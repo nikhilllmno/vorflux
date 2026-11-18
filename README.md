@@ -13,9 +13,11 @@ and learns from its work. The feature set follows
 
 | Path | What |
 |---|---|
-| `backend/` | Python 3.12 + uv + FastAPI control-plane API (skeleton, runtime-adapter contract, tests) |
+| `backend/` | Python 3.12 + uv + FastAPI control-plane API (skeleton, runtime-adapter contract, tests); `Dockerfile` and `fly*.toml` (validated in CI, not deployed) |
 | `web/` | Next.js control-plane UI (skeleton) |
 | `docs/architecture.md` | Architecture and design, milestones, open questions |
+| `docs/infra-map.md` | One-page map: services, environments, regions, secrets by name, owners |
+| `docs/runbook-deploy.md` | First-time setup, routine deploy, rollback, health checks, secret rotation |
 | `.github/` | CI workflow and PR template |
 | `.env.example` | Environment variable **names only** |
 

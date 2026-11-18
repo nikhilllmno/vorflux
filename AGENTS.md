@@ -35,4 +35,6 @@ The design authority is `docs/architecture.md`. Read the relevant section before
 
 - Use the PR template. Fill the safety checklist and the testing section with real commands.
 - Keep PRs small and focused. One concern per PR.
-- CI (`.github/workflows/ci.yml`) must be green: secret scan, backend, web.
+- CI (`.github/workflows/ci.yml`) must be green: secret scan, backend, web, deploy config.
+- Deploy config (`backend/Dockerfile`, `backend/fly*.toml`, `web/vercel.json`) is validated in CI
+  and never deployed from it. Deploys follow `docs/runbook-deploy.md` with owner approval.
