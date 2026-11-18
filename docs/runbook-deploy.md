@@ -168,7 +168,7 @@ also merges automatic revert PRs, with no confirmation (architecture 9.6, step 9
   O6). Set its server secrets (infra-map, "Fly secrets, Langfuse app") with the F3 method. Pin the
   Langfuse image by version. Create one project per env and put its keys in the API and proxy
   apps. Langfuse Cloud is not used unless the owner accepts tracing data outside India (pending,
-  O6).
+  Q33; O6).
 
 ### Hotel repo and Vapi (once per hotel; automated in M4)
 
@@ -403,7 +403,7 @@ Suspected leak of the eval-gate key or token:
 | O3 | Supabase projects for vorflux (staging, prod) and plan | S1–S5; PITR needs a paid plan | Pro plan for prod |
 | O4 | Fly region: `bom` or `sin` | F1a; Fly's list on 2026-11-18 does not show `bom` | **Decided** (D25): India. Supabase `ap-south-1`, Vercel `bom1`, Fly `bom` if offered at staging setup, else `sin` |
 | O5 | KMS provider for `HARNESS_KMS_KEY_ID` | Tenant secret envelope encryption | Decide in M1 |
-| O6 | Langfuse Cloud outside India: acceptable? (**pending owner answer**). Also where the self-hosted Langfuse stores run | Traces hold redacted prompts | Self-hosted in the Fly region (default, D25); its stores in the same region |
+| O6 | Langfuse Cloud outside India: acceptable? (architecture Q33, **pending owner answer**; default: no). Also where the self-hosted Langfuse stores run | Traces hold redacted prompts | Self-hosted in the Fly region (default, D25); its stores in the same region |
 | O7 | Domains | Stable API and web URLs for CORS and Auth | `*.fly.dev` and `*.vercel.app` until then |
 | O8 | GitHub org for hotel repos and the admin of both GitHub Apps | G1, G2 | Our org; owner is the App admin |
 | O9 | Optional read-only Fly token as GitHub secret `FLY_API_TOKEN_CI_READONLY` | Turns on `flyctl config validate` in CI (F7) | Add after the Fly apps exist |

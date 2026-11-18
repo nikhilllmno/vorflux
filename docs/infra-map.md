@@ -45,7 +45,7 @@ flowchart LR
 | Sandboxes (one Fly Machine per run) | Fly.io app, custom private network | `vorflux-harness-sandbox-staging` / `vorflux-harness-sandbox` | `sin` (`bom` if offered) | M2 | Owner / Bot |
 | Credential (egress) proxy | Fly.io app, reachable only from sandboxes | `vorflux-harness-egress-staging` / `vorflux-harness-egress` | `sin` (`bom` if offered) | M2 | Owner / Bot |
 | Database, Auth, Storage, job queue | Supabase, 2 projects | `vorflux-harness-staging` / `vorflux-harness-prod` | `ap-south-1` (Mumbai) | M1 (local stack), M5 hosted | Owner / Bot (migration files) |
-| LLM tracing | Langfuse, **self-hosted in the pilot region** (default, D25). Langfuse Cloud, which stores data outside India, only if the owner accepts it: **pending** (O6) | one instance per env: `vorflux-langfuse-staging` / `vorflux-langfuse` | same as Fly (`sin` or `bom`) | M1 local, M5 hosted | Owner / Bot |
+| LLM tracing | Langfuse, **self-hosted in the pilot region** (default, D25). Langfuse Cloud, which stores data outside India, only if the owner accepts it: **pending** (architecture Q33; runbook O6) | one instance per env: `vorflux-langfuse-staging` / `vorflux-langfuse` | same as Fly (`sin` or `bom`) | M1 local, M5 hosted | Owner / Bot |
 | Main harness GitHub App (change-request service: `harness/*` branches, PRs) | GitHub, our org. Contents write, pull requests write, checks read (PR status and check evidence), metadata read. No checks write, no merge path, no administration, no workflow write | `vorflux-harness-staging` / `vorflux-harness` | n/a | M2 | Owner / Bot |
 | Eval gate: posts `harness/eval-gate` and merges PRs that pass D18, plus automatic reverts. Kill switch: scale to zero, or a per-hotel pause flag | Separate Fly.io app, private network only, called by the API | `vorflux-harness-eval-gate-staging` / `vorflux-harness-eval-gate` | `sin` (`bom` if offered) | M2 (code changes from M3); hosted M5 | Owner / Bot |
 | Eval-gate GitHub App (the only merge credential) | GitHub, our org. Contents write (merge), pull requests write, checks write (`harness/eval-gate`), metadata read. No administration, no workflow write, no bypass | `vorflux-eval-gate-staging` / `vorflux-eval-gate` | n/a | M2 | Owner / Bot |
@@ -76,7 +76,7 @@ The pilot runs in India. Supabase `ap-south-1` (Mumbai) holds all harness data.
   India. If Fly gets `bom`, every part runs in Mumbai.
 - **Outside India:** Vapi (calls, transcripts, recordings) and the model providers (Anthropic,
   OpenAI) process data in their own regions. The redaction step limits what the model providers
-  see. Langfuse Cloud would also be outside India (pending, O6). Region per org comes in M6.
+  see. Langfuse Cloud would also be outside India (pending, Q33; runbook O6). Region per org comes in M6.
 
 ## Environments
 
