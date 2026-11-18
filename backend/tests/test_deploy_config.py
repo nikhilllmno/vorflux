@@ -22,8 +22,10 @@ BACKEND = Path(__file__).resolve().parents[1]
 REPO = BACKEND.parent
 FLY_CONFIGS = {"staging": BACKEND / "fly.toml", "production": BACKEND / "fly.production.toml"}
 SECRET_NAME = re.compile(r"KEY|SECRET|TOKEN|PASSWORD|PRIVATE|CREDENTIAL|DB_URL", re.IGNORECASE)
-# Fly region -> Vercel function region in the same metro (docs/infra-map.md, Regions).
-FLY_TO_VERCEL_REGION = {"iad": "iad1", "bom": "bom1", "fra": "fra1", "sin": "sin1"}
+# India pilot region (architecture D25): Fly runs in `bom` if Fly offers it, else `sin`; the web
+# functions run in Vercel `bom1`, the same AWS region as Supabase `ap-south-1` (docs/infra-map.md).
+PILOT_FLY_REGIONS = {"bom", "sin"}
+PILOT_VERCEL_REGION = "bom1"
 
 
 def load_fly(environment: str) -> dict[str, Any]:
@@ -105,10 +107,14 @@ def test_staging_and_production_share_region_and_vm_shape() -> None:
     assert staging["vm"] == production["vm"]
 
 
-def test_vercel_never_deploys_on_git_push_and_runs_next_to_the_api() -> None:
+def test_api_runs_in_the_india_pilot_region() -> None:
+    for environment in FLY_CONFIGS:
+        assert load_fly(environment)["primary_region"] in PILOT_FLY_REGIONS
+
+
+def test_vercel_never_deploys_on_git_push_and_runs_next_to_the_data() -> None:
     vercel = json.loads((REPO / "web" / "vercel.json").read_text())
 
     assert vercel["git"]["deploymentEnabled"] is False
     assert vercel["framework"] == "nextjs"
-    fly_region = load_fly("production")["primary_region"]
-    assert vercel["regions"] == [FLY_TO_VERCEL_REGION[fly_region]]
+    assert vercel["regions"] == [PILOT_VERCEL_REGION]

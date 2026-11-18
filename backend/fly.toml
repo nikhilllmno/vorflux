@@ -4,7 +4,10 @@
 # Secrets are set with `fly secrets set` (names in docs/infra-map.md), never in this file.
 
 app = "vorflux-harness-api-staging"
-primary_region = "iad"
+# Region (architecture D25): India pilot. Fly's region list (checked 2026-11-18) does not show
+# `bom` (Mumbai), so this is `sin` (Singapore). At staging setup run `fly platform regions`; if it
+# lists `bom`, change primary_region to "bom" in both fly*.toml files by PR (runbook F1a).
+primary_region = "sin"
 kill_signal = "SIGTERM"
 kill_timeout = "30s"
 

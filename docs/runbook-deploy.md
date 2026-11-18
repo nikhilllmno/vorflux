@@ -58,12 +58,13 @@ Checks run: <pre-deploy checklist items, CI link>
 
 ## 2. First-time setup (once per environment, staging first)
 
-Before you start, the owner provides the inputs in Section 7 (accounts, tokens, region).
+Before you start, the owner provides the inputs in Section 7 (accounts, tokens). The region is
+India (architecture D25; infra-map, "Regions").
 
 ### Supabase (do this first: the API needs its URL and keys)
 
 - **S1 [APPROVAL]** Create project `vorflux-harness-staging` (later `vorflux-harness-prod`) in the
-  owner's Supabase org, region `us-east-1`. Store the database password in the password manager as
+  owner's Supabase org, region `ap-south-1` (Mumbai). Store the database password in the password manager as
   `SUPABASE_DB_PASSWORD`.
 - **S2 [APPROVAL]** Project settings: enforce SSL; turn on network restrictions if the plan allows;
   production only: turn on point-in-time recovery (PITR).
@@ -77,6 +78,10 @@ Before you start, the owner provides the inputs in Section 7 (accounts, tokens, 
 ### Fly.io: API
 
 - **F1** `fly auth login` with an account in the owner's Fly org (`<fly-org>`, Section 7).
+- **F1a** Choose the Fly region: run `fly platform regions`. If it lists `bom` (Mumbai), change
+  `primary_region` to `"bom"` in `backend/fly.toml` and `backend/fly.production.toml` by PR
+  (CI accepts `bom` or `sin`), and use `bom` for every Fly app below. Else keep `sin`
+  (Singapore). Record the result in infra-map. Do not mix regions between apps.
 - **F2 [APPROVAL]** Create the app: `fly apps create vorflux-harness-api-staging --org <fly-org>`.
 - **F3 [APPROVAL]** Set secrets for the API app (names: infra-map, "Fly secrets, API app"). From a
   file outside the repo, or one at a time from stdin:
@@ -148,8 +153,8 @@ also merges automatic revert PRs, with no confirmation (architecture 9.6, step 9
 ### GitHub Apps and Langfuse (M1–M2)
 
 - **G1 [APPROVAL]** In our GitHub org, create the main harness App `vorflux-harness-staging`
-  with permissions: contents write (for `harness/*` branches), pull requests write, metadata
-  read; no checks write, no administration, no workflow write (architecture 9.9). Webhook URL: the API URL plus the path that ships in M2. Install it only on the
+  with permissions: contents write (for `harness/*` branches), pull requests write, checks read
+  (to sync PR status and attach check evidence), metadata read; no checks write, no administration, no workflow write (architecture 9.9). Webhook URL: the API URL plus the path that ships in M2. Install it only on the
   allow-listed hotel repos. Put `GITHUB_APP_ID`, `GITHUB_APP_PRIVATE_KEY`,
   `GITHUB_APP_WEBHOOK_SECRET` in the API app (F3). The egress proxy blocks the GitHub merge
   endpoints for sandboxes.
@@ -157,7 +162,13 @@ also merges automatic revert PRs, with no confirmation (architecture 9.6, step 9
   (needed to merge), pull requests write, checks write (posts `harness/eval-gate`), metadata
   read; no administration, no workflow write, no webhook, and not a bypass actor. Install it on
   the same repos. Put its ID and key in the eval-gate app only (F12).
-- **L1 [APPROVAL]** Create a Langfuse project per env; put its keys in the API and proxy apps.
+- **L1 [APPROVAL]** Langfuse, self-hosted in the pilot region (default, D25). Create Fly app
+  `vorflux-langfuse-staging` (later `vorflux-langfuse`) in the F1a region, with its Postgres,
+  ClickHouse, Redis, and S3-compatible store in the same region (exact hosting of these stores:
+  O6). Set its server secrets (infra-map, "Fly secrets, Langfuse app") with the F3 method. Pin the
+  Langfuse image by version. Create one project per env and put its keys in the API and proxy
+  apps. Langfuse Cloud is not used unless the owner accepts tracing data outside India (pending,
+  O6).
 
 ### Hotel repo and Vapi (once per hotel; automated in M4)
 
@@ -171,14 +182,20 @@ also merges automatic revert PRs, with no confirmation (architecture 9.6, step 9
   source), no force pushes, no bypass actors. **Open M2 spike (O13):** prove that the gate
   merges a PR that passes D18, that a protected-path or `High`-risk PR waits for our team, and
   that the main App cannot merge or post `harness/eval-gate`.
-- **H4 [APPROVAL]** Vapi (layout: O11): create the production assistant and a test assistant.
-  In the repo, create GitHub environment `vapi-production` (deployment branch `main` only) with
-  secret `VAPI_PRIVATE_API_KEY` and variable `VAPI_ASSISTANT_ID`, and environment `vapi-test`
-  with `VAPI_TEST_PRIVATE_API_KEY` and `VAPI_TEST_ASSISTANT_ID`. Use `gh secret set --env <env>`
+- **H4 [APPROVAL]** Vapi: create **two Vapi orgs** for the hotel (D21, Q30): `<slug>-live` with
+  the production assistant, and `<slug>-test` with the test assistant. A Vapi private key reaches
+  every assistant in its org, so a test-org key can never change a live assistant. Never put a
+  live-org key where a test key belongs. In the repo, create GitHub environment `vapi-production`
+  (deployment branch `main` only) with secret `VAPI_PRIVATE_API_KEY` (live org) and variable
+  `VAPI_ASSISTANT_ID`, and environment `vapi-test` with `VAPI_TEST_PRIVATE_API_KEY` (test org)
+  and `VAPI_TEST_ASSISTANT_ID`. Use `gh secret set --env <env>`
   (it prompts for the value).
 - **H5 [APPROVAL]** Install both GitHub Apps on the repo, add it to the hotel's allowlist, and
-  store `VAPI_TEST_PRIVATE_API_KEY` and `VAPI_READ_PRIVATE_API_KEY` in the hotel's tenant secrets
-  (envelope-encrypted, never in a file).
+  store `VAPI_TEST_PRIVATE_API_KEY` (test org) and `VAPI_READ_PRIVATE_API_KEY` (live org; the
+  proxy allows only `GET`) in the hotel's tenant secrets (envelope-encrypted, never in a file).
+- **H6 [APPROVAL]** Beds24 (M3, read only): the hotel creates a Beds24 long-life token with
+  `read/...` scopes only (Settings → Marketplace → API), with no `write/...` scope. Store it as
+  `BEDS24_READ_TOKEN` in the hotel's tenant secrets. Evals use the fake Beds24, never this token.
 
 ## 3. Routine deploy
 
@@ -243,9 +260,17 @@ On merge, the repo's workflow rolls out in stages (architecture 9.6, step 8). It
 5. Run the post-deploy smoke evals against production, with test numbers and synthetic guests.
 
 Evals on PRs use environment `vapi-test` and the test assistant only, never the production one.
-After the deploy, the harness watches live metrics (thresholds: Q23). On a failed smoke eval or a
-drop, the eval gate merges a revert PR at once, with no confirmation, and the harness alerts the
-hotel and our team.
+
+**Revert rules (architecture 9.6, Q23).** The eval gate merges a revert PR at once, with no
+confirmation, when either is true:
+
+- a post-deploy smoke eval fails; or
+- the hand-off rate or the failed-conversation rate rises **more than 20%** in the **24 hours**
+  after the deploy, compared with the **7 days** before.
+
+Then the harness alerts the hotel and our team. A hotel with too few conversations for a fair
+comparison uses the smoke evals only; a metric rise there sends an alert to our team, not a
+revert.
 
 ## 4. Health checks
 
@@ -261,8 +286,9 @@ hotel and our team.
 | Proxy (M2) | proxy logs for the test run | only allow-listed hosts |
 | Eval gate (M2) | `fly checks list -a <eval-gate-app>`; on a sample `hotel-<slug>` repo: a KB change and a prompt change with a confirmed diff; a code change; an eval-file change | the first two merge; the others get no `harness/eval-gate` success and wait for our team (architecture M2 exit criteria) |
 | Eval gate (M3) | on the sample repo: a backend fix with a confirmed diff, then a forced smoke-eval failure | the fix merges and rolls out in stages; the failure starts an automatic revert |
-| Vapi push | the push job's compare step; `GET /assistant/{id}` `updatedAt`; Vapi call logs | config matches `main`; no rise in failed calls or hand-offs |
-| Tracing | Langfuse project | a trace for the test run, tagged with `org_id`, `hotel_id`, `run_id` |
+| Vapi push | the push job's compare step; `GET /assistant/{id}` `updatedAt`; Vapi call logs | config matches `main`; post-deploy smoke evals pass; hand-off and failed-conversation rates stay within the revert rules (3.5) |
+| Beds24 connector (M3) | a read-only report run for the sample hotel; proxy logs | data returns; only `beds24.com` requests with the read token; no write call |
+| Tracing | `curl -fsS https://<langfuse-app>.fly.dev/api/public/health`; Langfuse project | a trace for the test run, tagged with `org_id`, `hotel_id`, `run_id` |
 
 ## 5. Rollback
 
@@ -340,12 +366,14 @@ logs for misuse.
 | `EVAL_GATE_GITHUB_APP_PRIVATE_KEY` | Overlapping | Eval-gate App page → generate a private key; delete the old key after (6.3). |
 | `EVAL_GATE_API_TOKEN` | Single-active | Generate a new random value; set it in the API and eval-gate apps together (6.3). |
 | `VAPI_PRIVATE_API_KEY`, `VAPI_TEST_PRIVATE_API_KEY`, `VAPI_READ_PRIVATE_API_KEY` | Overlapping | Vapi dashboard → API keys of that org. Update the hotel repo environment (`gh secret set --env`) and the hotel's tenant secrets, then delete the old key. |
+| `BEDS24_READ_TOKEN` | Overlapping | Beds24 → Settings → Marketplace → API: create a new long-life token with `read/...` scopes only, update the tenant secret, then delete the old token. |
+| Langfuse server: `NEXTAUTH_SECRET`, `CLICKHOUSE_PASSWORD`, database and S3 credentials | Single-active | The store or Langfuse settings, then the Langfuse app (6.2). Never rotate `SALT` or `ENCRYPTION_KEY`: a change breaks the existing Langfuse API keys (`SALT`) or the encrypted settings it stores (`ENCRYPTION_KEY`). |
 | `VAPI_SERVER_SECRET` | Single-active | Vapi server settings and the hotel backend env, together. |
 
 ### 6.3 GitHub App keys and the eval-gate token
 
-Architecture 9.9: both App keys and `EVAL_GATE_API_TOKEN` rotate on a schedule (proposed every 90
-days, O14) and at once after any suspected leak. Each run is an [APPROVAL] step.
+Architecture 9.9: both App keys and `EVAL_GATE_API_TOKEN` rotate every 90 days (default, Q32;
+O14) and at once after any suspected leak. Each run is an [APPROVAL] step.
 
 Scheduled rotation:
 
@@ -373,14 +401,14 @@ Suspected leak of the eval-gate key or token:
 | O1 | Fly.io org and a Fly token for the operator | F1–F10; none exists for vorflux | Org `vorflux`; the owner logs in, agents get no deploy token |
 | O2 | A new Vercel token and team for vorflux | V1–V4 | Two projects in the owner's team |
 | O3 | Supabase projects for vorflux (staging, prod) and plan | S1–S5; PITR needs a paid plan | Pro plan for prod |
-| O4 | Region (architecture Q5) | All services must share one metro | `iad` / `iad1` / `us-east-1` until Q5 is answered |
+| O4 | Fly region: `bom` or `sin` | F1a; Fly's list on 2026-11-18 does not show `bom` | **Decided** (D25): India. Supabase `ap-south-1`, Vercel `bom1`, Fly `bom` if offered at staging setup, else `sin` |
 | O5 | KMS provider for `HARNESS_KMS_KEY_ID` | Tenant secret envelope encryption | Decide in M1 |
-| O6 | Langfuse: cloud or self-hosted, and data region | Traces hold redacted prompts | Langfuse Cloud US |
+| O6 | Langfuse Cloud outside India: acceptable? (**pending owner answer**). Also where the self-hosted Langfuse stores run | Traces hold redacted prompts | Self-hosted in the Fly region (default, D25); its stores in the same region |
 | O7 | Domains | Stable API and web URLs for CORS and Auth | `*.fly.dev` and `*.vercel.app` until then |
 | O8 | GitHub org for hotel repos and the admin of both GitHub Apps | G1, G2 | Our org; owner is the App admin |
 | O9 | Optional read-only Fly token as GitHub secret `FLY_API_TOKEN_CI_READONLY` | Turns on `flyctl config validate` in CI (F7) | Add after the Fly apps exist |
 | O10 | Backup of Supabase Storage objects | Database backups and PITR do not include the files | A scheduled copy to a second bucket or provider, decided in M1 |
-| O11 | Vapi org layout (architecture Q30, default applied) | Vapi private keys are org-wide, so one key reaches every assistant in its org | Two Vapi orgs per hotel: production (push key only in the hotel repo's `vapi-production`; a read key for the harness, `GET` only at the proxy) and test (D21) |
-| O12 | Hotel repo name pattern and the Vapi push workflow (architecture Q31, default applied) | H1, 3.5; repos have no shared template | `hotel-<slug>`; we write one reference push workflow in M3 |
+| O11 | Vapi org layout | Vapi private keys are org-wide, so one key reaches every assistant in its org | **Decided** (Q30, D21): two Vapi orgs per hotel, live and test (H4) |
+| O12 | Hotel repo name pattern and the Vapi push workflow (architecture Q31, our default kept) | H1, 3.5; repos have no shared template | `hotel-<slug>`; we write one reference push workflow in M3 |
 | O13 | Branch protection with the eval gate (**open M2 spike**) | H3: the gate must merge only PRs that pass D18; protected-path and `High`-risk PRs must wait for our team | Ruleset in H3 with the separate eval-gate App (architecture 9.3, 9.9) |
-| O14 | Rotation schedule for the App keys and `EVAL_GATE_API_TOKEN` | 6.3; architecture 9.9 says "on a schedule" | Every 90 days |
+| O14 | Rotation schedule for the App keys and `EVAL_GATE_API_TOKEN` (architecture Q32, open with default applied) | 6.3 | Every 90 days, and at once after a suspected leak |
