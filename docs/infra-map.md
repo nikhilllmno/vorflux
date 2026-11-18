@@ -71,7 +71,7 @@ flowchart LR
 | Store | Holds | Tenant guard | Backup |
 |---|---|---|---|
 | Supabase Postgres | all harness data: orgs, hotels, sessions, runs, memory, skills, jobs (Postgres queue), approvals, audit, pgvector | `org_id`/`hotel_id` + RLS | Supabase daily backups; PITR on prod (paid add-on) |
-| Supabase Storage | artefacts, skill files, exports (`org/<org_id>/hotel/<hotel_id>/...`) | bucket policies | with project |
+| Supabase Storage | artefacts, skill files, exports (`org/<org_id>/hotel/<hotel_id>/...`) | bucket policies | **none yet**: database backups and PITR keep only object metadata, not the files. Object backup is an open item (runbook O10). |
 | Fly volumes (sandbox app) | workspace snapshots per session | one volume per session | none (rebuildable from git) |
 | Fly registry `registry.fly.io` | API, sandbox, and proxy images | n/a | keep last 10 releases |
 | Langfuse | traces with prompts and outputs (redacted) | project per env, `org_id`/`hotel_id` tags | provider |
