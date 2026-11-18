@@ -1,0 +1,17 @@
+# Keep the API image small and free of local state and secrets.
+.env
+.env.*
+.venv/
+**/__pycache__/
+*.py[cod]
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+dist/
+build/
+tests/
+fly*.toml
+Dockerfile
+.dockerignore

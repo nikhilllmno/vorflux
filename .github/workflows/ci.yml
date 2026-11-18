@@ -1,0 +1,151 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GITLEAKS_VERSION: "8.30.1"
+  GITLEAKS_SHA256: "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb"
+
+jobs:
+  secrets:
+    name: Secret scan (gitleaks)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install gitleaks (pinned, checksum verified)
+        run: |
+          curl -sSfL -o gitleaks.tgz \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          echo "${GITLEAKS_SHA256}  gitleaks.tgz" | sha256sum --check --strict
+          tar -xzf gitleaks.tgz gitleaks
+          rm gitleaks.tgz
+      - name: Scan full git history
+        run: ./gitleaks git --config .gitleaks.toml --redact --no-banner --verbose .
+      - name: .env.example holds variable names only
+        run: |
+          if grep -nvE '^[[:space:]]*(#.*)?$|^[A-Z][A-Z0-9_]*=$' .env.example; then
+            echo "::error file=.env.example::Every variable in .env.example must have an empty value."
+            exit 1
+          fi
+
+  backend:
+    name: Backend (uv, ruff, mypy, pytest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: "0.13.8"
+          python-version: "3.12"
+          enable-cache: true
+          cache-dependency-glob: backend/uv.lock
+      - run: uv sync --locked
+      - run: uv run ruff check .
+      - run: uv run ruff format --check .
+      - run: uv run mypy
+      - run: uv run pytest
+
+  web:
+    name: Web (Next.js lint, typecheck, build)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: web/.nvmrc
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run typecheck
+      - run: npm run build
+        env:
+          NEXT_TELEMETRY_DISABLED: "1"
+
+  deploy-config:
+    name: Deploy config (Dockerfile, fly.toml, vercel.json)
+    # Validates the deploy config files only. Nothing is pushed or deployed from CI.
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      HADOLINT_VERSION: "2.15.1"
+      HADOLINT_SHA256: "c7187db94eeeeca956519a6af171adc31453941a1e777961f6e680f697c8c507"
+      FLYCTL_VERSION: "0.5.12"
+      FLYCTL_SHA256: "41e3194dde966648e0943c13230c7a9c9874a7a235ac507dbf4ad4f575fa54fc"
+      # Optional read-only Fly token (docs/runbook-deploy.md, first-time setup F7).
+      # Empty on forks and until the owner adds it, so the flyctl step is skipped.
+      FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN_CI_READONLY }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Lint Dockerfile (hadolint, pinned, checksum verified)
+        run: |
+          curl -sSfL -o hadolint \
+            "https://github.com/hadolint/hadolint/releases/download/v${HADOLINT_VERSION}/hadolint-linux-x86_64"
+          echo "${HADOLINT_SHA256}  hadolint" | sha256sum --check --strict
+          chmod +x hadolint
+          ./hadolint backend/Dockerfile
+          rm hadolint
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: "0.13.8"
+          python-version: "3.12"
+          enable-cache: true
+          cache-dependency-glob: backend/uv.lock
+      - name: Config contracts (fly.toml, fly.production.toml, vercel.json)
+        working-directory: backend
+        run: |
+          uv sync --locked
+          uv run pytest tests/test_deploy_config.py
+      - name: Build the API image (not pushed)
+        run: docker build --tag harness-api:ci backend
+      - name: Smoke test the API image
+        run: |
+          docker run --detach --name harness-api -p 8080:8080 \
+            -e HARNESS_ENVIRONMENT=staging harness-api:ci
+          timeout 60 bash -c 'until curl -sf http://127.0.0.1:8080/healthz; do sleep 1; done'
+          curl -sf http://127.0.0.1:8080/healthz | grep -q '"environment":"staging"'
+          test "$(docker exec harness-api id -u)" != "0"
+          timeout 90 bash -c \
+            'until [ "$(docker inspect -f "{{.State.Health.Status}}" harness-api)" = healthy ]; do sleep 2; done'
+      - name: Container logs
+        if: always()
+        run: docker logs harness-api || true
+      - name: flyctl config validate (only with a read-only Fly token)
+        if: env.FLY_API_TOKEN != ''
+        working-directory: backend
+        run: |
+          curl -sSfL -o flyctl.tgz \
+            "https://github.com/superfly/flyctl/releases/download/v${FLYCTL_VERSION}/flyctl_${FLYCTL_VERSION}_Linux_x86_64.tar.gz"
+          echo "${FLYCTL_SHA256}  flyctl.tgz" | sha256sum --check --strict
+          tar -xzf flyctl.tgz flyctl
+          rm flyctl.tgz
+          ./flyctl config validate --strict --config fly.toml
+          ./flyctl config validate --strict --config fly.production.toml
