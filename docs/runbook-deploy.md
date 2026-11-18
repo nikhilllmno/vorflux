@@ -1,11 +1,13 @@
 # Deploy runbook — hotel agent harness
 
-How to set up and deploy the harness: the API and sandbox image on Fly.io, the web UI on Vercel,
-and database migrations on Supabase. Service names, regions, and secret locations are in
+How to set up and deploy the harness: the API, content gate, and sandbox image on Fly.io, the web
+UI on Vercel, and database migrations on Supabase. Section 3.5 covers hotel repos and Vapi, which
+deploy through their own CI. Service names, regions, and secret locations are in
 [`infra-map.md`](infra-map.md). Design: [`architecture.md`](architecture.md).
 
 **Status (2026-11-18): nothing is deployed, and no account exists yet.** The first hosted deploy
-is staging in M5 (architecture Section 12). The config files exist so that CI can validate them:
+is staging in M5 (architecture Section 12: M2 content gate, M3 Vapi, M4 operations and hotel
+onboarding, M5 pilot, M6 hardening). The config files exist so that CI can validate them:
 `backend/Dockerfile`, `backend/fly.toml` (staging), `backend/fly.production.toml`, and
 `web/vercel.json`. CI builds and smoke-tests the image; it never pushes or deploys.
 
@@ -114,14 +116,52 @@ Before you start, the owner provides the inputs in Section 7 (accounts, tokens, 
 - **V4** Put the web URL into `HARNESS_CORS_ORIGINS` in `backend/fly.toml` (or
   `fly.production.toml`) by PR, and into Supabase Auth (S3). Then redeploy the API (3.2).
 
-### GitHub App and Langfuse (M1–M2)
+### Content gate (M2)
+
+The content gate is a separate backend service. It merges a PR only when every changed file is in
+the `content_paths` of `harness.yaml` on the default branch, the requester confirmed the preview of
+that head commit, and CI, gitleaks, and all evals pass (architecture D18).
+
+- **F11 [APPROVAL]** Create app `vorflux-harness-content-gate-staging` on the default network,
+  with no public IPs (`fly apps create ... --org <fly-org>`, no `fly ips allocate`). The API calls
+  it over the Fly private network. Its config ships with the M2 code.
+- **F12 [APPROVAL]** Set its secrets (infra-map, "Fly secrets, content-gate app") with the F3
+  method. Put the same `CONTENT_GATE_API_TOKEN` in the API app. `CONTENT_GATE_DB_URL` uses a
+  Postgres role that can read preview confirmations and write merge records only.
+
+### GitHub Apps and Langfuse (M1–M2)
 
 - **G1 [APPROVAL]** In our GitHub org, create app `vorflux-harness-staging` with permissions:
   contents write, pull requests write, checks read, metadata read; no administration, no
   workflows. Webhook URL: the API URL plus the path that ships in M2. Install it only on the
-  allow-listed product-agent repos. Put `GITHUB_APP_ID`, `GITHUB_APP_PRIVATE_KEY`,
-  `GITHUB_APP_WEBHOOK_SECRET` in the API app (F3).
+  allow-listed hotel repos. Put `GITHUB_APP_ID`, `GITHUB_APP_PRIVATE_KEY`,
+  `GITHUB_APP_WEBHOOK_SECRET` in the API app (F3). The egress proxy blocks the GitHub merge
+  endpoints for sandboxes.
+- **G2 [APPROVAL]** Create app `vorflux-content-gate-staging`: contents write (needed to merge),
+  pull requests write, checks write (posts `harness/content-gate`), metadata read; no
+  administration, no workflows, no webhook. Install it on the same repos. Put its ID and key in
+  the content-gate app only (F12). Architecture 9.5 gives the check to the main App; a separate
+  App keeps the only merge key in one service. Confirm in the M2 spike (O13).
 - **L1 [APPROVAL]** Create a Langfuse project per env; put its keys in the API and proxy apps.
+
+### Hotel repo and Vapi (once per hotel; automated in M4)
+
+- **H1 [APPROVAL]** Create the private repo `<org>/hotel-<slug>` in our org (one repo per hotel).
+- **H2** By PR reviewed by our team: `harness.yaml` (with `content_paths` and the `voice:` block),
+  `CODEOWNERS` (our team on `*`, content paths with no owner), and the Vapi push workflow
+  (contract in 3.5).
+- **H3 [APPROVAL]** Ruleset on `main`: PR required, code-owner review, required checks (CI,
+  gitleaks, evals, and `harness/content-gate` with the content-gate App as its only allowed
+  source), no force pushes, no bypass actors. **Open M2 spike (O13):** prove that this lets the
+  content gate merge a content-only PR and blocks it on any other PR.
+- **H4 [APPROVAL]** Vapi (layout: O11): create the production assistant and a test assistant.
+  In the repo, create GitHub environment `vapi-production` (deployment branch `main` only) with
+  secret `VAPI_PRIVATE_API_KEY` and variable `VAPI_ASSISTANT_ID`, and environment `vapi-test`
+  with `VAPI_TEST_PRIVATE_API_KEY` and `VAPI_TEST_ASSISTANT_ID`. Use `gh secret set --env <env>`
+  (it prompts for the value).
+- **H5 [APPROVAL]** Install both GitHub Apps on the repo, add it to the hotel's allowlist, and
+  store `VAPI_TEST_PRIVATE_API_KEY` and `VAPI_READ_PRIVATE_API_KEY` in the hotel's tenant secrets
+  (envelope-encrypted, never in a file).
 
 ## 3. Routine deploy
 
@@ -136,7 +176,9 @@ for production with the production config, project, or link.
 4. `supabase db push --remote` — confirm the project ref at the CLI prompt.
 5. Section 4 Supabase checks, then the API checks (the running API must still work).
 
-### 3.2 API on Fly.io [APPROVAL]
+### 3.2 API and content gate on Fly.io [APPROVAL]
+
+Deploy the API first, then the content gate with the same steps and its own app name and config.
 
 1. `cd backend && fly releases --image -a vorflux-harness-api-staging` — note the current image.
 2. `fly deploy --image-label "git-$(git rev-parse --short HEAD)"`
@@ -164,6 +206,21 @@ in the shell:
 4. `vercel deploy --prebuilt --prod`
 5. Section 4 web checks.
 
+### 3.5 Hotel repos and Vapi (deployed by the hotel repo's CI, not by hand)
+
+The merge is the approval: our team merges code PRs and the content gate merges content-only PRs.
+The repo's workflow then pushes `vapi/assistant.json` to Vapi. It must do these steps:
+
+1. Run only on `push` to `main` and on `workflow_dispatch` with input `ref` (used for rollback),
+   in environment `vapi-production`.
+2. Validate the config. Fail if it holds a secret value.
+3. Save the live assistant (`GET /assistant/{VAPI_ASSISTANT_ID}`) as a workflow artifact named
+   `vapi-live-before-<sha>`. This is the rollback copy.
+4. `PATCH /assistant/{VAPI_ASSISTANT_ID}` with the config. Then `GET` it again and compare.
+
+Evals on PRs use environment `vapi-test` and the test assistant only, never the production one.
+After the push, the harness watches live metrics and opens a revert PR on a drop (thresholds: Q23).
+
 ## 4. Health checks
 
 | Part | Check | Pass |
@@ -176,6 +233,8 @@ in the shell:
 | Supabase | dashboard → Database health; RLS test suite against staging (M1) | no errors; tenant tests pass |
 | Sandbox (M2) | test run per runtime; `fly machines list -a <sandbox-app>` | run completes; no machine older than the max run time |
 | Proxy (M2) | proxy logs for the test run | only allow-listed hosts |
+| Content gate (M2) | `fly checks list -a <content-gate-app>`; on a sample hotel repo, a content-only PR with a confirmed preview, and a PR that also changes code | the first merges; the second gets no `harness/content-gate` success and waits for our team |
+| Vapi push | the push job's compare step; `GET /assistant/{id}` `updatedAt`; Vapi call logs | config matches `main`; no rise in failed calls or hand-offs |
 | Tracing | Langfuse project | a trace for the test run, tagged with `org_id`, `hotel_id`, `run_id` |
 
 ## 5. Rollback
@@ -186,6 +245,8 @@ in the shell:
 | Sandbox image (Fly) **[APPROVAL]** | Point the API back at the previous image reference and redeploy the API | Running sandboxes finish on their image. |
 | Web (Vercel) **[APPROVAL]** | `vercel rollback <previous deployment URL>` (or dashboard → Instant Rollback). Undo with `vercel promote <URL>` | Env var changes need a new deploy to take effect, so roll back env vars and redeploy. |
 | Supabase migration **[APPROVAL]** | Preferred: a new forward migration that reverts the change, by PR, then 3.1. Last resort (data loss after the restore point): PITR or a daily backup restore from the dashboard | Migrations are forward-only. If you revert by hand, fix history with `supabase migration repair --status reverted <version> --remote`. |
+| Content gate (Fly) **[APPROVAL]** | Same as the API. To stop all automatic merges at once: `fly scale count 0 -a <content-gate-app>` | Content PRs then wait; nothing merges by itself. |
+| Vapi config (bad push) | 1. Normal: a revert PR in the hotel repo. A content revert goes through the content gate (requester or hotel admin confirms); other reverts need our team. The merge pushes the old config. 2. **[APPROVAL]** Guests affected now: `gh workflow run <vapi-push workflow> -R <org>/hotel-<slug> -f ref=<last good sha>`, then the revert PR so `main` matches Vapi. 3. **[APPROVAL]** CI broken: restore artifact `vapi-live-before-<sha>` in the Vapi dashboard, then the revert PR. | Without the revert PR, the next merge pushes the bad config again. |
 | Secret change **[APPROVAL]** | Overlapping secrets: set the previous value again (still valid until step 5 of 6.1). Single-active secrets: no rollback to the old value; fix forward (6.2). | Do not revoke an old value until the new one passes checks. |
 
 ## 6. Rotate a secret [APPROVAL]
@@ -235,6 +296,10 @@ logs for misuse.
 | `SLACK_BOT_TOKEN`, `SLACK_SIGNING_SECRET` | Single-active | Slack app config (regenerate / reinstall). |
 | `TELEGRAM_BOT_TOKEN`, `TELEGRAM_WEBHOOK_SECRET` | Single-active | BotFather `/revoke`; then set the webhook again with the new secret. |
 | `VERCEL_TOKEN`, `SUPABASE_ACCESS_TOKEN` (operator) | Overlapping | Vercel account tokens; Supabase account access tokens. |
+| `CONTENT_GATE_GITHUB_APP_PRIVATE_KEY` | Overlapping | Content-gate App page → generate a private key; delete the old key after. |
+| `CONTENT_GATE_API_TOKEN` | Single-active | Generate a new random value; set it in the API and content-gate apps together (6.2). |
+| `VAPI_PRIVATE_API_KEY`, `VAPI_TEST_PRIVATE_API_KEY`, `VAPI_READ_PRIVATE_API_KEY` | Overlapping | Vapi dashboard → API keys of that org. Update the hotel repo environment (`gh secret set --env`) and the hotel's tenant secrets, then delete the old key. |
+| `VAPI_SERVER_SECRET` | Single-active | Vapi server settings and the hotel backend env, together. |
 
 ## 7. Open items that need owner input
 
@@ -250,3 +315,6 @@ logs for misuse.
 | O8 | GitHub org for product-agent repos and the App owner | G1 | Our org; owner is the App admin |
 | O9 | Optional read-only Fly token as GitHub secret `FLY_API_TOKEN_CI_READONLY` | Turns on `flyctl config validate` in CI (F7) | Add after the Fly apps exist |
 | O10 | Backup of Supabase Storage objects | Database backups and PITR do not include the files | A scheduled copy to a second bucket or provider, decided in M1 |
+| O11 | Vapi org layout and who holds the keys | Vapi private keys are org-wide, so one key reaches every assistant in its org | Two Vapi orgs per hotel: production (push key only in the hotel repo's `vapi-production`; a second key for harness reads, `GET` only at the proxy) and test. Also confirm D21 ("never calls Vapi write APIs") allows writes to the test assistant (architecture 9.4) |
+| O12 | Hotel repo name pattern and the Vapi push workflow | H1, 3.5; repos have no shared template | `hotel-<slug>`; the Bot writes a reference workflow in M3 |
+| O13 | Branch protection with the content gate (**open M2 spike**) | H3, G2: the gate must merge only content-only PRs | Ruleset in H3 and a separate content-gate App |
