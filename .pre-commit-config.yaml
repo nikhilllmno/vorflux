@@ -1,0 +1,6 @@
+# Optional local hooks: `uvx pre-commit install`. CI runs the same secret scan on every PR.
+repos:
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.30.1
+    hooks:
+      - id: gitleaks

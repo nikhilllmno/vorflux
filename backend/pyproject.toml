@@ -1,0 +1,46 @@
+[project]
+name = "harness"
+version = "0.1.0"
+description = "Control-plane API for the per-hotel agent harness."
+readme = "../README.md"
+requires-python = ">=3.12,<3.14"
+dependencies = [
+    "fastapi>=0.163.2,<1",
+    "pydantic-settings>=2.16.3,<3",
+    "uvicorn[standard]>=0.54.0,<1",
+]
+
+[project.scripts]
+harness = "harness.main:run"
+
+[build-system]
+requires = ["uv_build>=0.13.8,<0.14.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "httpx2>=2.16.2,<3",
+    "mypy>=2.4.1,<3",
+    "pytest>=9.2.0,<10",
+    "ruff>=0.17.5,<0.18",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "S", "ASYNC", "RUF"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101"]
+
+[tool.mypy]
+strict = true
+python_version = "3.12"
+mypy_path = "src"
+packages = ["harness"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
