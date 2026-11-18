@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | Draft for review (v0.1). Nothing here is deployed. |
+| Status | Draft for review (v0.2: owner answers to the open questions applied, see Section 14). Nothing here is deployed. |
 | Date | 2026-11-18 |
 | Scope | Design of the harness, plus the foundations that ship in the same PR |
 | Reference system | [Hermes Agent](https://github.com/NousResearch/hermes-agent) (MIT), reviewed at commit `f7e2898a`, 2026-11-17 |
@@ -22,7 +22,7 @@
 11. [Technology stack and repository layout](#11-technology-stack-and-repository-layout)
 12. [Phased milestone plan](#12-phased-milestone-plan)
 13. [Risks](#13-risks)
-14. [Open questions](#14-open-questions)
+14. [Open questions and answers](#14-open-questions-and-answers)
 15. [References](#15-references)
 
 ---
@@ -49,9 +49,13 @@ B2B**. So we keep the Hermes *features* and *learning loop*, but we change three
    OpenAI Agents SDK, LangChain Deep Agents, and opencode. Harness features sit above the
    adapter, so they behave the same on every framework.
 
-Code changes to hotel agents never go straight to production. The harness works on a branch in a
-sandbox, runs tests and agent-specific evals, and opens a **draft PR**. A human approves and
-merges. The target repository's own CI/CD deploys. In v1 the harness cannot merge or deploy.
+Code changes to hotel agents never go straight to production. Hotel staff ask the harness for a
+change. The harness works on a branch in a sandbox, runs tests and agent-specific evals, and
+opens a **draft PR**. **Our team** reviews, approves, and merges. The target repository's own
+CI/CD deploys. The harness cannot merge or deploy.
+
+The default runtime for the harness agent is the **Claude Agent SDK**, with **opencode** as the
+model-agnostic second runtime (D14).
 
 ---
 
@@ -97,7 +101,7 @@ merges. The target repository's own CI/CD deploys. In v1 the harness cannot merg
 
 ## 3. Key decisions
 
-Each decision has a short reason. Section 14 lists the decisions that still need the owner's input.
+Each decision has a short reason. Section 14 lists the owner's answers to the open questions and the two questions that are still open.
 
 | # | Decision | Reason |
 |---|---|---|
@@ -105,15 +109,19 @@ Each decision has a short reason. Section 14 lists the decisions that still need
 | D2 | One runtime-adapter contract (`AgentRuntime`) with four adapters: `claude_agent_sdk`, `openai_agents_sdk`, `deep_agents`, `opencode`. | The owner wants all four. Features above the seam (tenancy, approvals, memory, skills, audit) then work the same everywhere. |
 | D3 | Harness tools reach every runtime as **one MCP server per run**, scoped to the run's tenant. | All four runtimes are MCP clients. One tool implementation serves all of them, and the tenant scope is enforced in one place. |
 | D4 | The adapter and the runtime run **inside the sandbox**, not in the API process. | Hermes' security policy: in-process guards are heuristics, the OS is the boundary. Claude Agent SDK and opencode also spawn subprocesses, so whole-process isolation is the only clean option. |
-| D5 | Sandboxes are **Fly Machines** (Firecracker microVMs) by default, behind a `SandboxProvider` interface. E2B is the second provider. Docker is for local development only. | Same platform as the API (owner chose Fly.io), fast start, per-machine isolation, and suspend/resume. The interface keeps us portable. |
+| D5 | Sandboxes are **Fly Machines** (Firecracker microVMs) in staging and production, behind a `SandboxProvider` interface. Docker is for local development and CI only. No second provider is planned (Q10). | Same platform as the API, per-machine VM isolation, suspend/resume, and our own private network for the egress proxy. One provider means one security model to review. The interface keeps us portable if Fly cannot meet a need. |
 | D6 | **Supabase** is the system of record: Postgres (with row-level security), Auth, Storage, pgvector. | Owner listed Supabase. RLS gives a second tenant guard under the API. pgvector covers memory and session search. |
 | D7 | FastAPI control plane on Fly.io. Next.js UI on Vercel. | Owner's stack. |
-| D8 | InsForge is **not** in the v1 critical path. We keep a seam so it can host product-agent backends or replace parts of Supabase later. | The brief lists both InsForge and Supabase. Two systems of record for the same data is a risk. See open question Q1. |
-| D9 | Code changes go through a **GitHub App** with per-hotel repo allowlists. The harness pushes `harness/*` branches and opens **draft** PRs. It never merges, deploys, or force-pushes. | Safe by default, auditable, and the same flow that engineers already trust. |
+| D8 | **InsForge hosts product-agent backends only.** The harness itself does not use InsForge; its system of record is Supabase (Q1). | One system of record for harness data. Product agents can still use InsForge's database, auth, storage, and edge functions. |
+| D9 | Product-agent repositories live in **our GitHub org** (Q2). One **GitHub App** installation with per-hotel repo allowlists does all code work. The harness pushes `harness/*` branches and opens **draft** PRs. It never merges, deploys, or force-pushes. | Safe by default, auditable, and the same flow that engineers already trust. One org means one set of branch-protection rules to enforce. |
 | D10 | Every product-agent repository that the harness may change has a **`harness.yaml` manifest**: agent type, framework, test and eval commands, protected paths, deploy owner. | The harness needs a contract per repo to run the right checks and to know what it must not touch. |
 | D11 | Self-improvement writes only to **hotel or org scope**. Promotion of a learned skill to the shared (global) library needs human review. | One hotel's learning must not change another hotel's agent without review. |
-| D12 | Scheduling and workflows start on a **Postgres-backed job queue** with leases. We re-evaluate a durable workflow engine (Temporal or similar) at M4. | Fewer moving parts at the start. The job interface hides the engine. |
+| D12 | Scheduling and workflows run on a **Postgres-backed job queue** with leases. No separate workflow engine (Q4). | Fewer moving parts. The kanban board plus the job queue covers multi-step work. The job interface still hides the queue if this changes. |
 | D13 | Secrets are never in the sandbox filesystem or environment where possible. An **egress proxy injects credentials** for allowlisted hosts. | A prompt-injected agent cannot leak what it cannot read. Same idea as NVIDIA OpenShell, which Hermes recommends. |
+| D14 | The **default harness runtime is the Claude Agent SDK** for all roles. **opencode** is the second runtime, for hotels or tasks that need non-Anthropic or open-weight models. The OpenAI Agents SDK and Deep Agents adapters come later and are opt-in per hotel (Q3). | See Section 6.6. The Claude Agent SDK ships a complete coding loop (file edit, shell, search, sub-agents, compaction, session resume, hooks, permission callback, MCP) in Python. opencode ships the same kind of loop for any model. The other two are frameworks where we would build the coding tools ourselves. |
+| D15 | **One LLM tracing tool for all runtimes: Langfuse**, cloud or self-hosted (Q6). | Langfuse has integrations for all four runtimes: OpenInference instrumentation for the Claude Agent SDK and the OpenAI Agents SDK, a LangChain callback for Deep Agents, and OpenTelemetry export for opencode. Self-hosting is possible if residency (Q5) requires it. |
+| D16 | **Hotel staff request and drive changes; only our team approves and merges code** (Q8). | Hotels own what their agents should do; we own code quality and safety across all hotels. |
+| D17 | The repository has **no licence file** (Q9). | Owner decision. The code is public to read, but no reuse rights are granted. Hermes attribution stays in `THIRD_PARTY_NOTICES.md`. |
 
 ---
 
@@ -201,7 +209,7 @@ flowchart LR
 5. **Execute.** The adapter starts the runtime with the hotel's system prompt, context files,
    skill index, and memory snapshot. Tools come from the harness MCP server.
 6. **Gate.** A risky tool call (push, send, delete, external write) becomes an
-   `ApprovalRequired` event. The run pauses. The approver sees a card in Slack or the UI.
+   `ApprovalRequired` event. The run pauses. A hotel user with the right role sees a card in Slack or the UI.
 7. **Finish.** The run ends with `RunCompleted` or `RunFailed`. The workspace is snapshotted.
    The background review (Section 10.4) may propose memory or skill updates.
 8. **Record.** Transcript, tool calls, cost, and approvals go to Postgres and the audit log.
@@ -235,7 +243,7 @@ state. "New" means Hermes does not have it. "Defer" and "Skip" are explicit choi
 | Tool registry and toolsets | `tools/registry.py`, `toolsets.py` (`_HERMES_CORE_TOOLS`, postures such as coding) | Harness MCP server with named toolsets per agent role (`coding`, `ops`, `connector-safe`). The hotel's plan and role select the toolset. | M1 |
 | Deferred tools / tool search | `tools/tool_search*.py` | Keep the tool list short. Rare tools sit behind a `tool_search` tool, so the cached prefix stays small. | M3 |
 | Terminal, process management, file read/write/patch/search | `tools/terminal_tool*.py`, `tools/file_tools*.py` | Use the runtime's native shell and file tools, inside the sandbox only. | M1 |
-| Terminal backends (local, Docker, SSH, Modal, Daytona, Vercel Sandbox) | `tools/environments/` | `SandboxProvider` with Fly Machines, E2B, and local Docker. No SSH or host backends in production. | M2 |
+| Terminal backends (local, Docker, SSH, Modal, Daytona, Vercel Sandbox) | `tools/environments/` | `SandboxProvider` with Fly Machines and local Docker. No SSH or host backends in production. | M2 |
 | Code execution with tool RPC | `tools/code_execution*.py` | Runs in the sandbox. Tool calls from code go through the same MCP server and token. | M3 |
 | Web search and extract | `tools/web_tools*.py` | MCP tools behind the egress proxy with per-hotel provider keys. | M1 |
 | Browser automation | `browser_exec` over CDP, cloud browsers, real-profile mode, `browser_vault` | Headless Chromium in the sandbox (default) or a cloud browser provider. A credential vault fills logins without exposing them to the model. No "real profile" copy of a user's browser in production. | M3 |
@@ -376,9 +384,20 @@ suite with real models and a low budget.
 
 ### 6.6 Choosing a runtime
 
-- Each hotel agent role has a default runtime. Proposed defaults: **coding** on Claude Agent SDK,
-  **ops and connector tasks** on OpenAI Agents SDK, **long research and planning** on Deep Agents,
-  and **opencode** where a hotel requires a non-Anthropic or open-weight model for coding.
+Recommendation (D14): build the harness on the **Claude Agent SDK** first, and add **opencode**
+second.
+
+| Runtime | Role in the harness | Why |
+|---|---|---|
+| Claude Agent SDK | **Default for every role** (coding, ops, research) from M1 | It is the Claude Code agent loop as a Python library: file edit, shell, search, web fetch, todo, sub-agents, context compaction, and session resume are built in. `can_use_tool` and `PreToolUse` hooks map directly to our approval gate, and it is an MCP client. Least code for us to write and own. Limit: Claude models only (Anthropic API, Bedrock, or Vertex). |
+| opencode | **Second runtime** from M3, for non-Anthropic or open-weight models | Also a complete coding agent, with an HTTP server API, SSE events, and permission events that map to our approval gate. It works with many model providers. Limit: a separate TypeScript server process, so the adapter is an HTTP client. |
+| OpenAI Agents SDK | Opt-in adapter from M4 | A general agent framework. For coding we would supply the shell and file tools (or use its sandbox agent). Useful when a hotel wants OpenAI-native features such as handoffs. |
+| Deep Agents | Opt-in adapter from M4 | A LangGraph agent harness with planning, sub-agents, and file backends. Useful for long research tasks; coding needs extra tools. |
+
+Notes:
+
+- The harness runtime is independent of the product agent's framework (Section 6.1). A Claude
+  Agent SDK run can change a voice agent built on the OpenAI Agents SDK.
 - Our team can change the default per hotel. Hotel admins can choose from the runtimes in their
   plan.
 - A session keeps one runtime for its life (prompt-cache invariant). A different runtime means a
@@ -406,9 +425,13 @@ flowchart TD
   HOTEL --> SEC["Secrets<br/>(envelope-encrypted)"]
 ```
 
-- **Roles** (per org, optionally narrowed to hotels): `owner`, `admin`, `approver`, `operator`,
-  `viewer`. Our own staff have a separate `platform` role with audited, time-boxed access
-  ("break-glass"), never a hidden super-user.
+- **Hotel roles** (per org, optionally narrowed to hotels): `owner`, `admin`, `operator`,
+  `viewer`. Hotel staff with `operator` or higher start runs and change requests, and approve risky
+  non-code actions inside their own hotel (for example sending a message or a browser action in
+  their PMS).
+- **Our team's roles:** `code_reviewer` approves and merges PRs on product-agent repos (D16).
+  `platform` gives audited, time-boxed access for support ("break-glass"), never a hidden
+  super-user. Hotel roles can never approve code.
 - **Plans** set limits per org: hotels, runtimes, models, concurrent runs, monthly budget.
 
 ### 7.2 Isolation layers
@@ -437,7 +460,7 @@ references). The harness agent may see such data in logs, transcripts, and test 
   longer for redacted summaries).
 - **Export and delete.** Per-org data export and hard delete, for contract exit and data subject
   requests.
-- **Residency.** Region choice per org is an open question (Q5).
+- **Residency.** Still open (Q5). Until it is answered we run one region, and Langfuse and Supabase are chosen so that each can move to a per-region setup later.
 - **Audit.** Append-only `audit_events` table: who or what did which action, for which tenant,
   with which approval.
 
@@ -487,7 +510,6 @@ SandboxProvider
 | Provider | Use | Notes |
 |---|---|---|
 | Fly Machines | Default for staging and production | Firecracker microVM per run, dedicated app and private network, suspend and resume, volumes for workspace snapshots. |
-| E2B | Second provider | Managed sandboxes with snapshots; useful for burst capacity and a fallback. |
 | Docker (local) | Developer machines and CI only | Not a security boundary for production use. |
 
 ### 8.4 Run lifecycle and limits
@@ -528,8 +550,8 @@ SandboxProvider
    branches and opens **draft** PRs. It never pushes to protected branches, never force-pushes,
    never merges, and never deploys (D9).
 2. **Evidence in every PR.** Tests, agent-type evals, risk score, and a rollback plan.
-3. **Humans decide.** An approver with the right role reviews and merges. High-risk classes need
-   two approvers.
+3. **Our team decides.** Hotel staff request changes and see the PR, but only a member of our
+   team with the `code_reviewer` role approves and merges (D16).
 4. **The target repo owns deploys.** Its own CI/CD deploys after merge. The harness only reads
    status.
 5. **Everything is linked.** Change request ↔ session transcript ↔ PR ↔ CI runs ↔ deploy.
@@ -550,7 +572,7 @@ commands:
   lint: uv run ruff check .
   test: uv run pytest -q
   eval: uv run python -m evals.run --suite smoke
-protected_paths:         # changes here need two approvers
+protected_paths:         # plan approval by our team before work starts; CODEOWNERS review
   - prompts/legal/**
   - src/payments/**
   - .github/**
@@ -580,7 +602,7 @@ config:
 flowchart TD
   A["Request<br/>UI, Slack, Telegram,<br/>cron, or self-improvement"] --> B["Create change request<br/>hotel, repo, intent"]
   B --> C{"Risk class?"}
-  C -->|"high"| D["Plan approval<br/>by approver"]
+  C -->|"high"| D["Plan approval<br/>by our team"]
   C -->|"low / medium"| E["Sandbox: clone,<br/>new harness/* branch"]
   D --> E
   E --> F["Coding run<br/>edits + commits"]
@@ -589,24 +611,25 @@ flowchart TD
   G -->|"pass"| H["Agent-type evals<br/>voice / text / email"]
   H -->|"fail"| F
   H -->|"pass"| I["Push branch,<br/>open DRAFT PR<br/>with evidence"]
-  I --> J["Human review<br/>1 or 2 approvers"]
+  I --> J["Review by our team<br/>(code_reviewer)"]
   J -->|"changes requested"| F
   J -->|"approve + merge<br/>(human)"| K["Target repo CI/CD<br/>staging, then production"]
   K --> L["Harness watches status,<br/>proposes revert PR on regression"]
 ```
 
-1. **Request.** Any channel can create a CR. Self-improvement may only *propose* a CR; a human
-   confirms it before work starts.
+1. **Request.** Hotel staff create a CR from any channel. Self-improvement may only *propose* a
+   CR; a hotel user confirms it before work starts.
 2. **Classify.** Risk class from the manifest and the intent: content-only change (FAQ, hours,
    copy), prompt or tool change, code change, or protected-path change.
 3. **Work.** A coding run in a sandbox on a new branch. Iterates until checks and evals pass or
    the budget ends. A failed CR ends with a report, not a PR.
 4. **Open PR.** Draft PR with: summary, diff stats, eval report, risk score, the session link, and
    a rollback plan (normally "revert this PR").
-5. **Review and merge.** Humans only. The harness answers review comments by pushing new commits
-   to the same branch.
+5. **Review and merge.** Our team only. The hotel user who asked for the change sees the PR
+   status and the eval report in the UI. The harness answers review comments by pushing new
+   commits to the same branch.
 6. **After merge.** The harness reads CI and deploy status and the eval canaries. On a
-   regression it opens a revert PR and alerts the approvers. It does not revert on its own.
+   regression it opens a revert PR and alerts our team and the hotel. It does not revert on its own.
 
 ### 9.4 Agent-type evals
 
@@ -698,7 +721,7 @@ flowchart LR
 - Event triggers: signed webhooks (GitHub PR events, PMS events, monitoring alerts) can fire a job
   at once.
 - Workflows: the kanban `tasks` table plus the dispatcher (Section 5.4) covers multi-step,
-  multi-agent work with human steps. A durable engine is reconsidered at M4 (D12, Q4).
+  multi-agent work with human steps. There is no separate workflow engine (D12).
 
 ### 10.6 Connectors: Slack and Telegram
 
@@ -736,8 +759,8 @@ The connector gateway uses one adapter shape so email, WhatsApp, and Teams can f
 ### 10.9 Observability, evals, and cost
 
 - OpenTelemetry traces across API, orchestrator, sandbox, and MCP calls, keyed by `run_id`.
-- LLM tracing per runtime (LangSmith for Deep Agents, OpenAI tracing, or a single
-  OpenTelemetry-based tool; Q6).
+- LLM tracing in **Langfuse** for every runtime (D15). Each trace carries `org_id`, `hotel_id`,
+  `run_id`, and the runtime, so cost and quality compare across runtimes.
 - Per-run cost from token usage and sandbox time; per-hotel budgets with soft and hard limits.
 - Harness evals: a fixed task set (for example "add an FAQ entry", "fix a failing test") run
   nightly per runtime to catch regressions in adapters and skills.
@@ -752,7 +775,8 @@ The connector gateway uses one adapter shape so email, WhatsApp, and Teams can f
 | Frontend | Next.js (App Router), React, TypeScript; Vercel |
 | Data | Supabase Postgres (RLS, pgvector), Supabase Auth, Supabase Storage |
 | Hosting | Fly.io for the API, orchestrator, scheduler, gateway, and egress proxy; Fly Machines for sandboxes |
-| Runtimes | `claude-agent-sdk`, `openai-agents`, `deepagents`, `opencode` (pinned per sandbox image) |
+| Runtimes | `claude-agent-sdk` (default), `opencode`, later `openai-agents` and `deepagents` (pinned per sandbox image) |
+| Tracing | Langfuse (OpenTelemetry / OpenInference) |
 | Code hosting | GitHub App for product-agent repos |
 | CI | GitHub Actions: backend checks, web checks, gitleaks |
 
@@ -788,10 +812,10 @@ harness agent itself and are estimates, not commitments.
 | **M0 — Foundations** (this PR) | Design doc, backend and web skeletons, CI, gitleaks, templates. | CI green on PRs. Owner reviewed the doc and answered the open questions. |
 | **M1 — Tenancy and first runtime** (~3 weeks) | Supabase schema + RLS as migration files (applied to a local stack only), auth in API and UI, orgs/hotels/roles, sessions and runs, orchestrator with local Docker sandbox, Claude Agent SDK adapter, harness MCP server (todo, clarify, memory stub), approval service with UI inbox, conformance suite. | A staff user runs a session in the UI against a local sandbox; an approval pauses and resumes it; RLS tests pass for two orgs. |
 | **M2 — Safe code changes** (~3 weeks) | Fly Machines sandbox provider, egress proxy, GitHub App, `harness.yaml`, change-request service, draft PRs with check and eval evidence, text-agent eval starter, skills library v1, workspace snapshots. | The harness opens a draft PR on a sample text-agent repo with passing evals; it cannot push to `main` or merge (tested). |
-| **M3 — Connectors, memory, scheduling, self-improvement** (~4 weeks) | Slack and Telegram connectors with pairing and approval cards, scheduler and `cronjob_manage`, bounded memory, session search, background review proposals, skill linter and scan, browser tool in sandbox, OpenAI Agents SDK adapter, delegation. | A daily job posts a report to Slack; a run started in Telegram is approved in Slack; an approved skill proposal changes the next run's behaviour. |
-| **M4 — All runtimes and workflows** (~4 weeks) | Deep Agents and opencode adapters, voice and email eval suites, kanban board and dispatcher, curator, goals and loops, budgets and quotas, MCP catalog per hotel, workflow-engine decision. | All four adapters pass conformance; a multi-step CR on a voice-agent repo runs end to end with two approvers. |
+| **M3 — Connectors, memory, scheduling, self-improvement** (~4 weeks) | Slack and Telegram connectors with pairing and approval cards, scheduler and `cronjob_manage`, bounded memory, session search, background review proposals, skill linter and scan, browser tool in sandbox, opencode adapter, delegation. | A daily job posts a report to Slack; a run started in Telegram is approved in Slack; an approved skill proposal changes the next run's behaviour. |
+| **M4 — All runtimes and workflows** (~4 weeks) | OpenAI Agents SDK and Deep Agents adapters (opt-in), voice and email eval suites, kanban board and dispatcher, curator, goals and loops, budgets and quotas, MCP catalog per hotel. | All four adapters pass conformance; a multi-step CR on a voice-agent repo, requested by hotel staff, runs end to end and is approved by our team. |
 | **M5 — Pilot and extension** (~3 weeks) | Chrome extension, credential vault, audit export, retention jobs, staging deploy of the control plane (with owner approval), pilot with one hotel. | One pilot hotel uses the harness for two weeks with no cross-tenant or secret incidents. |
-| **M6 — Hardening for more hotels** | Second sandbox provider (E2B), SSO, region options, load and chaos tests, external security review, onboarding automation. | Security review findings closed; onboarding of a new hotel takes under one day. |
+| **M6 — Hardening for more hotels** | SSO, region options (Q5), load and chaos tests, external security review, onboarding automation. | Security review findings closed; onboarding of a new hotel takes under one day. |
 
 ---
 
@@ -810,20 +834,23 @@ harness agent itself and are estimates, not commitments.
 
 ---
 
-## 14. Open questions
+## 14. Open questions and answers
 
-| # | Question | Proposed default |
-|---|---|---|
-| Q1 | What is InsForge's role? Options: (a) host for product-agent backends only, (b) replacement for Supabase, (c) not used. | (a): Supabase is the harness system of record; InsForge stays an option for product agents. |
-| Q2 | Who owns the GitHub repos of product agents: the hotel's GitHub org, or ours? | Ours for v1 (one GitHub App installation), with per-hotel allowlists. |
-| Q3 | Which runtime is the default for coding runs? | Claude Agent SDK, with opencode for hotels that need other models. |
-| Q4 | Durable workflow engine (Temporal, Inngest, or Postgres queue only)? | Postgres queue until M4, then decide with real workflow data. |
-| Q5 | Data residency requirements (EU, India, US hotels)? | Single region at pilot; region per org from M6. |
-| Q6 | One LLM tracing tool across runtimes, or each runtime's native tracing? | OpenTelemetry-based single tool; decide in M1. |
-| Q7 | Is an OpenAI-compatible API (like the Hermes API server) needed for customers? | Not in v1. |
-| Q8 | Who may approve PRs and risky actions: hotel staff, our team, or both? Two-approver rule for which classes? | Our team approves code; hotel admins approve content changes; two approvers for protected paths. |
-| Q9 | Licence for this repository (it is public)? | Owner to choose; no `LICENSE` file is added until then. |
-| Q10 | Sandbox provider for production: Fly Machines only, or Fly + E2B from the start? | Fly Machines first, E2B in M6. |
+The owner answered these questions on 2026-11-18. "Owner" means the owner chose the answer.
+"Owner asked us" means the owner asked us to recommend, and the answer is our recommendation.
+
+| # | Question | Answer | Status |
+|---|---|---|---|
+| Q1 | What is InsForge's role? | Hosting for product-agent backends only. The harness uses Supabase (D8). | Decided (owner) |
+| Q2 | Who owns the GitHub repos of product agents? | Our GitHub org, one GitHub App installation, per-hotel allowlists (D9). | Decided (owner) |
+| Q3 | Which runtime do we build the harness on? | Claude Agent SDK as the default; opencode second for other models; OpenAI Agents SDK and Deep Agents opt-in later (D14, Section 6.6). | Decided (owner asked us) |
+| Q4 | Workflow engine or Postgres queue? | Postgres queue only (D12). | Decided (owner) |
+| Q5 | Data residency for EU, India, and US hotels? | Not answered. Default: one region for the pilot; per-org region from M6. | **Open** |
+| Q6 | One LLM tracing tool across runtimes? | Yes: Langfuse (D15). | Decided (owner; tool chosen by us) |
+| Q7 | Do customers need an OpenAI-compatible API? | Not answered. Default: not in v1; the public REST API (M5) covers integrations. | **Open** |
+| Q8 | Who approves code and risky actions? | Hotel staff request and drive changes; our team approves and merges all code. Hotel staff approve risky non-code actions in their own hotel. No two-approver rule (D16). | Decided (owner) |
+| Q9 | Licence for this public repository? | None. No `LICENSE` file (D17). | Decided (owner) |
+| Q10 | Fly Machines only, or Fly and E2B? | Fly Machines only; add a second provider only if Fly cannot meet a need (D5). | Decided (owner asked us) |
 
 ---
 
@@ -842,5 +869,8 @@ harness agent itself and are estimates, not commitments.
   <https://docs.langchain.com/oss/python/deepagents/human-in-the-loop>
 - opencode server — <https://opencode.ai/docs/server>
 - InsForge — <https://docs.insforge.dev/introduction>
+- Langfuse integrations — <https://langfuse.com/integrations/frameworks/claude-agent-sdk>,
+  <https://langfuse.com/integrations/frameworks/openai-agents>,
+  <https://langfuse.com/integrations/frameworks/langchain-deepagents>
 - Agent Skills format — <https://agentskills.io>
 - NVIDIA OpenShell (referenced by Hermes `SECURITY.md`) — <https://github.com/NVIDIA/OpenShell>

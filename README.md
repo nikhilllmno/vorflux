@@ -62,4 +62,5 @@ probably exports `NODE_ENV=development`. Run `env -u NODE_ENV npm run build`.
 - The repository is **public**. Never commit secret values, customer data, or real guest data.
   CI runs gitleaks on the full history of every PR and fails if `.env.example` has any value.
 - Changes go through PRs. No direct deploys or migrations against live databases from this repo.
+- There is no licence file. The code is public to read; no reuse rights are granted.
 - Contributor and agent conventions: [`AGENTS.md`](AGENTS.md).
