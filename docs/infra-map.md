@@ -27,12 +27,12 @@ flowchart LR
   EG --> GH["GitHub, our org:<br/>one repo per hotel"]
   EG -->|"evals: test assistant only;<br/>reports: call logs (read)"| VT["Vapi"]
   API -->|"PRs"| GH
-  API -->|"preview confirmed"| CG["Content gate<br/>(Fly app, private)"]
-  CG -->|"check + merge,<br/>content-only PRs"| GH
+  API -->|"requester confirmed diff"| CG["Eval gate<br/>(private Fly app,<br/>own GitHub App)"]
+  CG -->|"harness/eval-gate check, merge<br/>(D18), automatic reverts"| GH
   API --> LF["Langfuse (traces)"]
   SBX --> LF
-  GH -.->|"hotel repo CI on merge:<br/>push Vapi config"| VT
-  GH -.->|"hotel repo CI on merge"| INS["InsForge<br/>text/email agents, Vapi tool calls"]
+  GH -.->|"hotel repo CI on merge:<br/>test assistant, smoke evals,<br/>then production"| VT
+  GH -.->|"hotel repo CI on merge:<br/>staging, then production"| INS["InsForge<br/>text agent backends, Vapi tool calls"]
 ```
 
 ## Services
@@ -45,16 +45,22 @@ flowchart LR
 | Credential (egress) proxy | Fly.io app, reachable only from sandboxes | `vorflux-harness-egress-staging` / `vorflux-harness-egress` | `iad` | M2 | Owner / Bot |
 | Database, Auth, Storage, job queue | Supabase, 2 projects | `vorflux-harness-staging` / `vorflux-harness-prod` | `us-east-1` | M1 (local stack), M5 hosted | Owner / Bot (migration files) |
 | LLM tracing | Langfuse Cloud (or self-hosted, Q6) | one project per env | US | M1 | Owner / Bot |
-| GitHub App (branches, PRs) | GitHub, our org. Contents write, pull requests write, checks read, metadata read | `vorflux-harness-staging` / `vorflux-harness` | n/a | M2 | Owner / Bot |
-| Content gate: merges content-only PRs (D18) after preview confirm and all evals | Fly.io app, private network only, called by the API | `vorflux-harness-content-gate-staging` / `vorflux-harness-content-gate` | `iad` | M2 local, M5 hosted | Owner / Bot |
-| Content-gate GitHub App (only merge credential) | GitHub, our org. Contents write (merge), pull requests write, checks write (`harness/content-gate`), metadata read. No administration, workflows, or bypass | `vorflux-content-gate-staging` / `vorflux-content-gate` | n/a | M2 | Owner / Bot |
+| Main harness GitHub App (change-request service: `harness/*` branches, PRs) | GitHub, our org. Contents write, pull requests write, metadata read. No checks write, no merge path, no administration, no workflow write | `vorflux-harness-staging` / `vorflux-harness` | n/a | M2 | Owner / Bot |
+| Eval gate: posts `harness/eval-gate` and merges PRs that pass D18, plus automatic reverts. Kill switch: scale to zero, or a per-hotel pause flag | Separate Fly.io app, private network only, called by the API | `vorflux-harness-eval-gate-staging` / `vorflux-harness-eval-gate` | `iad` | M2 (code changes from M3); hosted M5 | Owner / Bot |
+| Eval-gate GitHub App (the only merge credential) | GitHub, our org. Contents write (merge), pull requests write, checks write (`harness/eval-gate`), metadata read. No administration, no workflow write, no bypass | `vorflux-eval-gate-staging` / `vorflux-eval-gate` | n/a | M2 | Owner / Bot |
 | Hotel repos (one per hotel; Vapi config in `vapi/`) | GitHub, our org; own CI pushes Vapi config on merge | `<org>/hotel-<slug>` (O12) | n/a | exist; onboarding automation M4 | Owner / our team |
 | Voice platform | Vapi (hosted): production assistant and test assistant per hotel | per hotel (O11) | Vapi | M3 (evals, read tools) | Owner / hotel repo CI |
 | Text/email agent backends | InsForge (not the harness) | per hotel | per hotel | exists | Hotel repo owners |
 | CI | GitHub Actions in this repo | n/a | n/a | now | Owner / Bot |
 
-Branch protection on hotel repos must let the content gate merge content-only PRs and block it
-on any other PR. How this works with GitHub rules is an **open M2 spike** (architecture 9.2).
+**What the eval gate merges (architecture D18, 9.6, 9.9).** Every change class (content, prompt,
+config, and backend code) goes live when CI, gitleaks, tests, and all evals pass with no score drop
+against `main`, the diff limits hold, and the requester confirmed the readable diff of that exact
+commit. Backend code merges through the gate only from M3, when staged rollout, post-deploy smoke
+evals, and automatic revert work; until then our team reviews it. A PR always goes to our team if
+it changes a protected path (Q28: `harness.yaml`, CODEOWNERS, CI, evals, migrations, payments,
+auth) or if `ReviewChange` rates it `High` (Q29). How hotel-repo branch protection allows exactly
+this is an **open M2 spike** (O13, architecture 9.3).
 
 ## Environments
 
@@ -68,17 +74,17 @@ on any other PR. How this works with GitHub rules is an **open M2 spike** (archi
 
 | Lives in | Names | Notes |
 |---|---|---|
-| Fly secrets, API app | `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, `SUPABASE_DB_URL`, `SUPABASE_JWT_ISSUER`, `LANGFUSE_BASE_URL`, `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY`, `FLY_API_TOKEN`, `FLY_SANDBOX_APP`, `GITHUB_APP_ID`, `GITHUB_APP_PRIVATE_KEY`, `GITHUB_APP_WEBHOOK_SECRET`, `SLACK_BOT_TOKEN`, `SLACK_SIGNING_SECRET`, `TELEGRAM_BOT_TOKEN`, `TELEGRAM_WEBHOOK_SECRET`, `INSFORGE_BASE_URL`, `INSFORGE_API_KEY`, `HARNESS_KMS_KEY_ID`, `CONTENT_GATE_API_TOKEN` | `FLY_API_TOKEN` is a deploy token scoped to the sandbox app only. |
+| Fly secrets, API app | `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, `SUPABASE_DB_URL`, `SUPABASE_JWT_ISSUER`, `LANGFUSE_BASE_URL`, `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY`, `FLY_API_TOKEN`, `FLY_SANDBOX_APP`, `GITHUB_APP_ID`, `GITHUB_APP_PRIVATE_KEY`, `GITHUB_APP_WEBHOOK_SECRET`, `SLACK_BOT_TOKEN`, `SLACK_SIGNING_SECRET`, `TELEGRAM_BOT_TOKEN`, `TELEGRAM_WEBHOOK_SECRET`, `INSFORGE_BASE_URL`, `INSFORGE_API_KEY`, `HARNESS_KMS_KEY_ID`, `EVAL_GATE_API_TOKEN` | `FLY_API_TOKEN` is a deploy token scoped to the sandbox app only. |
 | Fly `[env]` in `fly*.toml` (not secret) | `HARNESS_ENVIRONMENT`, `HARNESS_LOG_LEVEL`, `HARNESS_CORS_ORIGINS`, `PORT` | CI fails if a secret-like name appears here. |
 | Fly secrets, egress proxy app | `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY` | Injected per allowlisted host; sandboxes never see them. |
 | Sandbox machine env | `OPENCODE_SERVER_USERNAME`, `OPENCODE_SERVER_PASSWORD` | Generated per run, never stored. No long-lived secret. |
 | Vercel env (per project) | `NEXT_PUBLIC_HARNESS_API_URL`, `NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_ANON_KEY` | Public by design (RLS protects data). No server secrets in Vercel today. |
 | Supabase (Postgres rows) | per-org and per-hotel tenant secrets | Envelope-encrypted with `HARNESS_KMS_KEY_ID`. |
-| Fly secrets, content-gate app | `CONTENT_GATE_GITHUB_APP_ID`, `CONTENT_GATE_GITHUB_APP_PRIVATE_KEY`, `CONTENT_GATE_DB_URL`, `CONTENT_GATE_API_TOKEN` | The only merge credential. `CONTENT_GATE_DB_URL` uses a narrow Postgres role. `CONTENT_GATE_API_TOKEN` is also on the API app. |
+| Fly secrets, eval-gate app | `EVAL_GATE_GITHUB_APP_ID`, `EVAL_GATE_GITHUB_APP_PRIVATE_KEY`, `EVAL_GATE_DB_URL`, `EVAL_GATE_API_TOKEN` | The only merge credential. `EVAL_GATE_DB_URL` uses a narrow Postgres role: it reads confirmations and per-hotel pause flags and writes merge records. `EVAL_GATE_API_TOKEN` is also on the API app. |
 | Supabase rows, per hotel (Vapi) | `VAPI_TEST_PRIVATE_API_KEY` (test org), `VAPI_READ_PRIVATE_API_KEY` (prod org) | The proxy injects them for `api.vapi.ai`. It allows writes only to the test assistant and only `GET` with the prod key (Vapi private keys are org-wide). |
 | Hotel repo, GitHub environment `vapi-production` (branch `main` only) | secret `VAPI_PRIVATE_API_KEY`; variable `VAPI_ASSISTANT_ID` | Used only by the push-on-merge job. |
-| Hotel repo, GitHub environment `vapi-test` | secret `VAPI_TEST_PRIVATE_API_KEY`; variable `VAPI_TEST_ASSISTANT_ID` | Evals on PRs. Test org only, so PR code cannot reach production. |
-| Hotel backend env and Vapi | `VAPI_SERVER_SECRET` | Signs Vapi tool calls. Never in `vapi/assistant.json`. |
+| Hotel repo, GitHub environment `vapi-test` | secret `VAPI_TEST_PRIVATE_API_KEY`; variable `VAPI_TEST_ASSISTANT_ID` | Evals on PRs and the staged-rollout step. Test org only, so PR code cannot reach production. |
+| Hotel backend env and Vapi | `VAPI_SERVER_SECRET` | Signs Vapi tool calls. Never in `vapi/assistant.yaml`. |
 | GitHub Actions secrets (this repo) | `FLY_API_TOKEN_CI_READONLY` (optional) | Read-only; only for `flyctl config validate`. CI never deploys. |
 | Operator password manager | `FLY_API_TOKEN` (personal/deploy), `VERCEL_TOKEN`, `VERCEL_ORG_ID`, `VERCEL_PROJECT_ID`, `SUPABASE_ACCESS_TOKEN`, `SUPABASE_DB_PASSWORD` | Used from a human's machine for approved deploys and migrations. |
 
