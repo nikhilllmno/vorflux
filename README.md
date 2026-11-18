@@ -18,6 +18,7 @@ and learns from its work. The feature set follows
 | `docs/architecture.md` | Architecture and design, milestones, open questions |
 | `docs/infra-map.md` | One-page map: services, environments, regions, secrets by name, owners |
 | `docs/runbook-deploy.md` | First-time setup, routine deploy, rollback, health checks, secret rotation |
+| `docs/backlog.md` | Milestones with Linear links, Hermes feature-parity checklist |
 | `.github/` | CI workflow and PR template |
 | `.env.example` | Environment variable **names only** |
 
