@@ -1,0 +1,47 @@
+# Fly.io config for the control-plane API, STAGING. Not deployed by this repo or by CI.
+# A human deploys with owner approval: see docs/runbook-deploy.md.
+# Production uses fly.production.toml, so a bare `fly deploy` in backend/ can only hit staging.
+# Secrets are set with `fly secrets set` (names in docs/infra-map.md), never in this file.
+
+app = "vorflux-harness-api-staging"
+# Region (architecture D25): India pilot. Fly's region list (checked 2026-11-18) does not show
+# `bom` (Mumbai), so this is `sin` (Singapore). At staging setup run `fly platform regions`; if it
+# lists `bom`, change primary_region to "bom" in both fly*.toml files by PR (runbook F1a).
+primary_region = "sin"
+kill_signal = "SIGTERM"
+kill_timeout = "30s"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[deploy]
+  strategy = "rolling"
+
+[env]
+  HARNESS_ENVIRONMENT = "staging"
+  HARNESS_LOG_LEVEL = "INFO"
+  HARNESS_CORS_ORIGINS = '["https://vorflux-harness-web-staging.vercel.app"]'
+  PORT = "8080"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  min_machines_running = 0
+
+  [http_service.concurrency]
+    type = "requests"
+    soft_limit = 200
+    hard_limit = 250
+
+  [[http_service.checks]]
+    grace_period = "10s"
+    interval = "15s"
+    timeout = "2s"
+    method = "GET"
+    path = "/healthz"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "512mb"
