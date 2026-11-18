@@ -44,5 +44,5 @@ def test_registry_rejects_duplicate_and_unknown_kinds() -> None:
     with pytest.raises(ValueError, match="already registered"):
         registry.register(FakeRuntime())
     with pytest.raises(UnknownRuntimeError):
-        registry.get(RuntimeKind.OPENCODE)
+        registry.get(RuntimeKind.OPENAI_AGENTS_SDK)
     assert registry.kinds() == [RuntimeKind.FAKE]

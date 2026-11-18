@@ -1,7 +1,7 @@
 """The runtime-adapter contract every agent framework plugs into.
 
-One adapter per framework (Claude Agent SDK, OpenAI Agents SDK, LangChain Deep Agents, opencode)
-translates this contract to the framework's own API. Harness features (tenancy, approvals,
+One adapter per runtime (Claude Agent SDK, OpenAI Agents SDK) translates this contract to the
+runtime's own API. A later runtime needs only a new adapter. Harness features (tenancy, approvals,
 memory, skills, audit) live above this seam, so they work the same for every framework.
 See docs/architecture.md, section "Agent-runtime adapter layer".
 """
@@ -17,8 +17,6 @@ from harness.tenancy import TenantContext
 class RuntimeKind(StrEnum):
     CLAUDE_AGENT_SDK = "claude_agent_sdk"
     OPENAI_AGENTS_SDK = "openai_agents_sdk"
-    DEEP_AGENTS = "deep_agents"
-    OPENCODE = "opencode"
     FAKE = "fake"
 
 

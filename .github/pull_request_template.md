@@ -6,7 +6,7 @@
 
 - Hotels affected: <!-- all / list of hotel slugs / none -->
 - Agents affected: <!-- voice / text / email / harness only -->
-- Runtime adapters touched: <!-- claude_agent_sdk / openai_agents_sdk / deep_agents / opencode / none -->
+- Runtime adapters touched: <!-- claude_agent_sdk / openai_agents_sdk / none -->
 
 ## Safety checklist
 
