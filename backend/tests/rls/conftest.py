@@ -15,14 +15,12 @@ from __future__ import annotations
 import os
 from collections.abc import Iterator
 from typing import Any
-from urllib.parse import urlparse
 
 import psycopg
 import pytest
 
+from .local_db import NonLocalDatabaseError, check_local_database_url
 from .world import World, seed
-
-LOCAL_HOSTS = {"127.0.0.1", "localhost", "::1", "db", "postgres", "supabase_db"}
 
 
 def _database_url() -> str:
@@ -31,10 +29,10 @@ def _database_url() -> str:
         if os.environ.get("HARNESS_TEST_REQUIRE_DB") == "1":
             pytest.fail("HARNESS_TEST_REQUIRE_DB=1 but HARNESS_TEST_DATABASE_URL is not set")
         pytest.skip("HARNESS_TEST_DATABASE_URL is not set (local Supabase database)")
-    host = urlparse(url).hostname or ""
-    if host not in LOCAL_HOSTS:
-        pytest.fail(f"Refusing to run isolation tests against a non-local host: {host!r}")
-    return url
+    try:
+        return check_local_database_url(url, os.environ)
+    except NonLocalDatabaseError as exc:
+        pytest.fail(f"Refusing to run the isolation tests: {exc}")
 
 
 @pytest.fixture(scope="session")

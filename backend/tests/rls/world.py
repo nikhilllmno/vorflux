@@ -2,8 +2,11 @@
 
 Two orgs (A and B), each on its own plan, with two hotels each (A1, A2, B1, B2). Each org has
 one user per hotel role with an org-wide membership, one user per non-owner role with a
-membership narrowed to hotel 1, and one operator narrowed to hotel 2. Three users have no
-membership: an outsider, a code reviewer, and a platform (break-glass) user from our team.
+membership narrowed to hotel 1, and one operator narrowed to hotel 2. Two users mix roles and
+scopes: `A_mixed_hotels` is admin of hotel A1 and viewer of hotel A2, and `AB_mixed_orgs` is an
+org-wide admin of A and a viewer of hotel B1. Their admin rights must not carry into the scope
+where they are only viewers. Three users have no membership: an outsider, a code reviewer, and
+a platform (break-glass) user from our team.
 
 `expected_visible` is the behaviour contract of the policies, written without SQL: the tests
 compare what Postgres returns for a user against it.
@@ -141,6 +144,8 @@ class World:
 
 
 NO_MEMBERSHIP_USERS = ("outsider", "code_reviewer", "platform")
+# Users with several memberships that mix roles and scopes.
+MIXED_MEMBERSHIP_USERS = ("A_mixed_hotels", "AB_mixed_orgs")
 
 
 def member_names(org_key: str) -> list[str]:
@@ -185,6 +190,14 @@ def seed(conn: psycopg.Connection) -> World:
                 _add_membership(cur, world, org_id, org.hotels[0].id, user, role)
             user = _add_user(cur, world, f"{key}_hotel2_operator")
             _add_membership(cur, world, org_id, org.hotels[1].id, user, "operator")
+
+        org_a, org_b = world.org("A"), world.org("B")
+        user = _add_user(cur, world, "A_mixed_hotels")
+        _add_membership(cur, world, org_a.id, org_a.hotels[0].id, user, "admin")
+        _add_membership(cur, world, org_a.id, org_a.hotels[1].id, user, "viewer")
+        user = _add_user(cur, world, "AB_mixed_orgs")
+        _add_membership(cur, world, org_a.id, None, user, "admin")
+        _add_membership(cur, world, org_b.id, org_b.hotels[0].id, user, "viewer")
 
         _add_user(cur, world, "outsider")
         for role in ("code_reviewer", "platform"):  # our team, no membership

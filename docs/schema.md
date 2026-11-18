@@ -104,9 +104,10 @@ A write policy for clients, or a policy for `anon`, also fails them; that needs 
 
 | File | What it proves |
 |---|---|
-| `backend/tests/rls/test_rls_isolation.py` | Two orgs (A and B), each with two hotels, every hotel role org-wide and hotel-scoped, plus users with no membership and with each team role. For every user and table, the visible rows equal the expected set. No user of org A reads, inserts, updates, or deletes a row of org B, and no client role can write its own org either (by privilege, and by RLS alone if privileges were granted by mistake). A hotel-scoped member sees only their hotel. Also: no `sub` claim reads nothing, `anon` is denied, a removed membership takes effect at once, self-promotion fails. |
+| `backend/tests/rls/test_rls_isolation.py` | Two orgs (A and B), each with two hotels, every hotel role org-wide and hotel-scoped, plus two users that mix roles and scopes (admin of one hotel and viewer of another; org-wide admin of A and viewer of a hotel in B), and users with no membership and with each team role. For every user and table, the visible rows equal the expected set. No user of org A reads, inserts, updates, or deletes a row of org B, and no client role can write its own org either (by privilege, and by RLS alone if privileges were granted by mistake). A hotel-scoped member sees only their hotel, and admin rights never carry into a scope where the user is only a viewer. Also: no `sub` claim reads nothing, `anon` is denied, a removed membership takes effect at once, self-promotion fails. |
 | `backend/tests/rls/test_rls_catalog.py` | Schema-wide rules from the catalog: every `public` table is covered, RLS is on with a policy, policies are select-only for `authenticated`, grants, default privileges for new objects, tenant columns, foreign keys, `org_id`-first indexes, triggers, `SECURITY DEFINER` functions pin `search_path`. |
 | `backend/tests/rls/test_tenancy_constraints.py` | Data rules that hold for the service role too: cross-org hotel in a membership, hotel-scoped owner, duplicate membership, tenant key changes, time-boxed `platform`, unknown runtime ids, global hotel slugs, cascade on org delete, plan in use. |
+| `backend/tests/rls/test_local_db_guard.py` | Offline: the local-only guard rejects URLs that libpq could send to another server (`?host=`, `?hostaddr=`, services, several hosts, no host, `PGHOSTADDR` and `PGSERVICE`). |
 | `backend/tests/test_supabase_migrations.py` | Offline (runs in the backend job): migration file names, RLS enabled in the same file as each `create table`, no client write grants, `supabase/config.toml` keeps `private` unexposed and seeds off, `web/` never names the service role. |
 
 All rows are synthetic (`@example.test`) and every test runs in a transaction that is rolled back.
@@ -131,6 +132,8 @@ supabase stop --no-backup         # from the repo root, when done
 
 Without `HARNESS_TEST_DATABASE_URL`, `uv run pytest` skips the database tests. The tests refuse
 any host other than a local one (`127.0.0.1`, `localhost`, `::1`, or a local container name).
+They check the parameters libpq will use, so `?host=`, `?hostaddr=`, a service, several hosts,
+or `PGHOSTADDR` and `PGSERVICE` in the environment are refused too.
 
 ## Hosted projects
 

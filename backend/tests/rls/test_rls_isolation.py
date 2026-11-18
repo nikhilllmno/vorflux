@@ -22,6 +22,7 @@ from psycopg import errors, sql
 
 from .world import (
     HOTEL_SCOPED_ROLES,
+    MIXED_MEMBERSHIP_USERS,
     NO_MEMBERSHIP_USERS,
     TABLES,
     World,
@@ -32,7 +33,12 @@ from .world import (
 
 Conn = psycopg.Connection[Any]
 
-READ_ACTORS = [*member_names("A"), *member_names("B"), *NO_MEMBERSHIP_USERS]
+READ_ACTORS = [
+    *member_names("A"),
+    *member_names("B"),
+    *MIXED_MEMBERSHIP_USERS,
+    *NO_MEMBERSHIP_USERS,
+]
 # Writers come from org A; target org B is "another org", target org A is "own org".
 WRITE_ACTORS = [*member_names("A"), *NO_MEMBERSHIP_USERS]
 WRITE_OPS = ("insert", "update", "delete")
@@ -110,6 +116,39 @@ def test_org_wide_admin_sees_every_membership_of_their_org(conn: Conn, world: Wo
     with as_user(conn, world.users["A_admin"]):
         visible = select_ids(conn, "memberships")
     assert visible == world.ids_of_org("memberships", "A")
+
+
+def test_hotel_admin_rights_do_not_carry_into_a_viewer_hotel(conn: Conn, world: World) -> None:
+    # Admin of hotel A1, viewer of hotel A2: sees both hotels, but in A2 only their own
+    # membership. A helper that checked the role on one membership and the scope on another
+    # would leak the other A2 memberships.
+    user_id = world.users["A_mixed_hotels"]
+    hotel_1, hotel_2 = world.org("A").hotels
+    with as_user(conn, user_id):
+        assert select_ids(conn, "hotels") == {hotel_1.id, hotel_2.id}
+        visible = select_ids(conn, "memberships")
+        assert select_ids(conn, "plans") == set()
+    in_hotel_1 = {m.id for m in world.memberships if m.hotel_id == hotel_1.id}
+    mine = {m.id for m in world.memberships_of(user_id)}
+    assert visible == in_hotel_1 | mine
+    others_in_hotel_2 = {
+        m.id for m in world.memberships if m.hotel_id == hotel_2.id and m.user_id != user_id
+    }
+    assert others_in_hotel_2
+    assert visible.isdisjoint(others_in_hotel_2)
+
+
+def test_org_admin_rights_do_not_carry_into_another_org(conn: Conn, world: World) -> None:
+    # Org-wide admin of A, viewer of hotel B1: full admin view of A, viewer view of B1 only.
+    user_id = world.users["AB_mixed_orgs"]
+    org_a, org_b = world.org("A"), world.org("B")
+    with as_user(conn, user_id):
+        assert select_ids(conn, "orgs") == {org_a.id, org_b.id}
+        assert select_ids(conn, "plans") == {org_a.plan_id}
+        assert select_ids(conn, "hotels") == {h.id for h in org_a.hotels} | {org_b.hotels[0].id}
+        visible = select_ids(conn, "memberships")
+    mine_in_b = {m.id for m in world.memberships_of(user_id) if m.org_id == org_b.id}
+    assert visible == world.ids_of_org("memberships", "A") | mine_in_b
 
 
 @pytest.mark.parametrize("table", TABLES)
