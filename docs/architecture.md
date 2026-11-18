@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | Draft for review (v0.5: round-5 answers: protected paths, two Vapi orgs per hotel, Beds24 first, revert rules, India region for the pilot; see Section 14). Nothing here is deployed. |
+| Status | Draft for review (v0.5.1: main App reads checks, 4 CI jobs, key rotation default; v0.5: round-5 answers: protected paths, two Vapi orgs per hotel, Beds24 first, revert rules, India region for the pilot; see Section 14). Nothing here is deployed. |
 | Date | 2026-11-18 |
 | Scope | Design of the harness, plus the foundations that ship in the same PR |
 | Reference system | [Hermes Agent](https://github.com/NousResearch/hermes-agent) (MIT), reviewed at commit `f7e2898a`, 2026-11-17 |
@@ -255,7 +255,7 @@ flowchart LR
 | **Scheduler** | Cron jobs and event-triggered jobs per hotel. Each fire creates a run in a fresh session (or in a bound session for heartbeats). |
 | **Harness MCP server** | The tool surface for every runtime: memory, skills, session search, delegation, kanban, connectors, approvals, change requests. Each call carries a run-scoped token. |
 | **Approval service** | Holds pending approvals, routes them to the UI, Slack, or Telegram, records the decision, and resumes the run. |
-| **Change-request service** | Owns the main GitHub App, repo allowlists, branch naming, PR creation, and PR status sync. No merge rights. |
+| **Change-request service** | Owns the main GitHub App, repo allowlists, branch naming, PR creation, PR status sync, and check evidence (reads checks). No merge rights and no check writes. |
 | **Eval gate** | A separate private service with its own GitHub App. Posts `harness/eval-gate` and merges PRs that pass the gate (D18). Has a kill switch. |
 | **Sandbox** | Runs the adapter, the runtime, shell and file tools, and the browser for one run. Has no database access and no long-lived secrets. |
 | **Egress proxy** | Default-deny outbound network. Injects provider and GitHub credentials for allowlisted hosts. Logs every request per run. |
@@ -900,8 +900,9 @@ cases in a separate CR for our team. The harness ships starter suites as skills.
 - Staged rollout, post-deploy smoke evals, and automatic revert. Daily digest to our team.
 - **Two GitHub Apps** (D9):
   - The **main harness App** (change-request service): contents (write, for `harness/*` branches),
-    pull requests (write), metadata (read). No checks write, no merge path, no administration,
-    no workflow-write permission.
+    pull requests (write), checks (read, to sync PR status and attach check evidence), metadata
+    (read). No checks write, no merge path, no administration, no workflow-write permission.
+    Read access to checks gives no merge path and no way to post `harness/eval-gate`.
   - The **eval-gate App**: contents (write, needed to merge), pull requests (write), checks
     (write, for `harness/eval-gate`), metadata (read). No administration, no workflow-write
     permission, and it cannot bypass branch protection. Its key lives only in the eval-gate
@@ -909,8 +910,9 @@ cases in a separate CR for our team. The harness ships starter suites as skills.
     sandboxes.
 - **Kill switch.** Our team can stop all automatic merges at once (scale the eval-gate app to
   zero), or pause one hotel with a flag. PRs then wait; nothing merges by itself.
-- **Key rotation.** Both App keys and the gate's API token rotate on a schedule and at once after
-  any suspected leak (docs/runbook-deploy.md, PR #3).
+- **Key rotation.** Both App keys and the gate's API token rotate every 90 days (default, Q32)
+  and at once after any suspected leak (`docs/runbook-deploy.md`,
+  https://github.com/nikhilllmno/vorflux/pull/3).
 - **Vapi keys** (D21, O11): production assistants change only through the hotel repo's CI push
   workflow. The harness writes only to the test assistant, through the credential proxy. The
   proxy allows only `GET` with the production read key.
@@ -1102,7 +1104,7 @@ report goes to the hotel's Slack channel, Telegram chat, email, or the web app.
 | Code hosting | Two GitHub Apps: main harness App and eval-gate App; one `hotel-<slug>` repo per hotel in our org |
 | Hotel integrations | Vapi API, cloud PMS APIs, our text agent backend; browser fallback |
 | LLM functions | BAML (`baml-py`, `baml-cli test`) for the harness change functions and hotel-repo structured outputs |
-| CI | GitHub Actions: backend checks, web checks, gitleaks |
+| CI | GitHub Actions, 4 jobs: backend checks, web checks, gitleaks, and deploy config (validates `Dockerfile`, `fly.toml`, `vercel.json`; added with the infra map, https://github.com/nikhilllmno/vorflux/pull/3) |
 
 Repository layout (this PR creates the parts marked "now"):
 
@@ -1171,7 +1173,7 @@ harness agent itself and are estimates, not commitments.
 The owner answered these questions on 2026-11-18. Q11 to Q20 come from the use-case discussion
 (Section 2.4). Q24 to Q27 come from the change-flow discussion (hotel-stack reference, BAML).
 Q5, Q21, Q23, Q28, Q29, and Q30 were answered in round 5. Q7 and Q31 keep our defaults, because
-the owner did not change them. "Owner" means the owner chose the answer.
+the owner did not change them. Q32 is our default and waits for the owner to confirm. "Owner" means the owner chose the answer.
 "Owner asked us" means the owner asked us to recommend, and the answer is our recommendation.
 
 | # | Question | Answer | Status |
@@ -1207,6 +1209,7 @@ the owner did not change them. "Owner" means the owner chose the answer.
 | Q29 | Does a `High` risk from `ReviewChange` send a PR to our team? | Yes. | Decided (owner) |
 | Q30 | Vapi org layout (O11)? | Two Vapi orgs per hotel, production and test, so a test key cannot touch a production assistant (D21). | Decided (owner) |
 | Q31 | Repo naming and Vapi push workflow (O12)? | Repos named `hotel-<slug>`; we write one reference Vapi push workflow in M3 that every hotel repo uses. | Decided (our default; owner did not change it) |
+| Q32 | How often do the two GitHub App keys and the eval-gate API token rotate (O14)? | Default: every 90 days, and at once after a suspected leak. The owner can change the period. | **Open (default applied)** |
 
 ---
 
