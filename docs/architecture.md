@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | Draft for review (v0.3: owner answers on the use case applied, see Section 2.4 and Section 14). Nothing here is deployed. |
+| Status | Draft for review (v0.4: eval gate for all changes, BAML, standard hotel repo layout, voice and text scope; see Section 2.4, Section 9, and Section 14). Nothing here is deployed. |
 | Date | 2026-11-18 |
 | Scope | Design of the harness, plus the foundations that ship in the same PR |
 | Reference system | [Hermes Agent](https://github.com/NousResearch/hermes-agent) (MIT), reviewed at commit `f7e2898a`, 2026-11-17 |
@@ -17,7 +17,7 @@
 6. [Agent-runtime adapter layer](#6-agent-runtime-adapter-layer)
 7. [Multi-tenancy and isolation (B2B)](#7-multi-tenancy-and-isolation-b2b)
 8. [Sandboxing](#8-sandboxing)
-9. [Safe changes to hotel voice, text and email agents](#9-safe-changes-to-hotel-voice-text-and-email-agents)
+9. [Safe changes to hotel voice and text agents](#9-safe-changes-to-hotel-voice-and-text-agents)
 10. [Other subsystems](#10-other-subsystems)
 11. [Technology stack and repository layout](#11-technology-stack-and-repository-layout)
 12. [Phased milestone plan](#12-phased-milestone-plan)
@@ -32,7 +32,8 @@
 We build one **harness** that every hotel customer uses. The harness runs an operations-and-coding
 agent for each hotel. That agent can:
 
-- build new voice, text, and email agents for the hotel, and change the code of the existing ones;
+- change the hotel's voice agent (Vapi) and text agent (our own code): knowledge base, facts,
+  system prompt, agent config, tools, and backend code. Email and other agent types come later;
 - send scheduled reports (calls, messages, bookings, agent quality) and do hotel operations in
   the PMS, channel manager, and OTA extranets, API first and browser as a fallback;
 - do other day-to-day tasks with skills and tools (browser, files, web, connectors);
@@ -52,19 +53,25 @@ B2B**. So we keep the Hermes *features* and *learning loop*, but we change three
    adapter, so they behave the same on every framework.
 
 The day-to-day users are **non-technical hotel staff**. They ask for changes and tasks in plain
-language and see plain-language previews and results, never diffs or PRs.
+language. For each change they see a plain-language summary and a readable before-and-after of the
+changed text; our team sees the full git diff (Section 9.7).
 
-Changes to hotel agents never go straight to production. The harness works on a branch in a
-sandbox, runs tests and agent-specific evals, and opens a PR. Then there are two paths:
+The harness has the full context of each hotel's agents (Section 9.4). Every hotel repo uses one
+standard layout (D24). The harness makes and explains changes with typed **BAML** functions (D23).
+Changes never go straight to production. The harness works on a branch in a sandbox, runs checks,
+tests, and agent-specific evals, and opens a PR. Then:
 
-- **Content changes** (FAQ, hours, rates text, greetings) in paths that the repo's `harness.yaml`
-  declares as content: the requester confirms a plain-language before-and-after preview, and the
-  control plane's **content gate** merges the PR when all checks and evals pass (D18).
-- **All other changes** (code, prompt logic, tools, config): **our team** reviews, approves,
-  and merges.
+- When all checks and evals pass and the requester confirms the readable diff, the **eval gate**
+  merges the PR (D18). This applies to KB, facts, prompts, agent config, tools, and backend code.
+  Backend code joins in M3, when staged rollout and automatic revert work.
+- A PR that touches a protected path (evals, CI, `harness.yaml`, migrations, payments, auth) or
+  that the risk check rates `High` goes to **our team** for review.
+- The target repo's CI deploys in stages: staging and the Vapi test assistant, smoke evals, then
+  production. A failed smoke eval or a metric drop starts an automatic revert. Our team gets a
+  daily digest with the full diff.
 
-The target repository's own CI/CD deploys after merge. The harness agent itself never holds
-merge rights and never deploys. Hotel **operations** that change real systems (rates, inventory,
+The harness agent itself never holds merge rights and never deploys. The eval gate is a separate
+service with its own GitHub App. Hotel **operations** that change real systems (rates, inventory,
 bookings, campaigns) run only after a hotel staff member approves each action (D19).
 
 The default runtime for the harness agent is the **Claude Agent SDK**, with **opencode** as the
@@ -78,8 +85,8 @@ model-agnostic second runtime (D14).
 
 - Give each hotel a capable agent with Hermes-level features: skills, tools, memory, sessions,
   scheduling, delegation, browser use, connectors, and self-improvement.
-- Let that agent build and change hotel voice, text, and email agents safely, with branches, PRs,
-  evals, and human approval (or the content gate for content-only changes).
+- Let that agent change hotel voice and text agents safely, with branches, PRs, evals, a
+  readable diff, and the eval gate; and add more agent types later.
 - Send scheduled reports and do hotel operations in hotel systems, with an approval for every
   action that changes a real system.
 - Be usable by non-technical hotel staff from the web app, Slack, and Telegram.
@@ -91,7 +98,8 @@ model-agnostic second runtime (D14).
 ### 2.2 Non-goals (v1)
 
 - The harness agent does not merge PRs, deploy, or run database migrations against live systems.
-  The only automatic merge is the control-plane content gate for content-only PRs (D18).
+  The only automatic merge is the eval gate, a separate service (D18).
+- No email agents in v1. The design keeps agent types pluggable so that email can join later.
 - No desktop app, terminal UI, wake word, or other personal-assistant surfaces from Hermes.
 - No model training pipeline (Hermes batch trajectories and trajectory compression). We keep
   transcripts so that we can add this later.
@@ -103,7 +111,7 @@ model-agnostic second runtime (D14).
 |---|---|
 | Organization (org) | One B2B customer account, for example a hotel group. The billing and contract unit. |
 | Hotel | One property inside an org. Most data, skills, memory, and agents are hotel-scoped. |
-| Product agent | A guest- or staff-facing agent that we build for a hotel: voice, text (SMS/WhatsApp/web chat), or email. It lives in its own repository. |
+| Product agent | A guest- or staff-facing agent that we build for a hotel: voice (Vapi) or text (SMS/WhatsApp/web chat, our own code). Email and others come later. The hotel's agents live in one repository per hotel. |
 | Harness agent | The operations-and-coding agent that the harness runs for a hotel. It builds and changes product agents and does tasks. |
 | Runtime | An agent framework that executes a harness agent turn: Claude Agent SDK, OpenAI Agents SDK, Deep Agents, or opencode. |
 | Adapter | Harness code that maps one runtime to the harness contract (`backend/src/harness/runtimes/base.py`). |
@@ -112,23 +120,30 @@ model-agnostic second runtime (D14).
 | Sandbox | An isolated microVM or container that holds the workspace for a run. |
 | Skill | A versioned `SKILL.md` folder (agentskills.io format) that tells the agent how to do a task. |
 | Change request (CR) | A tracked request to change a product agent. It ends as a PR, or it is cancelled. |
-| Approver | A human with the right role who approves an action or a PR. Our team approves code PRs; hotel staff approve hotel operations and confirm content previews. |
-| Content change | A change only to files that match `content_paths` in the repo's `harness.yaml` (for example FAQ entries, hours, greetings). |
-| Content gate | The control-plane service that merges a content-only PR after the requester's confirmation and green checks and evals (D18). |
+| Approver | A human with the right role who approves an action or a PR. Hotel staff confirm their own changes and approve hotel operations; our team reviews protected-path and `High`-risk PRs. |
+| Change class | The kind of change, from `change_classes` in `harness.yaml`: content (KB, facts, policies), prompt, config (Vapi, tools), or code. It decides which evals run and how the staff diff looks. |
+| Protected path | A path in `harness.yaml` that always needs our team's review: evals, CI, `harness.yaml`, CODEOWNERS, migrations, payments, auth. |
+| Eval gate | The separate control-plane service, with its own GitHub App, that merges a PR after the requester's confirmation, green checks and evals, and the risk check (D18). Earlier drafts and PR #3 call it the content gate. |
+| Readable diff | The staff view of a change: a before-and-after of each changed prompt section, KB entry, fact, or setting, with changed lines marked, plus a plain-language summary (Section 9.7). |
+| BAML | A typed language for LLM functions with tests (`baml-cli test`). The harness uses it for its change functions (D23). |
+| Agent context | Everything the harness reads about a hotel's agents before a change (Section 9.4). |
 | Hotel operation | An action that changes a real hotel system or reaches guests: rates, inventory, bookings, guest messages, campaigns. Read-only work is not a hotel operation. |
 
 ### 2.4 Use case (owner answers, 2026-11-18)
 
 | Topic | Answer | Effect on the design |
 |---|---|---|
-| Day-to-day users | Non-technical hotel staff (general managers, front office) | Plain-language requests, previews, and results. No diffs, PR jargon, or eval tables in the hotel UI (Section 10.11). |
+| Day-to-day users | Non-technical hotel staff (general managers, front office) | Plain-language requests and results. A readable diff, but no PR jargon or eval tables, in the hotel UI (Section 10.11). |
 | Product-agent code | One independent repository per hotel, in our GitHub org. No shared template. | Repo allowlist per hotel. A bug can exist in many repos, so the harness offers multi-repo fixes on request (Section 9.6). |
-| Content changes | Go live when evals pass, after the requester confirms a preview. No review by our team. | Content gate with auto-merge (D18, Section 9.3). |
-| Code and prompt-logic changes | Our team approves and merges. | Draft PR flow (D9, D16). |
+| All changes (KB, facts, prompt, config, code) | Go to production when all evals pass, after the requester confirms the diff. No review by our team, except protected paths and `High` risk (our defaults, Q28, Q29). Owner changed this on 2026-11-18 (before: our team approved code). | Eval gate (D18, Section 9.6), staged rollout, automatic revert, daily digest. |
+| Diff | Staff see a readable diff and summary; our team sees the full git diff. | Section 9.7. |
+| How edits are made | BAML files (the role was left to us). | BAML change functions in the harness; BAML structured outputs in hotel repos (D23). |
+| Repo layout | One standard layout for every hotel repo; the harness helps move existing repos. | Section 9.2 (D24). |
+| Agents in scope | Voice (Vapi) and text (our own code). Email deferred; more agents later. | Pluggable agent types in `harness.yaml` (Section 9.3). |
 | Scope | Agent changes, scheduled reports, and hotel operations from the start. | Reports and operations are first-class (Section 10.10) and in the milestones from M3. |
 | Hotel operations | Hotel staff approve each action that changes a real system. Read-only work runs without approval. | Per-action preview and approval (D19). |
 | Channels | Web app, Slack, Telegram. | Connector gateway (Section 10.6). |
-| Voice platform | Vapi (hosted). Text and email agents run in our backend and deploy by CI on merge. | Vapi config lives in each hotel repo; the repo's CI pushes it to Vapi on merge; evals use Vapi's test and chat APIs (D21). |
+| Voice platform | Vapi (hosted). The text agent is our own code and deploys by CI on merge. The harness may also improve the voice agent. | Vapi config lives in each hotel repo; the repo's CI pushes it to production on merge; evals run on a test assistant (D21). |
 | Hotel systems | API first; browser only where no API exists. First hotels use cloud PMSs with APIs. | PMS connectors over API; browser fallback for OTA extranets (D22). |
 | Scale | 5 to 20 hotels in the pilot; about 100 within 12 months. | Onboarding automation and multi-repo tools by M4; review load is a tracked risk (Section 13). |
 
@@ -148,20 +163,22 @@ Each decision has a short reason. Section 14 lists the owner's answers to the op
 | D6 | **Supabase** is the system of record: Postgres (with row-level security), Auth, Storage, pgvector. | Owner listed Supabase. RLS gives a second tenant guard under the API. pgvector covers memory and session search. |
 | D7 | FastAPI control plane on Fly.io. Next.js UI on Vercel. | Owner's stack. |
 | D8 | **InsForge hosts product-agent backends only.** The harness itself does not use InsForge; its system of record is Supabase (Q1). | One system of record for harness data. Product agents can still use InsForge's database, auth, storage, and edge functions. |
-| D9 | Product-agent repositories live in **our GitHub org**, one independent repo per hotel (Q2, Q12). One **GitHub App** installation with per-hotel repo allowlists does all code work. The harness agent pushes `harness/*` branches and opens PRs. It never merges, deploys, or force-pushes; the only merge path without a human is the content gate (D18). | Safe by default, auditable, and the same flow that engineers already trust. One org means one set of branch-protection rules to enforce. |
-| D10 | Every product-agent repository that the harness may change has a **`harness.yaml` manifest**: agent type, framework, test and eval commands, `content_paths`, protected and forbidden paths, deploy owner. Our team owns the manifest through CODEOWNERS; the harness can never change it. | The harness needs a contract per repo to run the right checks, to know what it must not touch, and to know which changes may use the content gate. |
+| D9 | Product-agent repositories live in **our GitHub org**, one independent repo per hotel (Q2, Q12). One **GitHub App** installation with per-hotel repo allowlists does all code work. The harness agent pushes `harness/*` branches and opens PRs. It never merges, deploys, or force-pushes. The only merge path without a human is the eval gate (D18), which has **its own GitHub App**; the main App has no merge or check-write path. | Safe by default, auditable, and the same flow that engineers already trust. One org means one set of branch-protection rules to enforce. |
+| D10 | Every product-agent repository that the harness may change has a **`harness.yaml` manifest**: agent types, test and eval commands, `change_classes`, protected and forbidden paths, deploy owner. Our team owns the manifest through CODEOWNERS; the harness can never change it. | The harness needs a contract per repo to run the right checks, to know what it must not touch, and to know which changes need our team. |
 | D11 | Self-improvement writes only to **hotel or org scope**. Promotion of a learned skill to the shared (global) library needs human review. | One hotel's learning must not change another hotel's agent without review. |
 | D12 | Scheduling and workflows run on a **Postgres-backed job queue** with leases. No separate workflow engine (Q4). | Fewer moving parts. The kanban board plus the job queue covers multi-step work. The job interface still hides the queue if this changes. |
 | D13 | Secrets are never in the sandbox filesystem or environment where possible. An **egress proxy injects credentials** for allowlisted hosts. | A prompt-injected agent cannot leak what it cannot read. Same idea as NVIDIA OpenShell, which Hermes recommends. |
 | D14 | The **default harness runtime is the Claude Agent SDK** for all roles. **opencode** is the second runtime, for hotels or tasks that need non-Anthropic or open-weight models. The OpenAI Agents SDK and Deep Agents adapters come later and are opt-in per hotel (Q3). | See Section 6.6. The Claude Agent SDK ships a complete coding loop (file edit, shell, search, sub-agents, compaction, session resume, hooks, permission callback, MCP) in Python. opencode ships the same kind of loop for any model. The other two are frameworks where we would build the coding tools ourselves. |
 | D15 | **One LLM tracing tool for all runtimes: Langfuse**, cloud or self-hosted (Q6). | Langfuse has integrations for all four runtimes: OpenInference instrumentation for the Claude Agent SDK and the OpenAI Agents SDK, a LangChain callback for Deep Agents, and OpenTelemetry export for opencode. Self-hosting is possible if residency (Q5) requires it. |
-| D16 | **Hotel staff request and drive changes; only our team approves and merges code and prompt-logic changes** (Q8). Hotel staff approve hotel operations (D19) and confirm content previews (D18). | Hotels own what their agents should say and do; we own code quality and safety across all hotels. |
+| D16 | **Hotel staff request and confirm changes; evals decide** (Q8, Q24). Changes of every class go live through the eval gate. Our team reviews only protected-path and `High`-risk PRs, gets a daily digest with the full diff, and can revert any change. Hotel staff approve hotel operations (D19). | Owner decision (changed 2026-11-18; before, our team approved all code). Fast changes for hotels; protected paths and staged rollout limit the damage of a bad change. |
 | D17 | The repository has **no licence file** (Q9). | Owner decision. The code is public to read, but no reuse rights are granted. Hermes attribution stays in `THIRD_PARTY_NOTICES.md`. |
-| D18 | **Content gate.** A PR that changes only `content_paths` merges automatically when (1) the requester confirmed a plain-language preview of that exact commit, (2) CI, gitleaks, and evals pass, and (3) the content diff limits hold. The control plane merges, never the agent or the sandbox. After merge the harness watches live metrics and opens a revert PR on a drop (Q13, Q16). | Hotels get fast content updates without waiting for our team. The requester's preview catches misunderstandings that evals cannot see (for example 7:30 instead of 7:00). Path rules come from the default branch, so the agent cannot widen them. |
+| D18 | **Eval gate.** A PR merges automatically when (1) the requester confirmed the readable diff of that exact commit, (2) CI, gitleaks, tests, and evals pass with no score drop against `main`, (3) diff limits hold, (4) no protected path changed, and (5) `ReviewChange` did not rate it `High`. The eval gate is a separate private service with its own GitHub App, a kill switch, and key rotation; never the agent or the sandbox. After merge the repo's CI rolls out in stages, and a failed smoke eval or a metric drop starts an automatic revert (Q13, Q16, Q24). | Hotels get changes live without waiting for our team. The requester's confirmation catches misunderstandings that evals cannot see (for example 7:30 instead of 7:00). Path rules come from the default branch, so a change cannot widen them. |
 | D19 | **Every hotel operation needs a hotel staff approval of a plain-language preview**, one action at a time. Read-only work (reports, lookups) needs no approval (Q15). | Rates, inventory, bookings, and guest messages affect revenue and guests, and a sent message cannot be undone. |
 | D20 | **Multi-repo fixes on request.** An engineer on our team describes a fix once and selects hotel repos. The harness opens one PR per repo, adapted to that repo's code, and reports where the fix did not apply (Q20). | Hotel repos are independent with no shared template, so the same bug can exist in many repos. Each PR still goes through normal review. |
-| D21 | **Vapi is the voice platform.** Each voice repo holds its Vapi assistant config as code. The repo's CI pushes it to Vapi on merge; the harness never calls Vapi write APIs. Voice evals run through Vapi's test and chat APIs against a test assistant (Q17). | One source of truth in git, with review and revert. Evals test the real platform behaviour. |
+| D21 | **Vapi is the voice platform.** Each hotel repo holds its Vapi assistant config as code. **Production assistants change only through the CI push-on-merge workflow** in the hotel repo, which saves the live config first, for rollback. The harness writes **only to each hotel's test assistant**, and only through the credential proxy; for production it reads only (`GET`). Default: two Vapi orgs per hotel, production and test, because a Vapi private key reaches every assistant in its org (Q17, Q30). | One source of truth in git, with revert. Evals test the real platform behaviour, and a test key can never touch a production assistant. |
 | D22 | **Hotel systems: API first, browser fallback.** PMS connectors use the PMS API (first hotels use cloud PMSs). The browser is used for OTA extranets and systems with no API, with logins from the credential vault (Q18, Q19). | APIs are faster, cheaper, and safer. The browser covers the rest. |
+| D23 | **BAML for typed LLM functions.** The harness's change functions (`DraftChange`, `ReviewChange`, `ExplainDiff`) are BAML functions with BAML tests. In hotel repos, `baml_src/` holds the agents' structured-output functions (intent, call summary, extraction), tested with `baml-cli test`. System prompts and KB stay in Markdown and `facts.yaml` (Q25). | Typed edits and reviews, prompts versioned in git, and tests as eval signals. Vapi needs a plain system prompt string, and Markdown keeps the staff diff readable. |
+| D24 | **One standard hotel repo layout** (Section 9.2): `facts.yaml`, `prompts/voice`, `prompts/text`, `kb/`, `policies/`, `tools.yaml`, `vapi/`, `baml_src/`, `evals/`, `src/`, `AGENTS.md`, `harness.yaml`. Repos are named `hotel-<slug>` (Q27, Q31). | The harness knows where each kind of change goes and checks and publishes it the same way for every hotel. Based on the hotel-stack reference repo, not copied. |
 
 ---
 
@@ -186,7 +203,7 @@ flowchart LR
     ORCH["Run orchestrator<br/>queue + leases"]
     SCHED["Scheduler<br/>cron + event triggers"]
     APPR["Approval service"]
-    CRS["Change-request service<br/>GitHub App"]
+    CRS["Change-request service<br/>main GitHub App"]
     MCP["Harness MCP server<br/>tools, memory, skills"]
   end
 
@@ -200,6 +217,8 @@ flowchart LR
   DB[("Supabase<br/>Postgres + RLS, Auth,<br/>Storage, pgvector")]
   EG["Egress proxy<br/>allowlist + credential injection"]
   GH["GitHub<br/>hotel agent repos"]
+  GATE["Eval gate<br/>private Fly app,<br/>own GitHub App"]
+  VAPI["Vapi"]
   LLM["Model providers"]
 
   UI --> API
@@ -220,6 +239,9 @@ flowchart LR
   SB --> EG
   EG --> LLM
   EG --> GH
+  EG -->|"test assistant writes;<br/>production reads"| VAPI
+  API -->|"requester confirmed"| GATE
+  GATE -->|"merge"| GH
 ```
 
 ### 4.1 Components
@@ -232,7 +254,8 @@ flowchart LR
 | **Scheduler** | Cron jobs and event-triggered jobs per hotel. Each fire creates a run in a fresh session (or in a bound session for heartbeats). |
 | **Harness MCP server** | The tool surface for every runtime: memory, skills, session search, delegation, kanban, connectors, approvals, change requests. Each call carries a run-scoped token. |
 | **Approval service** | Holds pending approvals, routes them to the UI, Slack, or Telegram, records the decision, and resumes the run. |
-| **Change-request service** | Owns the GitHub App, repo allowlists, branch naming, PR creation, and PR status sync. |
+| **Change-request service** | Owns the main GitHub App, repo allowlists, branch naming, PR creation, and PR status sync. No merge rights. |
+| **Eval gate** | A separate private service with its own GitHub App. Posts `harness/eval-gate` and merges PRs that pass the gate (D18). Has a kill switch. |
 | **Sandbox** | Runs the adapter, the runtime, shell and file tools, and the browser for one run. Has no database access and no long-lived secrets. |
 | **Egress proxy** | Default-deny outbound network. Injects provider and GitHub credentials for allowlisted hosts. Logs every request per run. |
 
@@ -289,7 +312,7 @@ state. "New" means Hermes does not have it. "Defer" and "Skip" are explicit choi
 | Browser automation | `browser_exec` over CDP, cloud browsers, real-profile mode, `browser_vault` | Headless Chromium in the sandbox (default) or a cloud browser provider. A credential vault fills logins without exposing them to the model. No "real profile" copy of a user's browser in production. | M4 |
 | Chrome extension | Not in Hermes (Hermes attaches to a running Chrome over CDP) | **New:** Manifest V3 extension for hotel staff. It sends page context to a session, and it lets the agent act in the staff member's open tab, with per-action consent, for systems that have no API (PMS, channel managers, OTA extranets). | M5 |
 | Computer use | `computer_use` via cua-driver | Defer. Browser use covers the hotel back-office systems we know about. | Defer |
-| Vision, image generation, TTS, STT, voice mode | `vision_tools.py`, `image_generation_tool.py`, `tts_tool*.py`, `transcription*.py` | Vision and image generation as MCP tools (email creatives). TTS/STT only as test tools for voice-agent evals (Section 9.4). No voice mode for the harness agent itself in v1. | M3, M4 |
+| Vision, image generation, TTS, STT, voice mode | `vision_tools.py`, `image_generation_tool.py`, `tts_tool*.py`, `transcription*.py` | Vision and image generation as MCP tools. TTS/STT only as test tools for voice-agent evals (Section 9.8). No voice mode for the harness agent itself in v1. | M3, M4 |
 | MCP client, catalog, OAuth | `tools/mcp_tool*.py`, `optional-mcps/` | Hotels can connect approved MCP servers from a curated catalog. Each connection is per hotel with OAuth tokens in the secret store. | M4 |
 | Dangerous-command approval, smart guardian, yolo | `tools/approval*.py` | Policy engine: per toolset and per hotel, each action is `allow`, `ask`, or `deny`. `ask` becomes `ApprovalRequired`. No "yolo" mode in production. Approval rules are accident prevention; the sandbox is the boundary. | M1 |
 | Todo list, clarify | `todo_tool.py`, `clarify_tool.py` | Native where the runtime has it; else MCP tools. `clarify` routes to the session's channel. | M1 |
@@ -328,13 +351,14 @@ state. "New" means Hermes does not have it. "Defer" and "Skip" are explicit choi
 | New capability | Why | Plan |
 |---|---|---|
 | Multi-tenancy (orgs, hotels, roles, RLS) | B2B product | M1 |
-| Change-request pipeline (GitHub App, draft PRs, evals, approvals) | Safe changes to product agents | M2 |
-| Agent-type evals (voice, text, email) | A passing unit test is not enough proof for a guest-facing agent | M2–M4 |
+| Change-request pipeline (GitHub Apps, PRs, evals, readable diffs) | Safe changes to product agents | M2 |
+| Agent-type evals (voice, text, BAML, post-deploy smoke) | A passing unit test is not enough proof for a guest-facing agent | M2–M3 |
+| BAML change functions and standard hotel repo layout | Typed, testable edits; one place for each kind of change (D23, D24) | M2 |
 | `harness.yaml` repo manifest | Contract between the harness and each product-agent repo | M2 |
 | Egress proxy with credential injection | Secrets never reach the model or the sandbox filesystem | M2 |
 | Per-hotel budgets, quotas, and audit log | Cost control and compliance for B2B customers | M1–M3 |
 | Chrome extension | Staff-side context and action in systems without APIs | M5 |
-| Content gate with auto-merge | Fast, safe content updates for non-technical staff (D18) | M2 |
+| Eval gate with auto-merge | Changes go live when evals pass and the requester confirms (D18) | M2 (code from M3) |
 | Hotel operations with per-action approval | Rates, inventory, bookings, and campaigns with a human in the loop (D19) | M4 |
 | Scheduled reports from PMS and Vapi data | Daily and weekly hotel reports (Section 10.10) | M3 |
 | Multi-repo fixes | One fix across many independent hotel repos (D20) | M4 |
@@ -349,10 +373,10 @@ A framework name can mean two different things here. The design keeps them apart
 
 1. **Harness runtime.** The framework that runs the *harness agent* (the one that edits code and
    does tasks). This is what the adapter layer in this section covers.
-2. **Product-agent framework.** The framework that a hotel's voice, text, or email agent is
+2. **Product-agent framework.** The framework that a hotel's voice or text agent is
    *built on*. The harness must know how to scaffold, test, and evaluate repos on each
    framework. That knowledge lives in per-framework **skills and templates** plus the repo's
-   `harness.yaml` (Section 9.2), not in adapters.
+   `harness.yaml` (Section 9.3), not in adapters.
 
 Example: a hotel's text agent is built on OpenAI Agents SDK, and the harness changes its code
 with a Claude Agent SDK run. Both are normal and supported.
@@ -462,7 +486,7 @@ config:
 flowchart TD
   ORG["Organization<br/>(B2B customer, billing, SSO)"] --> HOTEL["Hotel<br/>(property)"]
   ORG --> MEM["Memberships<br/>user + role"]
-  HOTEL --> PA["Product agents<br/>voice / text / email"]
+  HOTEL --> PA["Product agents<br/>voice / text"]
   PA --> REPO["Repos + harness.yaml"]
   HOTEL --> SESS["Sessions, runs, jobs"]
   HOTEL --> KNOW["Memory, skills, SOUL"]
@@ -471,13 +495,14 @@ flowchart TD
 ```
 
 - **Hotel roles** (per org, optionally narrowed to hotels): `owner`, `admin`, `operator`,
-  `viewer`. Hotel staff with `operator` or higher start runs and change requests, confirm content
-  previews for their own requests, and approve hotel operations inside their own hotel (D19).
+  `viewer`. Hotel staff with `operator` or higher start runs and change requests, confirm the
+  readable diff of their own requests, and approve hotel operations inside their own hotel (D19).
   Admins choose which roles may approve which operation types (for example only `admin` may
   approve rate changes).
-- **Our team's roles:** `code_reviewer` approves and merges PRs on product-agent repos (D16).
+- **Our team's roles:** `code_reviewer` reviews protected-path and `High`-risk PRs, reads the
+  daily digest, and can revert any change (D16).
   `platform` gives audited, time-boxed access for support ("break-glass"), never a hidden
-  super-user. Hotel roles can never approve code.
+  super-user. Hotel roles can never approve a protected-path change.
 - **Plans** set limits per org: hotels, runtimes, models, concurrent runs, monthly budget.
 
 ### 7.2 Isolation layers
@@ -588,81 +613,189 @@ SandboxProvider
 
 ---
 
-## 9. Safe changes to hotel voice, text and email agents
+## 9. Safe changes to hotel voice and text agents
+
+The harness changes two agent types now: the **voice agent** on Vapi and the **text agent** (SMS,
+WhatsApp, web chat), which is our own code. Email agents are deferred. Agent types are pluggable
+(Section 9.3), so email and other agents can join later without a change to the harness core.
 
 ### 9.1 Principles
 
 1. **Branches and PRs only.** The harness pushes to `harness/<hotel-slug>/<cr-id>-<short-name>`
-   branches and opens PRs (draft for code changes). It never pushes to protected branches, never
-   force-pushes, and never deploys. The agent never merges; only the control-plane content gate
-   merges content-only PRs (D9, D18).
-2. **Evidence in every PR.** Tests, agent-type evals, risk score, and a rollback plan.
-3. **The right person decides.** For code and prompt-logic changes, only a member of our team
-   with the `code_reviewer` role approves and merges (D16). For content changes, the requester
-   confirms a preview and the content gate merges after green checks (D18).
-4. **The target repo owns deploys.** Its own CI/CD deploys after merge. The harness only reads
-   status.
-5. **Everything is linked.** Change request ↔ session transcript ↔ PR ↔ CI runs ↔ deploy.
+   branches and opens PRs. It never pushes to protected branches, never force-pushes, and never
+   deploys. The harness agent never merges. Only the **eval gate**, a separate control-plane
+   service with its own GitHub App, merges (D9, D18).
+2. **Evals decide.** A change goes to production when all checks, tests, and evals pass and the
+   requester confirms the readable diff. This applies to every change class: KB, facts, system
+   prompt, agent config, tools, and backend code (D18, Q24). Paths that the manifest marks as
+   protected always need our team (Section 9.9, Q28).
+3. **Show what changes.** Every change has a readable diff and a plain-language summary for staff,
+   and the full git diff for our team (Section 9.7).
+4. **Full agent context.** The harness reads the whole agent before it changes it: prompts, KB,
+   facts, tools, Vapi config, backend code, evals, and recent conversations (Section 9.4).
+5. **Staged rollout and fast revert.** The target repo's CI deploys to staging and the Vapi test
+   assistant first, runs smoke evals, and then deploys to production. A failed smoke eval or a
+   metric drop starts an automatic revert.
+6. **Everything is linked.** Change request ↔ session transcript ↔ PR ↔ CI runs ↔ deploy ↔ revert.
 
-### 9.2 The `harness.yaml` manifest
+### 9.2 Standard hotel repo layout
 
-Each product-agent repository that the harness may change has a manifest at its root. The
-harness refuses to open a CR against a repo without one. Example:
+Every hotel repo uses one standard layout (D24, Q27). It is based on the `hotels/<id>/` folders
+in the hotel-stack reference repo, with changes: one repo per hotel, so the hotel files sit at
+the repo root; Vapi settings move to `vapi/`; agent structured outputs move to BAML; and every
+repo has an `AGENTS.md` and a `harness.yaml`.
+
+```text
+hotel-<slug>/                    # repo name (O12, Q31)
+├── AGENTS.md                    # agent context: what each agent does, where things live, how to test
+├── harness.yaml                 # manifest (Section 9.3); our team owns it
+├── CODEOWNERS                   # our team owns the protected paths
+├── facts.yaml                   # every changeable value (hours, prices, phone numbers), used as {{facts.path}}
+├── prompts/
+│   ├── voice/*.md               # voice system prompt sections; frontmatter: id, editable, depends_on
+│   └── text/*.md                # text system prompt sections
+├── kb/*.md                      # knowledge base, read at runtime by the search_knowledge_base tool
+├── policies/*.md                # cancellation, pets, payments, and other policies
+├── tools.yaml                   # tool descriptions, JSON schemas, channels (voice, text), filler phrases
+├── vapi/assistant.yaml          # Vapi settings: model, voice, transcriber, endpointing, first message
+├── baml_src/                    # BAML functions for structured outputs, with BAML tests (D23)
+├── evals/
+│   ├── voice.yaml               # caller scripts: say, expected tool calls, expected outcome
+│   └── text.yaml                # conversation fixtures with expected outcomes
+├── src/                         # backend: text agent loop, tool API, Vapi webhooks, PMS client
+├── tests/                       # unit and integration tests
+└── .github/workflows/           # ci.yml, vapi-push.yml (reference workflow, M3)
+```
+
+Rules of the layout:
+
+- **System prompts and KB stay in Markdown, and values stay in `facts.yaml`.** Vapi needs a plain
+  system prompt string, and the text agent reads the KB at runtime. Markdown and YAML also give
+  diffs that staff can read.
+- A render step builds the final prompts from `prompts/`, `facts.yaml`, and `tools.yaml`. CI
+  fails when a `{{facts.path}}` is missing or a prompt section has a broken `depends_on`.
+- KB and facts changes take effect for the next conversation. Prompt and Vapi changes take effect
+  for new calls and chats after the deploy.
+
+**Migration of existing hotel repos.** The current hotel repos are independent and do not use this
+layout. The harness helps move each repo: it reads the repo, proposes a mapping (old file → new
+path), moves files in one PR, and proves with evals that the agent behaves the same before and
+after. Our team reviews migration PRs, because they change protected files. New hotels start from
+the layout (M4 onboarding automation).
+
+### 9.3 The `harness.yaml` manifest
+
+Each hotel repo has a manifest at its root. The harness refuses to open a CR against a repo
+without one. Example:
 
 ```yaml
 version: 1
-agent:
-  type: voice            # voice | text | email
-  framework: openai_agents_sdk   # or claude_agent_sdk, deep_agents, opencode, other
-hotels: [example-hotel]  # hotel slugs this repo serves
+layout: standard/v1
+hotel: example-hotel
+agents:                              # pluggable agent types; email and others later
+  - type: voice
+    platform: vapi
+    prompt_dir: prompts/voice
+    config_path: vapi/assistant.yaml # pushed to the production assistant by the repo's CI on merge
+    test_assistant: example-hotel-test   # in the hotel's Vapi test org (D21, O11)
+  - type: text
+    platform: own                    # our text agent in src/
+    prompt_dir: prompts/text
 commands:
   setup: uv sync --locked
   lint: uv run ruff check .
   test: uv run pytest -q
-  eval: uv run python -m evals.run --suite smoke
-content_paths:           # content gate may merge PRs that touch only these (D18)
-  - content/faq/**
-  - content/hours.yaml
-  - content/greetings/**
-protected_paths:         # plan approval by our team before work starts; CODEOWNERS review
-  - prompts/legal/**
-  - src/payments/**
-  - .github/**
+  render: uv run python -m hotel.render --check
+  baml_test: uv run baml-cli test
+  eval: uv run python -m evals.run --suite full
+  smoke: uv run python -m evals.run --suite smoke
+change_classes:                      # decide which evals run and how the staff diff looks
+  content: [kb/**, facts.yaml, policies/**]
+  prompt: [prompts/**]
+  config: [vapi/**, tools.yaml]
+  code: [src/**, baml_src/**, tests/**]
+protected_paths:                     # always need our team's review (Q28)
   - harness.yaml
   - CODEOWNERS
-forbidden_paths:         # the harness must never change these
+  - .github/**
+  - evals/**
+  - src/**/migrations/**
+  - src/payments/**
+  - src/auth/**
+forbidden_paths:                     # the harness must never change these
   - infra/prod/**
   - "**/*.pem"
+  - ".env*"
 limits:
   max_changed_files: 30
   max_diff_lines: 800
-  content_max_diff_lines: 200
 deploy:
-  owner: target-repo-ci  # the harness never deploys
+  owner: target-repo-ci              # the harness never deploys
   staging_check: https://example.invalid/healthz   # read-only status URL
-voice:                   # only for type: voice (D21)
-  platform: vapi
-  config_path: vapi/assistant.json   # pushed to Vapi by the repo's CI on merge
-  test_assistant: example-hotel-test # evals run against this assistant, never production
 ```
 
-Onboarding checks, before the first CR: the manifest is valid, branch protection on the default
-branch requires green CI and code-owner review, the GitHub App has no bypass permission, and
-CODEOWNERS gives our team every path except `content_paths`.
+Onboarding checks, before the first CR: the manifest is valid, the repo uses the standard layout,
+branch protection on the default branch requires green CI and code-owner review, neither GitHub
+App has a bypass permission, and CODEOWNERS gives our team every protected path.
 
-How the content gate fits GitHub branch protection (to verify with a spike in M2):
+How the eval gate fits GitHub branch protection (to verify with the branch-protection spike in
+M2, O13):
 
-- `CODEOWNERS` assigns `*` to our team, then lists each content path with no owner, so content
-  files have no code owner.
-- The default branch requires "review from Code Owners", required status checks (CI, evals, and
-  `harness/content-gate`), and no bypass actors.
-- So a PR that touches any non-content file needs our team's review. A content-only PR needs only
-  green checks, and the control plane posts `harness/content-gate` as success only after the
-  requester confirmed the preview of that head commit.
-- The merge credential lives only in the control plane. The egress proxy blocks GitHub merge
-  endpoints from sandboxes.
+- `CODEOWNERS` assigns only the protected paths to our team. All other paths have no code owner.
+- The default branch requires "review from Code Owners", the required status checks (CI, evals,
+  gitleaks, and `harness/eval-gate`, with the eval-gate App as its only allowed source), no force
+  pushes, and no bypass actors.
+- So a PR that touches a protected path needs our team's review. Any other PR needs green checks,
+  and the eval gate posts `harness/eval-gate` as success only after the requester confirmed the
+  readable diff of that head commit and the risk check passed (Section 9.5).
+- Path rules always come from the default branch, never from the PR branch, so a change cannot
+  widen its own rules.
 
-### 9.3 Change flow
+### 9.4 Full agent context
+
+Before a change, the harness loads the full context of the hotel's agents into the sandbox:
+
+| Source | What it gives the harness |
+|---|---|
+| The repo, cloned in the sandbox | `AGENTS.md`, `harness.yaml`, prompts, KB, facts, policies, tools, Vapi settings, BAML functions, backend code, tests, evals |
+| Rendered prompts | The exact system prompt that each agent sees today |
+| Live Vapi config (read key, `GET` only) | The production assistant as it is now. A difference from `main` is **drift**; the harness reports it and does not change code until our team resolves it |
+| Recent conversations | Call transcripts and text conversations (redacted, Section 7.3) that show the problem the request is about |
+| Eval history | Eval scores on `main` and on recent changes, to compare against |
+| Change history | Recent CRs, reverts, and their reasons |
+
+With this context the harness can change any part of an agent: the KB, facts, system prompt,
+Vapi settings (voice, model, transcriber, endpointing), tools, and backend code. It can also
+propose improvements to the voice agent, for example a lower endpointing wait or a better
+hand-off rule, from what it sees in transcripts and eval failures.
+
+### 9.5 BAML change functions
+
+The harness uses BAML (D23, Q25) for its own typed LLM functions that make and explain changes.
+BAML gives typed inputs and outputs, prompts versioned in git, and tests that run in CI with
+`baml-cli test`. The functions live in this repo and run in the sandbox.
+
+| BAML function | Input | Output |
+|---|---|---|
+| `DraftChange` | The request, the agent context, and the files in scope | `ChangeProposal`: title, reason, list of `FileEdit` (path, old text, new text, or full content, or delete) |
+| `ReviewChange` | The full diff, check results, and eval results | `ChangeReview`: staff summary, risk (`Low`, `Medium`, `High`), guest impact, what to test |
+| `ExplainDiff` | The diff of prompt, KB, facts, or config files | Readable before-and-after blocks for staff (Section 9.7) |
+
+- `DraftChange` handles small, targeted edits (a KB entry, a fact, a prompt section). For larger
+  work, for example backend code, the coding runtime (D14) edits the files directly. Both paths
+  end in the same diff, checks, and `ReviewChange`.
+- The harness applies a `FileEdit` only when `old_text` matches the file exactly once. Otherwise the
+  edit fails and the harness drafts it again.
+- BAML tests (`@@assert`, `@@check`) hold fixed cases, for example "a request to change breakfast
+  to 7:00 gives an edit to `facts.yaml` with 7:00". They call a model, so they run in a separate
+  eval job, never in the unit-test step (unit tests never call live models; they use recorded
+  outputs).
+
+In hotel repos, `baml_src/` holds the agents' structured-output functions, for example text-agent
+intent and reply, call summary, and booking-detail extraction. `baml-cli test` runs as part of
+the evals. System prompts and KB do not move into BAML (Section 9.2).
+
+### 9.6 Change flow
 
 ```mermaid
 ---
@@ -672,82 +805,126 @@ config:
 ---
 flowchart TD
   A["Request<br/>UI, Slack, Telegram,<br/>cron, or self-improvement"] --> B["Create change request<br/>hotel, repo, intent"]
-  B --> C{"Risk class?"}
-  C -->|"high"| D["Plan approval<br/>by our team"]
-  C -->|"low / medium"| E["Sandbox: clone,<br/>new harness/* branch"]
-  D --> E
-  E --> F["Coding run<br/>edits + commits"]
-  F --> G["Checks: lint, tests,<br/>gitleaks, path rules, limits"]
+  B --> C["Load full agent context<br/>(Section 9.4)"]
+  C --> E["Sandbox: clone,<br/>new harness/* branch"]
+  E --> F["Draft change<br/>BAML DraftChange or coding run"]
+  F --> G["Checks: render, lint, tests,<br/>gitleaks, path rules, limits"]
   G -->|"fail"| F
-  G -->|"pass"| H["Agent-type evals<br/>voice / text / email"]
+  G -->|"pass"| H["Evals: voice on test assistant,<br/>text fixtures, baml-cli test,<br/>compared with main"]
   H -->|"fail"| F
-  H -->|"pass"| I["Push branch,<br/>open PR with evidence"]
-  I --> T{"Only content_paths<br/>changed?"}
-  T -->|"no"| J["Review by our team<br/>(code_reviewer)"]
-  T -->|"yes"| P["Requester confirms<br/>plain-language preview"]
-  P -->|"confirmed"| CG["Content gate merges<br/>(control plane)"]
+  H -->|"pass"| R["BAML ReviewChange<br/>summary, risk, guest impact"]
+  R --> I["Push branch, open PR<br/>with evidence"]
+  I --> T{"Protected path<br/>or High risk?"}
+  T -->|"yes"| J["Review by our team<br/>(code_reviewer)"]
+  T -->|"no"| P["Requester confirms<br/>readable diff + summary"]
   P -->|"not what I asked"| F
+  P -->|"confirmed"| CG["Eval gate merges<br/>(own GitHub App)"]
   J -->|"changes requested"| F
-  J -->|"approve + merge<br/>(human)"| K["Target repo CI/CD<br/>staging, then production"]
-  CG --> K
-  K --> L["Harness watches status and metrics,<br/>opens revert PR on regression"]
+  J -->|"approve + merge"| K
+  CG --> K["Repo CI: staging and<br/>Vapi test assistant, smoke evals"]
+  K -->|"pass"| PR["Production deploy<br/>(CI push-on-merge)"]
+  K -->|"fail"| RV["Automatic revert"]
+  PR --> L["Post-deploy smoke evals<br/>and live metrics"]
+  L -->|"drop or fail"| RV
+  L --> DG["Digest to our team<br/>with the full diff"]
 ```
 
 1. **Request.** Hotel staff create a CR from any channel. Self-improvement may only *propose* a
    CR; a hotel user confirms it before work starts.
-2. **Classify.** Risk class from the manifest and the intent: content-only change (FAQ, hours,
-   copy), prompt or tool change, code change, or protected-path change.
-3. **Work.** A coding run in a sandbox on a new branch. Iterates until checks and evals pass or
-   the budget ends. A failed CR ends with a report, not a PR.
-4. **Open PR.** PR with: summary, diff stats, eval report, risk score, the session link, and a
-   rollback plan (normally "revert this PR"). Code PRs are drafts.
-5. **Content path.** If the PR changes only `content_paths`, the requester gets a before-and-after
-   preview in plain language ("Breakfast hours: 7:00–10:00 → 6:30–10:30"). After confirmation of
-   that commit and green checks, the content gate merges. A new commit needs a new confirmation.
-6. **Review and merge (all other PRs).** Our team only. The hotel user who asked for the change
-   sees a plain-language status ("waiting for review", "live") in the UI. The harness answers review comments by pushing new
-   commits to the same branch.
-7. **After merge.** The harness reads CI and deploy status, eval canaries, and live metrics (for
-   example call hand-off rate and conversation failure rate). On a regression it opens a revert
-   PR and alerts our team and the hotel. A revert of a content change uses the content gate with
-   the requester or a hotel admin as confirmer; other reverts need our team.
+2. **Context.** The harness loads the full agent context (Section 9.4) and classifies the change
+   by `change_classes`: content, prompt, config, or code. The class decides which evals run and
+   how the staff diff looks.
+3. **Work.** A run in a sandbox on a new branch. It iterates until checks and evals pass or the
+   budget ends. A failed CR ends with a report, not a PR. Eval scores must not drop below the
+   scores on `main` by more than the threshold.
+4. **Review.** `ReviewChange` writes the staff summary, the guest impact, and a risk level.
+5. **Open PR.** PR with: summary, full diff, eval report, risk level, the session link, and a
+   rollback plan (normally "revert this PR").
+6. **Route.** A PR that touches a protected path, or that `ReviewChange` rates `High`, goes to our
+   team (Q28, Q29). All other PRs go to the requester.
+7. **Confirm and merge.** The requester sees the readable diff and summary (Section 9.7) and
+   confirms or rejects. After confirmation of that head commit and green checks, the eval gate
+   merges. A new commit needs a new confirmation.
+8. **Staged rollout.** The repo's CI deploys to staging and pushes the Vapi config to the test
+   assistant, runs smoke evals, then deploys to production. The Vapi push workflow saves the live
+   production config first, for rollback (D21).
+9. **After deploy.** Post-deploy smoke evals run against production with test numbers and
+   synthetic guests. The harness watches live metrics (Q23). On a failure or a drop, the eval gate
+   merges a revert PR at once with no confirmation, and the harness alerts the hotel and our team.
+10. **Digest.** Our team gets a daily digest of merged changes with the full diff, eval results,
+    and risk level, and can revert any change.
 
-### 9.4 Agent-type evals
+**Code changes join the eval gate in M3.** Until staged rollout, post-deploy smoke evals, and
+automatic revert work (M3), code-class changes go to our team for review. From M3, they use the
+same eval gate as other changes.
 
-| Agent type | Eval suite (runs in the sandbox, synthetic data only) |
+### 9.7 Diff views
+
+| Viewer | What they see |
 |---|---|
-| Voice (Vapi) | The candidate config is pushed to a per-hotel **test assistant** on Vapi (never the production assistant). Scripted caller conversations run through Vapi's chat and test-suite APIs, plus a small set of simulated voice calls. Assertions on intents handled, tool calls (for example booking lookups against a fake PMS), forbidden statements, hand-off to a human, and latency budget per turn. |
-| Text (SMS, WhatsApp, web chat) | Conversation fixtures with expected outcomes, policy checks (no prices or promises outside the knowledge base), language and tone checks, message length limits. |
-| Email | Render the templates, check links and unsubscribe, spam-score heuristics, brand rules, and personalisation fields. **Never send** to real recipients; a sink catches all mail. |
-| All | LLM-judge rubric with a fixed judge model and stored scores, compared with the scores on the base branch. A drop beyond a threshold fails the CR. |
+| Hotel staff (requester) | A plain-language summary ("The voice agent will now say breakfast starts at 7:00"), the guest impact, and a readable before-and-after of each changed prompt section, KB entry, fact, or Vapi setting, with changed lines marked. Code changes show the summary and guest impact only. No branch names, PR numbers, or eval tables. |
+| Our team | The full git diff, including code, the eval report with scores against `main`, the risk level, and the session transcript. |
 
-Each eval suite lives in the product-agent repo (`commands.eval` in the manifest), so its owners
-can review it. The harness ships starter suites as skills and templates per framework.
+`ExplainDiff` builds the staff view from the git diff, so the staff view always matches the
+commit that merges.
 
-### 9.5 Guardrails summary
+### 9.8 Agent-type evals
 
-- Repo allowlist per hotel. Forbidden and protected paths from the manifest.
+| Agent type | Eval suite (synthetic data only) |
+|---|---|
+| Voice (Vapi) | The harness pushes the candidate config to the hotel's **test assistant**, only through the credential proxy (D21). Caller scripts from `evals/voice.yaml` run through Vapi's chat and test-suite APIs, plus a small set of simulated voice calls. Assertions on intents handled, tool calls (for example booking lookups against a fake PMS), forbidden statements, hand-off to a human, and latency budget per turn. |
+| Text (our text agent) | Conversation fixtures from `evals/text.yaml` run against the text agent with a fake PMS. Assertions on outcomes, tool calls, policy (no prices or promises outside the KB and facts), language and tone, and message length. |
+| BAML functions | `baml-cli test` in the hotel repo: fixed cases with `@@assert` and `@@check` for each structured-output function. |
+| All | LLM-judge rubric with a fixed judge model and stored scores, compared with the scores on `main`. A drop beyond a threshold fails the CR. |
+| Post-deploy smoke | A small fixed set of voice and text cases against production, with test numbers and synthetic guests. A failure starts an automatic revert. |
+
+Eval files live in the hotel repo (`commands.eval` in the manifest) and are protected paths, so the
+harness cannot weaken the evals in the change that they check. The harness can propose new eval
+cases in a separate CR for our team. The harness ships starter suites as skills.
+
+### 9.9 Guardrails summary
+
+- Repo allowlist per hotel. Forbidden and protected paths from the manifest on the default branch.
+- Protected paths always need our team: `harness.yaml`, CODEOWNERS, CI workflows, evals, database
+  migrations, payments, and auth (Q28).
+- A `High` risk from `ReviewChange` sends the PR to our team (Q29).
 - Diff limits. Large diffs split into several CRs.
 - gitleaks before every push. No `.env` files, no keys, no real guest data in fixtures.
-- No changes to CI workflows, branch protection, or deploy config without the protected-path flow.
-- GitHub App permissions: contents (write), pull requests (write), checks (write, for the
-  `harness/content-gate` status), metadata (read). No administration and no workflow-write
-  permission. The merge call is made only by the control plane's content gate.
+- Staged rollout, post-deploy smoke evals, and automatic revert. Daily digest to our team.
+- **Two GitHub Apps** (D9):
+  - The **main harness App** (change-request service): contents (write, for `harness/*` branches),
+    pull requests (write), metadata (read). No checks write, no merge path, no administration,
+    no workflow-write permission.
+  - The **eval-gate App**: contents (write, needed to merge), pull requests (write), checks
+    (write, for `harness/eval-gate`), metadata (read). No administration, no workflow-write
+    permission, and it cannot bypass branch protection. Its key lives only in the eval-gate
+    service, a separate private Fly app. The egress proxy blocks GitHub merge endpoints from
+    sandboxes.
+- **Kill switch.** Our team can stop all automatic merges at once (scale the eval-gate app to
+  zero), or pause one hotel with a flag. PRs then wait; nothing merges by itself.
+- **Key rotation.** Both App keys and the gate's API token rotate on a schedule and at once after
+  any suspected leak (docs/runbook-deploy.md, PR #3).
+- **Vapi keys** (D21, O11): production assistants change only through the hotel repo's CI push
+  workflow. The harness writes only to the test assistant, through the credential proxy. The
+  proxy allows only `GET` with the production read key.
 
-### 9.6 Multi-repo fixes
+### 9.10 Multi-repo fixes
 
-Hotel repos are independent, so one bug can exist in many of them (D20).
+Hotel repos are independent, so one bug can exist in many of them (D20). The standard layout
+(D24) makes this rarer and the fixes more uniform.
 
 1. An engineer on our team describes the fix once and selects repos (or a search finds the
    repos with the same pattern).
 2. The harness starts one child run per repo (Section 10.8), with a budget per repo. Each run
    adapts the fix to that repo's code and runs that repo's checks and evals.
-3. Each repo gets its own draft PR, reviewed as a normal code change. Multi-repo fixes never use
-   the content gate.
-4. A summary lists, per repo: PR opened, fix not needed, or fix failed (with the reason).
+3. Each repo gets its own PR. The engineer who asked is the requester and confirms the grouped
+   diff once. Each PR merges through the eval gate when its own checks and evals pass, or goes to
+   review when it touches a protected path.
+4. A summary lists, per repo: merged, fix not needed, waiting for review, or fix failed (with the
+   reason).
 
 At about 100 hotels the review load matters, so the summary groups PRs whose diffs are the same,
-and our team can review them together.
+and our team can review the protected-path PRs together.
 
 ---
 ## 10. Other subsystems
@@ -780,7 +957,7 @@ and our team can review them together.
 - Library: `global` skills in this repo under `skills/` (reviewed by PR), and `org` / `hotel`
   skills in Postgres + Storage with versions and provenance.
 - First global skills (planned): "change a voice agent prompt safely", "add an FAQ to a text
-  agent", "build an email campaign template", "write an eval case", per-framework scaffolds
+  agent", "edit a hotel repo with BAML DraftChange", "write an eval case", "move a hotel repo to the standard layout", per-framework scaffolds
   (OpenAI Agents SDK, Claude Agent SDK, Deep Agents, opencode), "read PMS data with the browser".
 
 ### 10.4 Self-improvement loop
@@ -873,7 +1050,7 @@ vault and calls made through the egress proxy:
 |---|---|---|
 | PMS (cloud, API) | PMS API; which PMS first is open (Q21) | Bookings, occupancy, ADR, arrivals and departures; rate and availability updates as operations |
 | Vapi | Vapi API (read) | Call logs, outcomes, hand-offs, and costs for reports and live metrics |
-| Text and email agents | Our backend's API (read) | Conversation counts, outcomes, failures, campaign results |
+| Text agent | Our backend's API (read) | Conversation counts, outcomes, failures |
 | Channel manager, OTA extranets | API where it exists, else the browser | Rate parity checks, reviews, restrictions |
 
 **Reports** are scheduled jobs (Section 10.5) with read-only tools. No approval is needed. Each
@@ -890,16 +1067,17 @@ report goes to the hotel's Slack channel, Telegram chat, email, or the web app.
 4. The control plane executes the call with an idempotency key, records the result in the audit
    log, and reports back. If the system supports it, the old value is kept for an undo action.
 5. Guest messages and campaigns show the audience size and a sample message, and they are
-   sent through the hotel's email or text agent, never directly by the harness agent.
+   sent through the hotel's text agent (or a later email agent), never directly by the harness agent.
 
 ### 10.11 Experience for non-technical hotel staff
 
 - Staff write requests in plain language. The harness asks short follow-up questions when the
   request is unclear (`clarify`).
-- Staff see previews and outcomes in hotel terms: "the voice agent will now say …", "this rate
-  will change from … to …". Diffs, branch names, and eval tables appear only for our team.
+- Staff see summaries and outcomes in hotel terms: "the voice agent will now say …", "this rate
+  will change from … to …", plus a readable before-and-after of the changed text (Section 9.7).
+  The full git diff, branch names, and eval tables appear only for our team.
 - Every request has a simple status: in progress, waiting for you, waiting for our team, live,
-  or not done (with the reason).
+  reverted, or not done (with the reason).
 - Approval cards work the same in the web app, Slack, and Telegram.
 
 ---
@@ -914,8 +1092,9 @@ report goes to the hotel's Slack channel, Telegram chat, email, or the web app.
 | Hosting | Fly.io for the API, orchestrator, scheduler, gateway, and egress proxy; Fly Machines for sandboxes |
 | Runtimes | `claude-agent-sdk` (default), `opencode`, later `openai-agents` and `deepagents` (pinned per sandbox image) |
 | Tracing | Langfuse (OpenTelemetry / OpenInference) |
-| Code hosting | GitHub App for product-agent repos (one repo per hotel, our org) |
-| Hotel integrations | Vapi API, cloud PMS APIs, our text/email agent backend; browser fallback |
+| Code hosting | Two GitHub Apps: main harness App and eval-gate App; one `hotel-<slug>` repo per hotel in our org |
+| Hotel integrations | Vapi API, cloud PMS APIs, our text agent backend; browser fallback |
+| LLM functions | BAML (`baml-py`, `baml-cli test`) for the harness change functions and hotel-repo structured outputs |
 | CI | GitHub Actions: backend checks, web checks, gitleaks |
 
 Repository layout (this PR creates the parts marked "now"):
@@ -928,6 +1107,7 @@ Repository layout (this PR creates the parts marked "now"):
 │   │   ├── config.py        # settings from env (names in .env.example)
 │   │   ├── tenancy.py       # TenantContext
 │   │   └── runtimes/        # AgentRuntime contract, registry, fake runtime
+│   ├── baml_src/           # later (M2): DraftChange, ReviewChange, ExplainDiff + BAML tests
 │   └── tests/
 ├── web/                     # now: Next.js app skeleton
 ├── docs/architecture.md     # now: this document
@@ -949,9 +1129,9 @@ harness agent itself and are estimates, not commitments.
 |---|---|---|
 | **M0 — Foundations** (this PR) | Design doc, backend and web skeletons, CI, gitleaks, templates. | CI green on PRs. Owner reviewed the doc and answered the open questions. |
 | **M1 — Tenancy and first runtime** (~3 weeks) | Supabase schema + RLS as migration files (applied to a local stack only), auth in API and UI, orgs/hotels/roles, sessions and runs, orchestrator with local Docker sandbox, Claude Agent SDK adapter, harness MCP server (todo, clarify, memory stub), approval service with UI inbox, plain-language request UI, conformance suite. | A staff user runs a session in the UI against a local sandbox; an approval pauses and resumes it; RLS tests pass for two orgs. |
-| **M2 — Safe changes and the content gate** (~4 weeks) | Fly Machines sandbox provider, egress proxy, GitHub App, `harness.yaml`, change-request service, PRs with check and eval evidence, text-agent eval starter, content gate with requester preview and auto-merge (after the branch-protection spike), skills library v1, workspace snapshots. | On a sample hotel repo: a content change merges after preview and green evals; a code change waits for our team; the agent cannot merge, push to `main`, or edit `harness.yaml` (tested). |
-| **M3 — Channels, reports, voice** (~4 weeks) | Slack and Telegram connectors with pairing and approval cards, scheduler and `cronjob_manage`, first cloud PMS connector (read), Vapi read tools, scheduled reports, Vapi voice evals against a test assistant, live-metric watch and revert PRs, bounded memory, session search, background review proposals, opencode adapter, delegation. | A daily report from PMS and Vapi data posts to Slack; a voice content change requested in Telegram goes live after preview and evals; a forced metric drop opens a revert PR. |
-| **M4 — Operations and many hotels** (~4 weeks) | Hotel operations with per-action approval (PMS rate and availability writes), credential vault and browser fallback for OTA extranets, multi-repo fixes, email eval suite, onboarding automation for new hotel repos, kanban board and dispatcher, curator, goals and loops, budgets and quotas, MCP catalog per hotel. | A rate change approved in Slack updates the PMS with an audit record; a multi-repo fix opens PRs on 10 repos with a summary; a new hotel is onboarded in under one day. |
+| **M2 — Safe changes and the eval gate** (~4 weeks) | Fly Machines sandbox provider, egress proxy, main GitHub App, eval-gate service with its own GitHub App and kill switch, standard hotel repo layout and `harness.yaml`, agent-context loader, BAML change functions (`DraftChange`, `ReviewChange`, `ExplainDiff`) with BAML tests, readable diff for staff, change-request service, PRs with check and eval evidence, text-agent eval starter, eval gate with requester confirmation and auto-merge for content, prompt, and config changes (after the branch-protection spike, O13), skills library v1, workspace snapshots. | On a sample `hotel-<slug>` repo: a KB change and a prompt change merge after confirmation and green evals; a code change and an eval-file change wait for our team; the harness agent cannot merge, push to `main`, post `harness/eval-gate`, or edit `harness.yaml` (tested). |
+| **M3 — Channels, reports, voice, staged rollout** (~4 weeks) | Slack and Telegram connectors with pairing and approval cards, scheduler and `cronjob_manage`, first cloud PMS connector (read), Vapi read tools and drift detection, scheduled reports, Vapi voice evals on the test assistant through the credential proxy, reference Vapi push workflow for hotel repos (saves the live config first, O12), staged rollout with post-deploy smoke evals, automatic revert and daily digest, code changes join the eval gate, bounded memory, session search, background review proposals, opencode adapter, delegation. | A daily report from PMS and Vapi data posts to Slack; a voice prompt change requested in Telegram goes live after confirmation and evals; a backend fix merges through the eval gate and rolls out in stages; a forced smoke failure reverts it. |
+| **M4 — Operations and many hotels** (~4 weeks) | Hotel operations with per-action approval (PMS rate and availability writes), credential vault and browser fallback for OTA extranets, multi-repo fixes, migration of existing hotel repos to the standard layout, onboarding automation for new hotel repos, kanban board and dispatcher, curator, goals and loops, budgets and quotas, MCP catalog per hotel. | A rate change approved in Slack updates the PMS with an audit record; a multi-repo fix opens PRs on 10 repos with a summary; a new hotel is onboarded in under one day. |
 | **M5 — Pilot** (~3 weeks) | Pilot with 5 to 20 hotels, staging deploy of the control plane (with owner approval), audit export, retention jobs, Chrome extension, OpenAI Agents SDK and Deep Agents adapters (opt-in). | Pilot hotels use the harness for two weeks with no cross-tenant, secret, or unapproved-operation incidents. |
 | **M6 — Hardening toward 100 hotels** | SSO, region options (Q5), load and chaos tests, external security review, review-load tooling for our team. | Security review findings closed; the system handles 100 hotels' load in tests. |
 
@@ -965,12 +1145,15 @@ harness agent itself and are estimates, not commitments.
 | Prompt injection from guest content and the web | Data leak, bad PRs | OS isolation, egress allowlist, credential injection, approvals, draft-only PRs, redaction. |
 | Runtime APIs change fast | Adapter breakage | Pinned versions per image, nightly live suite, adapter owners. |
 | Self-improvement drift | Agent behaviour degrades over time | Scoped writes, approvals for skills, versioned rollback, curator, metrics per skill. |
-| Eval suites are weak | Bad agent changes pass review | Evals live in product repos with owners; base-branch score comparison; humans still approve. |
+| Eval suites are weak | Bad agent changes go live, because evals are now the main gate | Eval files are protected paths; scores compared with `main`; post-deploy smoke evals; staged rollout; automatic revert; daily digest; our team adds eval cases from every revert. |
 | Cost overruns | Margin loss | Budgets per hotel and per run, model policy, idle sandbox shutdown. |
 | Sandbox cold-start latency | Poor chat experience | Warm pool per region, suspend/resume, small base image. |
-| A bad content change passes evals and auto-merges | Wrong information to guests | Requester confirms the exact preview, content diff limits, path rules from the default branch, live-metric watch, fast revert through the content gate. |
-| Review load on our team with ~100 independent repos | Slow code changes for hotels | Content gate for content, grouped multi-repo PRs, risk scores, eval evidence in every PR. |
-| Independent hotel repos drift apart | Same bug fixed many times; uneven quality | Multi-repo fixes (D20), shared skills and eval starters, reports on drift. |
+| A bad change passes evals and auto-merges, including backend code | Wrong information to guests; broken bookings for all guests of a hotel | Requester confirms the readable diff, protected paths (migrations, payments, auth) and `High` risk go to our team, code joins only in M3 with staged rollout, post-deploy smoke evals, live-metric watch, automatic revert, kill switch. |
+| The harness weakens the evals that check its own change | Evals pass for a bad change | Eval files, CI, and `harness.yaml` are protected paths; path rules come from the default branch; the eval-gate App is the only source of `harness/eval-gate`. |
+| A Vapi key reaches a production assistant | A test change reaches guests | Two Vapi orgs per hotel (Q30); the proxy allows only `GET` with the production key; only the hotel repo's CI pushes to production. |
+| BAML changes fast | Generated client breakage | Pin the BAML version per repo; BAML tests in CI; upgrade in one PR. |
+| Review load on our team with ~100 hotel repos | Slow protected-path changes for hotels | Eval gate for all other changes, grouped multi-repo PRs, risk levels, eval evidence in every PR. |
+| Hotel repos drift apart | Same bug fixed many times; uneven quality | Standard layout (D24), multi-repo fixes (D20), shared skills and eval starters, reports on drift. |
 | A hotel operation goes wrong (rate, booking, campaign) | Revenue loss, guest impact; messages cannot be unsent | Per-action approval of an exact preview, role rules per operation type, idempotency keys, undo where the system allows, audit log. |
 | Public repository | Accidental secret or customer data exposure | gitleaks in CI and pre-push, `.env.example` value check, no customer data in this repo, synthetic fixtures. |
 
@@ -979,7 +1162,8 @@ harness agent itself and are estimates, not commitments.
 ## 14. Open questions and answers
 
 The owner answered these questions on 2026-11-18. Q11 to Q20 come from the use-case discussion
-(Section 2.4). "Owner" means the owner chose the answer.
+(Section 2.4). Q24 to Q27 come from the change-flow discussion (hotel-stack reference, BAML).
+Q28 to Q31 are our defaults and wait for the owner to confirm. "Owner" means the owner chose the answer.
 "Owner asked us" means the owner asked us to recommend, and the answer is our recommendation.
 
 | # | Question | Answer | Status |
@@ -991,22 +1175,30 @@ The owner answered these questions on 2026-11-18. Q11 to Q20 come from the use-c
 | Q5 | Data residency for EU, India, and US hotels? | Not answered. Default: one region for the pilot; per-org region from M6. | **Open** |
 | Q6 | One LLM tracing tool across runtimes? | Yes: Langfuse (D15). | Decided (owner; tool chosen by us) |
 | Q7 | Do customers need an OpenAI-compatible API? | Not answered. Default: not in v1; the public REST API (M5) covers integrations. | **Open** |
-| Q8 | Who approves code and risky actions? | Hotel staff request and drive changes; our team approves and merges all code. Hotel staff approve risky non-code actions in their own hotel. No two-approver rule (D16). | Decided (owner) |
+| Q8 | Who approves code and risky actions? | **Changed 2026-11-18 (see Q24).** Hotel staff request and confirm changes; evals decide; our team reviews only protected-path and `High`-risk PRs and gets a daily digest. Hotel staff approve hotel operations in their own hotel. No two-approver rule (D16). | Decided (owner) |
 | Q9 | Licence for this public repository? | None. No `LICENSE` file (D17). | Decided (owner) |
 | Q10 | Fly Machines only, or Fly and E2B? | Fly Machines only; add a second provider only if Fly cannot meet a need (D5). | Decided (owner asked us) |
 | Q11 | Who uses the harness day to day? | Non-technical hotel staff (Section 10.11). | Decided (owner) |
 | Q12 | How is product-agent code organized? | One repo per hotel (D9). | Decided (owner) |
-| Q13 | Who approves content-only changes? | No human review; evals decide (D18). | Decided (owner) |
+| Q13 | Who approves content-only changes? | No human review; evals and the requester's confirmation decide (D18). Now true for all change classes (Q24). | Decided (owner) |
 | Q14 | What work besides agent changes? | Reports and hotel operations too, from the start (Section 10.10). | Decided (owner) |
 | Q15 | Who approves hotel operations? | Hotel staff, each action (D19). | Decided (owner) |
-| Q16 | How do content changes go live? | Auto-merge content-only PRs, after the requester confirms a preview; revert on metric drop (D18). | Decided (owner) |
-| Q17 | Which voice platform? | Vapi; text and email in our backend, deployed by CI (D21). | Decided (owner) |
+| Q16 | How do changes go live? | The eval gate auto-merges after the requester confirms the readable diff; staged rollout; revert on smoke failure or metric drop (D18). | Decided (owner) |
+| Q17 | Which voice platform? | Vapi; the text agent is our own code, deployed by CI. The harness writes only to test assistants (D21). | Decided (owner) |
 | Q18 | How to reach hotel systems? | API first, browser fallback (D22). | Decided (owner) |
 | Q19 | Which PMS type do the first hotels use? | Cloud PMSs with APIs (D22). | Decided (owner) |
 | Q20 | Repos share a template? Help with fixes across repos? | Repos are independent; multi-repo fixes on request (D20). | Decided (owner) |
 | Q21 | Which cloud PMS do we integrate first (for example Mews, Cloudbeds, Beds24, Apaleo)? | Not answered. Needed before M3. | **Open** |
-| Q22 | Which email service do the email agents send through? | Not answered. Needed for the email eval sink and reports in M4. | **Open** |
+| Q22 | Which email service do the email agents send through? | Not needed now: email agents are deferred (owner, 2026-11-18). | Deferred |
 | Q23 | Which live metrics trigger a revert PR, and at what thresholds? | Not answered. Default: hand-off rate and failed-conversation rate, compared with the 7 days before the change. | **Open** |
+| Q24 | Does "live when evals pass" also apply to backend code? | Yes, everything (owner). Our guardrails: protected paths and `High` risk go to our team (Q28, Q29); code joins the eval gate in M3 with staged rollout and automatic revert (D16, D18). | Decided (owner) |
+| Q25 | What role do BAML files have? | Harness change functions, plus structured outputs in hotel repos; prompts and KB stay in Markdown (D23). | Decided (owner asked us) |
+| Q26 | Who sees the diff? | Staff: readable diff and summary. Our team: full git diff (Section 9.7). | Decided (owner) |
+| Q27 | One standard layout for hotel repos? | Yes; the harness helps move existing repos (D24, Section 9.2). | Decided (owner) |
+| Q28 | Which paths always need our team? | Default: `harness.yaml`, CODEOWNERS, CI, evals, migrations, payments, auth. | **Open (default applied)** |
+| Q29 | Does a `High` risk from `ReviewChange` send a PR to our team? | Default: yes. | **Open (default applied)** |
+| Q30 | Vapi org layout (O11)? | Default: two Vapi orgs per hotel, production and test, so a test key cannot touch a production assistant. | **Open (default applied)** |
+| Q31 | Repo naming and Vapi push workflow (O12)? | Default: repos named `hotel-<slug>`; we write one reference Vapi push workflow in M3 that every hotel repo uses. | **Open (default applied)** |
 
 ---
 
@@ -1025,6 +1217,10 @@ The owner answered these questions on 2026-11-18. Q11 to Q20 come from the use-c
   <https://docs.langchain.com/oss/python/deepagents/human-in-the-loop>
 - opencode server — <https://opencode.ai/docs/server>
 - InsForge — <https://docs.insforge.dev/introduction>
+- BAML — tests: <https://docs.boundaryml.com/ref/baml/test>, CLI test runner:
+  <https://docs.boundaryml.com/ref/baml-cli/test>
+- hotel-stack (our reference repo, inspiration only) — `docs/ARCHITECTURE.md`, `hotels/<id>/`,
+  `baml_src/proposals.baml`, `changes.py`, `change_checks.py`, `publish.py`
 - Langfuse integrations — <https://langfuse.com/integrations/frameworks/claude-agent-sdk>,
   <https://langfuse.com/integrations/frameworks/openai-agents>,
   <https://langfuse.com/integrations/frameworks/langchain-deepagents>
