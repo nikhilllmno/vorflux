@@ -540,7 +540,8 @@ references). The harness agent may see such data in logs, transcripts, and test 
 
 ### 7.4 Isolation tests
 
-- RLS tests run against a local Supabase stack in CI (two orgs, every table, every role).
+- RLS tests run against a local Supabase stack in CI (two orgs, every table, every role). The
+  schema, policies, and tests are described in [`schema.md`](schema.md).
 - API tests assert that each endpoint returns 404 (not 403) for another tenant's ids.
 - MCP tests assert that a token for hotel A cannot read or write hotel B data with any argument.
 
@@ -1104,7 +1105,7 @@ report goes to the hotel's Slack channel, Telegram chat, email, or the web app.
 | Code hosting | Two GitHub Apps: main harness App and eval-gate App; one `hotel-<slug>` repo per hotel in our org |
 | Hotel integrations | Vapi API, cloud PMS APIs, our text agent backend; browser fallback |
 | LLM functions | BAML (`baml-py`, `baml-cli test`) for the harness change functions and hotel-repo structured outputs |
-| CI | GitHub Actions, 4 jobs: backend checks, web checks, gitleaks, and deploy config (validates `Dockerfile`, `fly.toml`, `vercel.json`; added with the infra map, https://github.com/nikhilllmno/vorflux/pull/3) |
+| CI | GitHub Actions, 5 jobs: backend checks, web checks, gitleaks, deploy config (validates `Dockerfile`, `fly.toml`, `vercel.json`; added with the infra map, https://github.com/nikhilllmno/vorflux/pull/3), and database (applies `supabase/migrations/` to a local Supabase stack and runs the RLS isolation tests of §7.4; added in M1, see [`schema.md`](schema.md)) |
 
 Repository layout (this PR creates the parts marked "now"):
 
@@ -1123,7 +1124,7 @@ Repository layout (this PR creates the parts marked "now"):
 ├── .github/                 # now: CI workflow, PR template
 ├── skills/                  # later (M2): global skill library
 ├── sandbox/                 # later (M2): base image, egress proxy config
-├── supabase/migrations/     # later (M1): schema + RLS as reviewed files, never applied from CI
+├── supabase/migrations/     # M1: schema + RLS as reviewed files (docs/schema.md); CI applies them to a local stack only
 └── extension/               # later (M5): Chrome extension
 ```
 

@@ -72,8 +72,10 @@ India (architecture D25; infra-map, "Regions").
   redirect allow list. Leave sign-ups closed (invite only) until M5.
 - **S4** Link the CLI from the repo root: `supabase login` (uses `SUPABASE_ACCESS_TOKEN`), then
   `supabase link --project-ref <ref>`.
-- **S5 [APPROVAL]** When `supabase/migrations/` exists (M1): `supabase db push --dry-run --remote`,
-  then `supabase db push --remote`. Then run Section 4 Supabase checks.
+- **S5 [APPROVAL]** Before the first push: Project settings → Data API → turn off automatic exposure
+  of new tables, and keep `private` out of the exposed schemas (matches `supabase/config.toml`; see
+  [`schema.md`](schema.md)). Then `supabase db push --dry-run --remote`, then
+  `supabase db push --remote`. Then run Section 4 Supabase checks.
 
 ### Fly.io: API
 
@@ -281,7 +283,7 @@ revert.
 | API | `fly logs -a <app> --no-tail` | no errors or restarts since the deploy |
 | Web | `curl -fsSI https://vorflux-harness-web-staging.vercel.app/` | HTTP 200; page loads and calls the API without CORS errors |
 | Supabase | `supabase migration list --remote` | local and remote columns match |
-| Supabase | dashboard → Database health; RLS test suite against staging (M1) | no errors; tenant tests pass |
+| Supabase | dashboard → Database health; `supabase db lint --remote`; RLS test suite on the same commit is green in CI (the suite runs on a local stack only and refuses hosted hosts) | no errors; tenant tests pass |
 | Sandbox (M2) | test run per runtime; `fly machines list -a <sandbox-app>` | run completes; no machine older than the max run time |
 | Proxy (M2) | proxy logs for the test run | only allow-listed hosts |
 | Eval gate (M2) | `fly checks list -a <eval-gate-app>`; on a sample `hotel-<slug>` repo: a KB change and a prompt change with a confirmed diff; a code change; an eval-file change | the first two merge; the others get no `harness/eval-gate` success and wait for our team (architecture M2 exit criteria) |
