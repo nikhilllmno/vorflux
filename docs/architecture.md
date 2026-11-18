@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | Draft for review (v0.4: eval gate for all changes, BAML, standard hotel repo layout, voice and text scope; see Section 2.4, Section 9, and Section 14). Nothing here is deployed. |
+| Status | Draft for review (v0.5: round-5 answers: protected paths, two Vapi orgs per hotel, Beds24 first, revert rules, India region for the pilot; see Section 14). Nothing here is deployed. |
 | Date | 2026-11-18 |
 | Scope | Design of the harness, plus the foundations that ship in the same PR |
 | Reference system | [Hermes Agent](https://github.com/NousResearch/hermes-agent) (MIT), reviewed at commit `f7e2898a`, 2026-11-17 |
@@ -135,7 +135,7 @@ model-agnostic second runtime (D14).
 |---|---|---|
 | Day-to-day users | Non-technical hotel staff (general managers, front office) | Plain-language requests and results. A readable diff, but no PR jargon or eval tables, in the hotel UI (Section 10.11). |
 | Product-agent code | One independent repository per hotel, in our GitHub org. No shared template. | Repo allowlist per hotel. A bug can exist in many repos, so the harness offers multi-repo fixes on request (Section 9.6). |
-| All changes (KB, facts, prompt, config, code) | Go to production when all evals pass, after the requester confirms the diff. No review by our team, except protected paths and `High` risk (our defaults, Q28, Q29). Owner changed this on 2026-11-18 (before: our team approved code). | Eval gate (D18, Section 9.6), staged rollout, automatic revert, daily digest. |
+| All changes (KB, facts, prompt, config, code) | Go to production when all evals pass, after the requester confirms the diff. No review by our team, except protected paths and `High` risk (owner confirmed, Q28, Q29). Owner changed this on 2026-11-18 (before: our team approved code). | Eval gate (D18, Section 9.6), staged rollout, automatic revert, daily digest. |
 | Diff | Staff see a readable diff and summary; our team sees the full git diff. | Section 9.7. |
 | How edits are made | BAML files (the role was left to us). | BAML change functions in the harness; BAML structured outputs in hotel repos (D23). |
 | Repo layout | One standard layout for every hotel repo; the harness helps move existing repos. | Section 9.2 (D24). |
@@ -175,10 +175,11 @@ Each decision has a short reason. Section 14 lists the owner's answers to the op
 | D18 | **Eval gate.** A PR merges automatically when (1) the requester confirmed the readable diff of that exact commit, (2) CI, gitleaks, tests, and evals pass with no score drop against `main`, (3) diff limits hold, (4) no protected path changed, and (5) `ReviewChange` did not rate it `High`. The eval gate is a separate private service with its own GitHub App, a kill switch, and key rotation; never the agent or the sandbox. After merge the repo's CI rolls out in stages, and a failed smoke eval or a metric drop starts an automatic revert (Q13, Q16, Q24). | Hotels get changes live without waiting for our team. The requester's confirmation catches misunderstandings that evals cannot see (for example 7:30 instead of 7:00). Path rules come from the default branch, so a change cannot widen them. |
 | D19 | **Every hotel operation needs a hotel staff approval of a plain-language preview**, one action at a time. Read-only work (reports, lookups) needs no approval (Q15). | Rates, inventory, bookings, and guest messages affect revenue and guests, and a sent message cannot be undone. |
 | D20 | **Multi-repo fixes on request.** An engineer on our team describes a fix once and selects hotel repos. The harness opens one PR per repo, adapted to that repo's code, and reports where the fix did not apply (Q20). | Hotel repos are independent with no shared template, so the same bug can exist in many repos. Each PR still goes through normal review. |
-| D21 | **Vapi is the voice platform.** Each hotel repo holds its Vapi assistant config as code. **Production assistants change only through the CI push-on-merge workflow** in the hotel repo, which saves the live config first, for rollback. The harness writes **only to each hotel's test assistant**, and only through the credential proxy; for production it reads only (`GET`). Default: two Vapi orgs per hotel, production and test, because a Vapi private key reaches every assistant in its org (Q17, Q30). | One source of truth in git, with revert. Evals test the real platform behaviour, and a test key can never touch a production assistant. |
-| D22 | **Hotel systems: API first, browser fallback.** PMS connectors use the PMS API (first hotels use cloud PMSs). The browser is used for OTA extranets and systems with no API, with logins from the credential vault (Q18, Q19). | APIs are faster, cheaper, and safer. The browser covers the rest. |
+| D21 | **Vapi is the voice platform.** Each hotel repo holds its Vapi assistant config as code. **Production assistants change only through the CI push-on-merge workflow** in the hotel repo, which saves the live config first, for rollback. The harness writes **only to each hotel's test assistant**, and only through the credential proxy; for production it reads only (`GET`). Two Vapi orgs per hotel, production and test, because a Vapi private key reaches every assistant in its org (Q17, Q30). | One source of truth in git, with revert. Evals test the real platform behaviour, and a test key can never touch a production assistant. |
+| D22 | **Hotel systems: API first, browser fallback.** PMS connectors use the PMS API (first hotels use cloud PMSs; **Beds24 first**, Q21). The browser is used for OTA extranets and systems with no API, with logins from the credential vault (Q18, Q19). | APIs are faster, cheaper, and safer. The browser covers the rest. |
 | D23 | **BAML for typed LLM functions.** The harness's change functions (`DraftChange`, `ReviewChange`, `ExplainDiff`) are BAML functions with BAML tests. In hotel repos, `baml_src/` holds the agents' structured-output functions (intent, call summary, extraction), tested with `baml-cli test`. System prompts and KB stay in Markdown and `facts.yaml` (Q25). | Typed edits and reviews, prompts versioned in git, and tests as eval signals. Vapi needs a plain system prompt string, and Markdown keeps the staff diff readable. |
 | D24 | **One standard hotel repo layout** (Section 9.2): `facts.yaml`, `prompts/voice`, `prompts/text`, `kb/`, `policies/`, `tools.yaml`, `vapi/`, `baml_src/`, `evals/`, `src/`, `AGENTS.md`, `harness.yaml`. Repos are named `hotel-<slug>` (Q27, Q31). | The harness knows where each kind of change goes and checks and publishes it the same way for every hotel. Based on the hotel-stack reference repo, not copied. |
+| D25 | **The pilot runs in an India region** (Q5): Supabase in `ap-south-1` (Mumbai) holds all harness data. Control-plane apps and sandboxes run in the Fly region nearest to it: `bom` (Mumbai) if `fly platform regions` lists it at setup, else `sin` (Singapore). Langfuse is self-hosted in the same place, or Langfuse Cloud only if the owner accepts tracing data outside India. Region per org comes in M6. | Most pilot hotels are in India, so data stays close to guests and staff. Fly's public region list (checked 2026-11-18) does not show `bom`, so the compute region is confirmed in the M5 staging setup. |
 
 ---
 
@@ -531,7 +532,9 @@ references). The harness agent may see such data in logs, transcripts, and test 
   longer for redacted summaries).
 - **Export and delete.** Per-org data export and hard delete, for contract exit and data subject
   requests.
-- **Residency.** Still open (Q5). Until it is answered we run one region, and Langfuse and Supabase are chosen so that each can move to a per-region setup later.
+- **Residency.** The pilot runs in India (D25, Q5): Supabase `ap-south-1`; Fly `bom` or else `sin`;
+  Langfuse self-hosted near the data. Vapi and the model providers still process call and prompt
+  data in their own regions; the redaction step limits what they see. Per-org regions come in M6.
 - **Audit.** Append-only `audit_events` table: who or what did which action, for which tenant,
   with which approval.
 
@@ -849,8 +852,12 @@ flowchart TD
    assistant, runs smoke evals, then deploys to production. The Vapi push workflow saves the live
    production config first, for rollback (D21).
 9. **After deploy.** Post-deploy smoke evals run against production with test numbers and
-   synthetic guests. The harness watches live metrics (Q23). On a failure or a drop, the eval gate
-   merges a revert PR at once with no confirmation, and the harness alerts the hotel and our team.
+   synthetic guests. The harness watches live metrics (Q23). The eval gate merges a revert PR at
+   once, with no confirmation, when a post-deploy smoke eval fails, or when the hand-off rate or
+   the failed-conversation rate rises more than 20% in the 24 hours after the deploy, compared
+   with the 7 days before. Then the harness alerts the hotel and our team. A hotel with too few
+   conversations for a fair comparison uses the smoke evals only, and our team gets an alert on
+   a metric rise.
 10. **Digest.** Our team gets a daily digest of merged changes with the full diff, eval results,
     and risk level, and can revert any change.
 
@@ -1048,7 +1055,7 @@ vault and calls made through the egress proxy:
 
 | System | Access | First uses |
 |---|---|---|
-| PMS (cloud, API) | PMS API; which PMS first is open (Q21) | Bookings, occupancy, ADR, arrivals and departures; rate and availability updates as operations |
+| PMS (cloud, API) | Beds24 API first (Q21); other cloud PMSs later through the same connector interface | Bookings, occupancy, ADR, arrivals and departures; rate and availability updates as operations |
 | Vapi | Vapi API (read) | Call logs, outcomes, hand-offs, and costs for reports and live metrics |
 | Text agent | Our backend's API (read) | Conversation counts, outcomes, failures |
 | Channel manager, OTA extranets | API where it exists, else the browser | Rate parity checks, reviews, restrictions |
@@ -1130,10 +1137,10 @@ harness agent itself and are estimates, not commitments.
 | **M0 — Foundations** (this PR) | Design doc, backend and web skeletons, CI, gitleaks, templates. | CI green on PRs. Owner reviewed the doc and answered the open questions. |
 | **M1 — Tenancy and first runtime** (~3 weeks) | Supabase schema + RLS as migration files (applied to a local stack only), auth in API and UI, orgs/hotels/roles, sessions and runs, orchestrator with local Docker sandbox, Claude Agent SDK adapter, harness MCP server (todo, clarify, memory stub), approval service with UI inbox, plain-language request UI, conformance suite. | A staff user runs a session in the UI against a local sandbox; an approval pauses and resumes it; RLS tests pass for two orgs. |
 | **M2 — Safe changes and the eval gate** (~4 weeks) | Fly Machines sandbox provider, egress proxy, main GitHub App, eval-gate service with its own GitHub App and kill switch, standard hotel repo layout and `harness.yaml`, agent-context loader, BAML change functions (`DraftChange`, `ReviewChange`, `ExplainDiff`) with BAML tests, readable diff for staff, change-request service, PRs with check and eval evidence, text-agent eval starter, eval gate with requester confirmation and auto-merge for content, prompt, and config changes (after the branch-protection spike, O13), skills library v1, workspace snapshots. | On a sample `hotel-<slug>` repo: a KB change and a prompt change merge after confirmation and green evals; a code change and an eval-file change wait for our team; the harness agent cannot merge, push to `main`, post `harness/eval-gate`, or edit `harness.yaml` (tested). |
-| **M3 — Channels, reports, voice, staged rollout** (~4 weeks) | Slack and Telegram connectors with pairing and approval cards, scheduler and `cronjob_manage`, first cloud PMS connector (read), Vapi read tools and drift detection, scheduled reports, Vapi voice evals on the test assistant through the credential proxy, reference Vapi push workflow for hotel repos (saves the live config first, O12), staged rollout with post-deploy smoke evals, automatic revert and daily digest, code changes join the eval gate, bounded memory, session search, background review proposals, opencode adapter, delegation. | A daily report from PMS and Vapi data posts to Slack; a voice prompt change requested in Telegram goes live after confirmation and evals; a backend fix merges through the eval gate and rolls out in stages; a forced smoke failure reverts it. |
+| **M3 — Channels, reports, voice, staged rollout** (~4 weeks) | Slack and Telegram connectors with pairing and approval cards, scheduler and `cronjob_manage`, Beds24 PMS connector (read) and a fake Beds24 for evals, Vapi read tools and drift detection, scheduled reports, Vapi voice evals on the test assistant through the credential proxy, reference Vapi push workflow for hotel repos (saves the live config first, O12), staged rollout with post-deploy smoke evals, automatic revert and daily digest, code changes join the eval gate, bounded memory, session search, background review proposals, opencode adapter, delegation. | A daily report from PMS and Vapi data posts to Slack; a voice prompt change requested in Telegram goes live after confirmation and evals; a backend fix merges through the eval gate and rolls out in stages; a forced smoke failure reverts it. |
 | **M4 — Operations and many hotels** (~4 weeks) | Hotel operations with per-action approval (PMS rate and availability writes), credential vault and browser fallback for OTA extranets, multi-repo fixes, migration of existing hotel repos to the standard layout, onboarding automation for new hotel repos, kanban board and dispatcher, curator, goals and loops, budgets and quotas, MCP catalog per hotel. | A rate change approved in Slack updates the PMS with an audit record; a multi-repo fix opens PRs on 10 repos with a summary; a new hotel is onboarded in under one day. |
-| **M5 — Pilot** (~3 weeks) | Pilot with 5 to 20 hotels, staging deploy of the control plane (with owner approval), audit export, retention jobs, Chrome extension, OpenAI Agents SDK and Deep Agents adapters (opt-in). | Pilot hotels use the harness for two weeks with no cross-tenant, secret, or unapproved-operation incidents. |
-| **M6 — Hardening toward 100 hotels** | SSO, region options (Q5), load and chaos tests, external security review, review-load tooling for our team. | Security review findings closed; the system handles 100 hotels' load in tests. |
+| **M5 — Pilot** (~3 weeks) | Pilot with 5 to 20 hotels, staging deploy of the control plane in the India region (D25, with owner approval), audit export, retention jobs, Chrome extension, OpenAI Agents SDK and Deep Agents adapters (opt-in). | Pilot hotels use the harness for two weeks with no cross-tenant, secret, or unapproved-operation incidents. |
+| **M6 — Hardening toward 100 hotels** | SSO, region per org (India, EU, US; Q5), load and chaos tests, external security review, review-load tooling for our team. | Security review findings closed; the system handles 100 hotels' load in tests. |
 
 ---
 
@@ -1163,7 +1170,8 @@ harness agent itself and are estimates, not commitments.
 
 The owner answered these questions on 2026-11-18. Q11 to Q20 come from the use-case discussion
 (Section 2.4). Q24 to Q27 come from the change-flow discussion (hotel-stack reference, BAML).
-Q28 to Q31 are our defaults and wait for the owner to confirm. "Owner" means the owner chose the answer.
+Q5, Q21, Q23, Q28, Q29, and Q30 were answered in round 5. Q7 and Q31 keep our defaults, because
+the owner did not change them. "Owner" means the owner chose the answer.
 "Owner asked us" means the owner asked us to recommend, and the answer is our recommendation.
 
 | # | Question | Answer | Status |
@@ -1172,9 +1180,9 @@ Q28 to Q31 are our defaults and wait for the owner to confirm. "Owner" means the
 | Q2 | Who owns the GitHub repos of product agents? | Our GitHub org, one GitHub App installation, per-hotel allowlists (D9). | Decided (owner) |
 | Q3 | Which runtime do we build the harness on? | Claude Agent SDK as the default; opencode second for other models; OpenAI Agents SDK and Deep Agents opt-in later (D14, Section 6.6). | Decided (owner asked us) |
 | Q4 | Workflow engine or Postgres queue? | Postgres queue only (D12). | Decided (owner) |
-| Q5 | Data residency for EU, India, and US hotels? | Not answered. Default: one region for the pilot; per-org region from M6. | **Open** |
+| Q5 | Data residency for EU, India, and US hotels? | Pilot in India: Supabase `ap-south-1`, Fly `bom` (or `sin` if `bom` is not offered), Langfuse self-hosted near the data; region per org from M6 (D25). | Decided (owner) |
 | Q6 | One LLM tracing tool across runtimes? | Yes: Langfuse (D15). | Decided (owner; tool chosen by us) |
-| Q7 | Do customers need an OpenAI-compatible API? | Not answered. Default: not in v1; the public REST API (M5) covers integrations. | **Open** |
+| Q7 | Do customers need an OpenAI-compatible API? | Not in v1; the public REST API (M5) covers integrations. | Decided (our default; owner did not change it) |
 | Q8 | Who approves code and risky actions? | **Changed 2026-11-18 (see Q24).** Hotel staff request and confirm changes; evals decide; our team reviews only protected-path and `High`-risk PRs and gets a daily digest. Hotel staff approve hotel operations in their own hotel. No two-approver rule (D16). | Decided (owner) |
 | Q9 | Licence for this public repository? | None. No `LICENSE` file (D17). | Decided (owner) |
 | Q10 | Fly Machines only, or Fly and E2B? | Fly Machines only; add a second provider only if Fly cannot meet a need (D5). | Decided (owner asked us) |
@@ -1188,17 +1196,17 @@ Q28 to Q31 are our defaults and wait for the owner to confirm. "Owner" means the
 | Q18 | How to reach hotel systems? | API first, browser fallback (D22). | Decided (owner) |
 | Q19 | Which PMS type do the first hotels use? | Cloud PMSs with APIs (D22). | Decided (owner) |
 | Q20 | Repos share a template? Help with fixes across repos? | Repos are independent; multi-repo fixes on request (D20). | Decided (owner) |
-| Q21 | Which cloud PMS do we integrate first (for example Mews, Cloudbeds, Beds24, Apaleo)? | Not answered. Needed before M3. | **Open** |
+| Q21 | Which cloud PMS do we integrate first? | Beds24. Our existing repos already integrate it, so the connector and the fake PMS for evals are faster to build. Needed in M3. | Decided (owner) |
 | Q22 | Which email service do the email agents send through? | Not needed now: email agents are deferred (owner, 2026-11-18). | Deferred |
-| Q23 | Which live metrics trigger a revert PR, and at what thresholds? | Not answered. Default: hand-off rate and failed-conversation rate, compared with the 7 days before the change. | **Open** |
+| Q23 | Which live metrics trigger a revert, and at what thresholds? | A failed post-deploy smoke eval, or a rise of more than 20% in hand-off rate or failed-conversation rate in the 24 hours after the deploy, compared with the 7 days before (Section 9.6). | Decided (owner) |
 | Q24 | Does "live when evals pass" also apply to backend code? | Yes, everything (owner). Our guardrails: protected paths and `High` risk go to our team (Q28, Q29); code joins the eval gate in M3 with staged rollout and automatic revert (D16, D18). | Decided (owner) |
 | Q25 | What role do BAML files have? | Harness change functions, plus structured outputs in hotel repos; prompts and KB stay in Markdown (D23). | Decided (owner asked us) |
 | Q26 | Who sees the diff? | Staff: readable diff and summary. Our team: full git diff (Section 9.7). | Decided (owner) |
 | Q27 | One standard layout for hotel repos? | Yes; the harness helps move existing repos (D24, Section 9.2). | Decided (owner) |
-| Q28 | Which paths always need our team? | Default: `harness.yaml`, CODEOWNERS, CI, evals, migrations, payments, auth. | **Open (default applied)** |
-| Q29 | Does a `High` risk from `ReviewChange` send a PR to our team? | Default: yes. | **Open (default applied)** |
-| Q30 | Vapi org layout (O11)? | Default: two Vapi orgs per hotel, production and test, so a test key cannot touch a production assistant. | **Open (default applied)** |
-| Q31 | Repo naming and Vapi push workflow (O12)? | Default: repos named `hotel-<slug>`; we write one reference Vapi push workflow in M3 that every hotel repo uses. | **Open (default applied)** |
+| Q28 | Which paths always need our team? | `harness.yaml`, CODEOWNERS, CI, evals, database migrations, payments, auth. | Decided (owner) |
+| Q29 | Does a `High` risk from `ReviewChange` send a PR to our team? | Yes. | Decided (owner) |
+| Q30 | Vapi org layout (O11)? | Two Vapi orgs per hotel, production and test, so a test key cannot touch a production assistant (D21). | Decided (owner) |
+| Q31 | Repo naming and Vapi push workflow (O12)? | Repos named `hotel-<slug>`; we write one reference Vapi push workflow in M3 that every hotel repo uses. | Decided (our default; owner did not change it) |
 
 ---
 
@@ -1217,6 +1225,8 @@ Q28 to Q31 are our defaults and wait for the owner to confirm. "Owner" means the
   <https://docs.langchain.com/oss/python/deepagents/human-in-the-loop>
 - opencode server — <https://opencode.ai/docs/server>
 - InsForge — <https://docs.insforge.dev/introduction>
+- Fly.io regions — <https://docs.fly.io/reference/regions/> (checked 2026-11-18: `bom` not listed);
+  region consolidation — <https://fly.io/blog/the-region-consolidation-project/>
 - BAML — tests: <https://docs.boundaryml.com/ref/baml/test>, CLI test runner:
   <https://docs.boundaryml.com/ref/baml-cli/test>
 - hotel-stack (our reference repo, inspiration only) — `docs/ARCHITECTURE.md`, `hotels/<id>/`,
