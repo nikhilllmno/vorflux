@@ -8,21 +8,22 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from harness import __version__
 from harness.config import Settings, get_settings
-from harness.runtimes import FakeRuntime, RuntimeRegistry
+from harness.runtimes import RuntimeRegistry
 
 
 def build_registry(settings: Settings) -> RuntimeRegistry:
-    registry = RuntimeRegistry()
-    if settings.environment in ("local", "test"):
-        registry.register(FakeRuntime())
-    return registry
+    """Register the production adapters. None exist yet (Claude Agent SDK lands in M1)."""
+    return RuntimeRegistry()
 
 
-def create_app(settings: Settings | None = None) -> FastAPI:
+def create_app(
+    settings: Settings | None = None, runtimes: RuntimeRegistry | None = None
+) -> FastAPI:
+    """`runtimes` lets tests inject a registry with test doubles."""
     settings = settings or get_settings()
     app = FastAPI(title="Hotel Agent Harness", version=__version__)
     app.state.settings = settings
-    app.state.runtimes = build_registry(settings)
+    app.state.runtimes = runtimes if runtimes is not None else build_registry(settings)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=settings.cors_origins,
@@ -39,7 +40,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         registry: RuntimeRegistry = request.app.state.runtimes
         return {
             "runtimes": [
-                {"kind": kind.value, "capabilities": asdict(registry.get(kind).capabilities())}
+                {"kind": kind, "capabilities": asdict(registry.get(kind).capabilities())}
                 for kind in registry.kinds()
             ]
         }

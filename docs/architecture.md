@@ -155,7 +155,7 @@ Each decision has a short reason. Section 14 lists the owner's answers to the op
 
 | # | Decision | Reason |
 |---|---|---|
-| D1 | Re-implement Hermes features in our own Python codebase. Do not fork or embed Hermes. | Hermes is single-tenant by design ("profiles are islands"), file-based, and tied to its own agent loop. We need multi-tenant state and four runtimes. Hermes is MIT, so we may copy small parts later with attribution (`THIRD_PARTY_NOTICES.md`). |
+| D1 | Re-implement Hermes features in our own Python codebase. Do not fork or embed Hermes. | Hermes is single-tenant by design ("profiles are islands"), file-based, and tied to its own agent loop. We need multi-tenant state and two runtimes (D2, D14). Hermes is MIT, so we may copy small parts later with attribution (`THIRD_PARTY_NOTICES.md`). |
 | D2 | One runtime-adapter contract (`AgentRuntime`) with two adapters: `claude_agent_sdk` (M1) and `openai_agents_sdk` (M3). The contract stays, so a later runtime needs only a new adapter that passes the conformance suite. | The owner uses only Anthropic and OpenAI models (2026-11-18), so we need one runtime per model provider. Features above the seam (tenancy, approvals, memory, skills, audit) work the same on both. |
 | D3 | Harness tools reach every runtime as **one MCP server per run**, scoped to the run's tenant. | Both runtimes are MCP clients. One tool implementation serves all of them, and the tenant scope is enforced in one place. |
 | D4 | The adapter and the runtime run **inside the sandbox**, not in the API process. | Hermes' security policy: in-process guards are heuristics, the OS is the boundary. The Claude Agent SDK spawns the Claude Code CLI as a subprocess, and OpenAI Agents SDK runs use shell and file tools for coding, so whole-process isolation is the only clean option. |
@@ -290,7 +290,7 @@ state. "New" means Hermes does not have it. "Defer" and "Skip" are explicit choi
 | Hermes feature | In Hermes | Harness design | Plan |
 |---|---|---|---|
 | Agent loop | `run_agent.py`, `agent/turn_*.py`: one in-house loop for all providers | Replaced by the two runtimes behind `AgentRuntime` (Section 6). The harness keeps the loop-adjacent features: approvals, budgets, interrupts, audit. | M1 |
-| Any model, provider switch, fallback providers, credential pools | `providers/`, `agent/credential_pool*.py`, `/model` | Per-hotel model policy (allowed models, default, fallback chain, monthly budget). Keys per org in the tenant secret store, injected at egress. Runtimes limit choice (Claude SDK: Anthropic models; others: wider). | M1, M4 |
+| Any model, provider switch, fallback providers, credential pools | `providers/`, `agent/credential_pool*.py`, `/model` | Per-hotel model policy (allowed models, default, fallback chain, monthly budget). Keys per org in the tenant secret store, injected at egress. Each runtime takes one provider's models (Claude Agent SDK: Anthropic; OpenAI Agents SDK: OpenAI). The allowed models and the fallback chain are set per runtime (Section 6.6). | M1, M4 |
 | Prompt-cache discipline | Root `AGENTS.md`: never mutate past context or toolsets mid-session | Same invariant: system prompt, tool list, memory snapshot, and skill index are frozen per session. Changes apply from the next session. | M1 |
 | Context files | `.hermes.md`, `AGENTS.md`, `CLAUDE.md`, `SOUL.md` discovery | Per-hotel `SOUL` (persona, tone, brand rules) stored in Postgres. Repo `AGENTS.md` / `CLAUDE.md` are read from the cloned workspace for coding runs. | M1 |
 | Context compression | `agent/context_compressor*.py`, `/compress` | Use the runtime's native compaction where it exists (Claude Agent SDK). Harness fallback: summarise older turns into a pinned summary message with a link to the archived transcript. | M2 |
@@ -405,8 +405,9 @@ tools. The event stream is the only output. The orchestrator persists every even
 Slack, and Telegram all render the same run in the same way.
 
 Planned additions in M1: `resume(session_id, state)` for paused runs, `ApprovalDecision` input,
-usage and cost fields on every event, and a `RunConfig` with system prompt, context files,
-memory snapshot, and skill index.
+usage and cost fields on every event, and a `RunConfig` with runtime, model, system prompt,
+context files, memory snapshot, and skill index. Section 6.6 gives the rule for the runtime and
+model pair.
 
 ### 6.3 What the harness owns and what the runtime owns
 
@@ -470,7 +471,16 @@ Notes:
 - The harness runtime is independent of the product agent's framework (Section 6.1). A Claude
   Agent SDK run can change a voice agent built on the OpenAI Agents SDK.
 - Our team can change the default per hotel. Hotel admins can choose from the runtimes in their
-  plan.
+  plan. The hotel policy holds the default runtime. The tenancy schema does not have this field
+  yet; add it with the runtime contract v2 (DEX-15).
+- The runtime ids are the `RuntimeKind` values in `backend/src/harness/runtimes/base.py`. This
+  is the one source of truth. The plan limits in the database (`plans.allowed_runtimes`) must hold
+  the same ids, and a backend test compares them. The fake runtime is a test double in
+  `backend/tests/`. It is not a `RuntimeKind`, so production config cannot select it.
+- Each runtime takes one provider's models: Anthropic for the Claude Agent SDK, OpenAI for the
+  OpenAI Agents SDK. `RunConfig` carries the runtime and the model. Before a run starts, the
+  orchestrator rejects a runtime and model pair that the plan, and then the hotel policy, does
+  not allow. A fallback chain stays inside one runtime, because a session keeps one runtime.
 - A session keeps one runtime for its life (prompt-cache invariant). A different runtime means a
   new session or a delegated child run.
 
@@ -1116,9 +1126,9 @@ Repository layout (this PR creates the parts marked "now"):
 │   │   ├── main.py          # app factory, /healthz, /v1/runtimes
 │   │   ├── config.py        # settings from env (names in .env.example)
 │   │   ├── tenancy.py       # TenantContext
-│   │   └── runtimes/        # AgentRuntime contract, registry, fake runtime
+│   │   └── runtimes/        # AgentRuntime contract, registry
 │   ├── baml_src/           # later (M2): DraftChange, ReviewChange, ExplainDiff + BAML tests
-│   └── tests/
+│   └── tests/               # tests; fakes.py holds the fake runtime (test double)
 ├── web/                     # now: Next.js app skeleton
 ├── docs/architecture.md     # now: this document
 ├── .github/                 # now: CI workflow, PR template
