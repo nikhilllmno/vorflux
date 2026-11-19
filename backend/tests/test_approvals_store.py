@@ -14,9 +14,10 @@ from typing import Any
 from uuid import UUID
 
 import pytest
-from approval_world import World
+from approval_world import FakeClock, World
 
 from harness.approvals import (
+    NO_STORED_POLICY,
     ActionKind,
     ActorType,
     ApprovalRequest,
@@ -29,10 +30,12 @@ from harness.approvals import (
     InMemoryAuditLog,
     InMemoryPolicyStore,
     RiskLevel,
+    TransitionGuard,
     Verdict,
+    WriteResult,
 )
 from harness.approvals.model import thaw_json
-from harness.approvals.store import SyncAuditLog
+from harness.approvals.store import Clock, SyncAuditLog, guard_failure
 
 pytestmark = pytest.mark.anyio
 
@@ -65,10 +68,12 @@ def _from_row(text: str) -> ApprovalRequest:
 
 
 class JsonRowApprovalStore:
-    def __init__(self, audit: SyncAuditLog | None = None) -> None:
-        self._lock = threading.Lock()
+    def __init__(self, policies: "JsonRowPolicyStore", audit: SyncAuditLog, clock: Clock) -> None:
+        self._policies = policies
+        self._lock = policies.lock
+        self._clock = clock
         self._rows: dict[UUID, str] = {}
-        self.audit: SyncAuditLog = audit or InMemoryAuditLog()
+        self.audit: SyncAuditLog = audit
 
     def _all(self) -> list[ApprovalRequest]:
         return [_from_row(row) for row in self._rows.values()]
@@ -114,17 +119,25 @@ class JsonRowApprovalStore:
         return sorted(rows, key=lambda r: r.created_at)
 
     async def replace(
-        self, current: ApprovalRequest, new: ApprovalRequest, event: AuditEvent
-    ) -> bool:
+        self,
+        current: ApprovalRequest,
+        new: ApprovalRequest,
+        event: AuditEvent,
+        guard: TransitionGuard | None = None,
+    ) -> WriteResult:
         if new.version != current.version + 1 or new.id != current.id:
             raise ValueError("replace must keep the id and bump the version by one")
         with self._lock:
             row = self._rows.get(current.id)
             if row is None or _from_row(row).version != current.version:
-                return False
+                return WriteResult.STALE
+            policy_version = self._policies.stored_version_locked(current.org_id, current.hotel_id)
+            failure = guard_failure(guard, policy_version, self._clock())
+            if failure is not None:
+                return failure
             self.audit.record_now(event)
             self._rows[current.id] = _to_row(new)
-            return True
+            return WriteResult.APPLIED
 
 
 class JsonRowPolicyStore:
@@ -132,6 +145,14 @@ class JsonRowPolicyStore:
         self._lock = threading.Lock()
         self._rows: dict[tuple[UUID, UUID], str] = {}
         self.audit: SyncAuditLog = audit or InMemoryAuditLog()
+
+    @property
+    def lock(self) -> threading.Lock:
+        return self._lock
+
+    def stored_version_locked(self, org_id: UUID, hotel_id: UUID) -> int:
+        text = self._rows.get((org_id, hotel_id))
+        return NO_STORED_POLICY if text is None else int(json.loads(text)["version"])
 
     async def get(self, org_id: UUID, hotel_id: UUID) -> HotelPolicy | None:
         with self._lock:
@@ -153,8 +174,7 @@ class JsonRowPolicyStore:
     async def put(self, policy: HotelPolicy, event: AuditEvent) -> bool:
         key = (policy.org_id, policy.hotel_id)
         with self._lock:
-            text = self._rows.get(key)
-            stored_version = -1 if text is None else json.loads(text)["version"]
+            stored_version = self.stored_version_locked(*key)
             if policy.version != stored_version + 1:
                 return False
             self.audit.record_now(event)
@@ -182,9 +202,10 @@ def _typed_world() -> World:
 
 def _json_world() -> World:
     audit = InMemoryAuditLog()
-    return World(
-        audit=audit, approvals=JsonRowApprovalStore(audit), policies=JsonRowPolicyStore(audit)
-    )
+    clock = FakeClock()
+    policies = JsonRowPolicyStore(audit)
+    approvals = JsonRowApprovalStore(policies, audit, clock)
+    return World(clock=clock, audit=audit, approvals=approvals, policies=policies)
 
 
 @pytest.fixture(params=[_typed_world, _json_world], ids=["typed", "json_rows"])
@@ -229,9 +250,48 @@ async def test_replace_is_compare_and_set(world: World) -> None:
     _, request = await world.request()
     newer = replace(request, version=request.version + 1)
 
-    assert await world.approvals.replace(request, newer, _event(newer, "a")) is True
-    assert await world.approvals.replace(request, newer, _event(newer, "b")) is False
+    assert await world.approvals.replace(request, newer, _event(newer, "a")) == WriteResult.APPLIED
+    assert await world.approvals.replace(request, newer, _event(newer, "b")) == WriteResult.STALE
     assert world.audit_actions() == ["approval.requested", "a"]
+
+
+def test_a_write_result_cannot_be_used_as_a_bool() -> None:
+    with pytest.raises(TypeError):
+        bool(WriteResult.STALE)
+
+
+@pytest.mark.parametrize("seeded", [False, True], ids=["no_stored_policy", "stored_policy"])
+async def test_a_guarded_write_fails_if_the_policy_changed(world: World, seeded: bool) -> None:
+    if seeded:
+        await world.set_policy()
+    _, request = await world.request()
+    assessed = 0 if seeded else NO_STORED_POLICY
+    await world.set_policy(use_window=timedelta(minutes=5))  # a policy write after the read
+    newer = replace(request, version=request.version + 1)
+
+    result = await world.approvals.replace(
+        request, newer, _event(newer, "a"), TransitionGuard(assessed)
+    )
+
+    assert result == WriteResult.POLICY_CHANGED
+    assert world.audit_actions() == ["approval.requested"]
+    current = TransitionGuard(assessed + 1)
+    assert await world.approvals.replace(request, newer, _event(newer, "b"), current) == (
+        WriteResult.APPLIED
+    )
+
+
+async def test_a_guarded_write_fails_at_or_after_its_deadline(world: World) -> None:
+    _, request = await world.request()
+    newer = replace(request, version=request.version + 1)
+    at_deadline = TransitionGuard(NO_STORED_POLICY, deadline=world.clock.now)
+    before_deadline = TransitionGuard(NO_STORED_POLICY, deadline=world.clock.now + timedelta(0, 1))
+
+    late = await world.approvals.replace(request, newer, _event(newer, "a"), at_deadline)
+    in_time = await world.approvals.replace(request, newer, _event(newer, "b"), before_deadline)
+
+    assert (late, in_time) == (WriteResult.DEADLINE_PASSED, WriteResult.APPLIED)
+    assert world.audit_actions() == ["approval.requested", "b"]
 
 
 async def test_one_request_per_tool_call(world: World) -> None:

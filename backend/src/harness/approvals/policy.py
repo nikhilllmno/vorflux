@@ -155,6 +155,10 @@ def approver_roles_for(policy: HotelPolicy, kind: ActionKind) -> frozenset[Appro
     return hotel_roles_at_least(policy.min_role_for(kind))
 
 
+NO_STORED_POLICY = -1
+"""The policy version of a hotel with no stored policy (the defaults apply)."""
+
+
 @dataclass(frozen=True, slots=True)
 class Assessment:
     """The decision plus what the service needs to bind an approval (absent on deny)."""
@@ -163,6 +167,9 @@ class Assessment:
     spec: ToolSpec | None = None
     preview: Preview | None = None
     proposal_hash: str | None = None
+    # The stored policy version this decision used (NO_STORED_POLICY for the defaults). A write
+    # that relies on the decision passes it to the store in a TransitionGuard.
+    policy_version: int | None = None
 
 
 def _deny(call: object, reason: str) -> Assessment:
@@ -186,8 +193,14 @@ class PolicyEngine:
         self._platform_rules = tuple(platform_rules)
 
     async def hotel_policy(self, org_id: UUID, hotel_id: UUID) -> HotelPolicy:
+        return (await self.load_policy(org_id, hotel_id))[0]
+
+    async def load_policy(self, org_id: UUID, hotel_id: UUID) -> tuple[HotelPolicy, int]:
+        """The hotel policy and its stored version (NO_STORED_POLICY when defaults apply)."""
         stored = await self._policies.get(org_id, hotel_id)
-        return stored or HotelPolicy(org_id=org_id, hotel_id=hotel_id)
+        if stored is None:
+            return HotelPolicy(org_id=org_id, hotel_id=hotel_id), NO_STORED_POLICY
+        return stored, stored.version
 
     async def evaluate(self, call: ProposedCall) -> Decision:
         return (await self.assess(call)).decision
@@ -209,7 +222,7 @@ class PolicyEngine:
         if spec is None:
             return _deny(call, f"tool {call.toolset}/{call.tool} is not registered")
 
-        policy = await self.hotel_policy(call.org_id, call.hotel_id)
+        policy, policy_version = await self.load_policy(call.org_id, call.hotel_id)
         matching = [
             rule.effect
             for rule in (*self._platform_rules, *policy.rules)
@@ -244,4 +257,4 @@ class PolicyEngine:
             decision = Decision(
                 call.tool_call_id, Verdict.ASK, f"{spec.kind} needs approval by {needs}", roles
             )
-        return Assessment(decision, spec, preview, bound)
+        return Assessment(decision, spec, preview, bound, policy_version)

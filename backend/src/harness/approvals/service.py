@@ -4,6 +4,9 @@ It implements `ApprovalPolicy` (the adapter interface) and the staff-facing oper
 API.
 
 - Every state change goes to the store together with its audit event (one transaction).
+- A decision and a use pass a `TransitionGuard` to the store: the write fails if the hotel
+  policy changed after the service read it, or if the deadline passed while the service waited
+  for I/O. The service then reads again and re-checks (at most `MAX_TRANSITION_ATTEMPTS` times).
 - A denied tool call and a refused use write an audit event too (best effort; the denial or
   refusal stands if the audit write fails).
 - Every exit from `pending` notifies the `RunResumer`, so the paused run continues
@@ -38,12 +41,19 @@ from harness.approvals.model import (
     Verdict,
 )
 from harness.approvals.policy import (
+    Assessment,
     HotelPolicy,
     PolicyEngine,
     approver_roles_for,
     validate_approver_min_role,
 )
-from harness.approvals.store import ApprovalStore, DuplicateToolCallError, PolicyStore
+from harness.approvals.store import (
+    ApprovalStore,
+    DuplicateToolCallError,
+    PolicyStore,
+    TransitionGuard,
+    WriteResult,
+)
 from harness.tenancy import TenantContext
 
 logger = logging.getLogger(__name__)
@@ -51,6 +61,7 @@ logger = logging.getLogger(__name__)
 Clock = Callable[[], datetime]
 MAX_NOTE_LENGTH = 2000
 MAX_REASON_LENGTH = 1000
+MAX_TRANSITION_ATTEMPTS = 3
 
 
 class ApprovalError(Exception):
@@ -173,7 +184,7 @@ class ApprovalService:
 
     async def check(self, approval_id: UUID, call: ProposedCall) -> ApprovalCheck:
         try:
-            request, failure = await self._verify(approval_id, call, self._clock())
+            request, failure, _ = await self._verify(approval_id, call, self._clock())
             if request is None or failure is not None:
                 return ApprovalCheck(False, failure or "approval not found", _status(request))
             return ApprovalCheck(True, "approval is valid", request.status)
@@ -183,12 +194,24 @@ class ApprovalService:
 
     async def consume(self, approval_id: UUID, call: ProposedCall) -> ApprovalCheck:
         try:
-            now = self._clock()
-            request, failure = await self._verify(approval_id, call, now)
-            if request is not None and failure is None:
+            request: ApprovalRequest | None = None
+            reason = "approval changed while it was being used; try again"
+            for _ in range(MAX_TRANSITION_ATTEMPTS):
+                request, failure, assessment = await self._verify(approval_id, call, self._clock())
+                if failure is not None or request is None:
+                    reason = failure or "approval not found"
+                    break
+                if assessment is None or assessment.policy_version is None:
+                    reason = "policy evaluation failed"
+                    break
+                # The store checks the policy version and `use_by` again, atomically with the
+                # write, so a change while this call awaited I/O cannot slip through.
+                now = self._clock()
                 used = replace(request, consumed_at=now, version=request.version + 1)
                 event = _event(used, ActorType.RUN, used.run_id, "approval.consumed", now)
-                if await self._approvals.replace(request, used, event):
+                guard = TransitionGuard(assessment.policy_version, deadline=request.use_by)
+                result = await self._approvals.replace(request, used, event, guard)
+                if result == WriteResult.APPLIED:
                     return ApprovalCheck(
                         True,
                         "approval used",
@@ -196,8 +219,10 @@ class ApprovalService:
                         args=used.args,
                         idempotency_key=str(used.id),
                     )
-                failure = "approval was already used"
-            reason = failure or "approval not found"
+                if result == WriteResult.DEADLINE_PASSED:
+                    reason = "approval expired"
+                    break
+                # STALE or POLICY_CHANGED: verify again against the current row and policy.
             await self._record_tool_call_event(
                 call, "approval.use_refused", reason, approval_id=approval_id
             )
@@ -285,7 +310,7 @@ class ApprovalService:
             version=request.version + 1,
         )
         event = _event(cancelled, ActorType.RUN, cancelled.run_id, "approval.cancelled", now)
-        if not await self._approvals.replace(request, cancelled, event):
+        if await self._approvals.replace(request, cancelled, event) != WriteResult.APPLIED:
             raise ConflictError("approval changed; reload it")
         await self._notify(cancelled)
         return cancelled
@@ -378,64 +403,80 @@ class ApprovalService:
         reason: str | None,
     ) -> ApprovalRequest:
         _check_actor(principal, tenant)
-        request = await self._approvals.get(tenant.org_id, tenant.hotel_id, approval_id)
-        if request is None or not self._can_view(principal, request):
-            raise NotFoundError("approval not found")
-        if not principal.is_human:
-            raise ForbiddenError("only a person can decide an approval")
-        now = self._clock()
-        request = await self._expire_if_due(request, now)
-        if request.status != ApprovalStatus.PENDING:
-            raise ConflictError(f"approval is {request.status}")
-        policy = await self._engine.hotel_policy(request.org_id, request.hotel_id)
-        if not self._can_decide(principal, request, policy):
-            raise ForbiddenError("you do not have a role that can decide this approval")
-        if approve and _self_approval_blocked(principal, request, policy):
-            raise ForbiddenError("the requester cannot approve their own high-risk action")
-
+        reason = _clean_text(reason, MAX_REASON_LENGTH, "reason")
         status = ApprovalStatus.APPROVED if approve else ApprovalStatus.REJECTED
-        decided = replace(
-            request,
-            status=status,
-            decided_by=principal.user_id,
-            decided_at=now,
-            use_by=now + policy.use_window if approve else None,
-            reason=_clean_text(reason, MAX_REASON_LENGTH, "reason"),
-            version=request.version + 1,
-        )
-        event = _event(decided, ActorType.USER, str(principal.user_id), f"approval.{status}", now)
-        if not await self._approvals.replace(request, decided, event):
-            raise ConflictError("approval changed; reload it")
-        await self._notify(decided)
-        return decided
+        for _ in range(MAX_TRANSITION_ATTEMPTS):
+            request = await self._approvals.get(tenant.org_id, tenant.hotel_id, approval_id)
+            if request is None or not self._can_view(principal, request):
+                raise NotFoundError("approval not found")
+            if not principal.is_human:
+                raise ForbiddenError("only a person can decide an approval")
+            request = await self._expire_if_due(request, self._clock())
+            if request.status != ApprovalStatus.PENDING:
+                raise ConflictError(f"approval is {request.status}")
+            policy, policy_version = await self._engine.load_policy(
+                request.org_id, request.hotel_id
+            )
+            if not self._can_decide(principal, request, policy):
+                raise ForbiddenError("you do not have a role that can decide this approval")
+            if approve and _self_approval_blocked(principal, request, policy):
+                raise ForbiddenError("the requester cannot approve their own high-risk action")
+
+            # The store checks the policy version and `expires_at` again, atomically with the
+            # write, so a change while this call awaited I/O cannot slip through.
+            now = self._clock()
+            decided = replace(
+                request,
+                status=status,
+                decided_by=principal.user_id,
+                decided_at=now,
+                use_by=now + policy.use_window if approve else None,
+                reason=reason,
+                version=request.version + 1,
+            )
+            event = _event(
+                decided, ActorType.USER, str(principal.user_id), f"approval.{status}", now
+            )
+            guard = TransitionGuard(policy_version, deadline=request.expires_at)
+            result = await self._approvals.replace(request, decided, event, guard)
+            if result == WriteResult.APPLIED:
+                await self._notify(decided)
+                return decided
+            if result == WriteResult.DEADLINE_PASSED:
+                await self._expire_if_due(request, self._clock())
+                raise ConflictError(f"approval is {ApprovalStatus.EXPIRED}")
+            # STALE or POLICY_CHANGED: read the request and the policy again.
+        raise ConflictError("approval changed; reload it")
 
     async def _verify(
         self, approval_id: UUID, call: ProposedCall, now: datetime
-    ) -> tuple[ApprovalRequest | None, str | None]:
-        """The request, and why it cannot authorise this exact tool call now (None if it can)."""
+    ) -> tuple[ApprovalRequest | None, str | None, Assessment | None]:
+        """The request, why it cannot authorise this exact tool call now (None if it can), and
+        the current policy assessment that the answer used."""
         if not isinstance(call, ProposedCall) or not isinstance(call.tenant, TenantContext):
-            return None, "tool call has no tenant context"
+            return None, "tool call has no tenant context", None
         request = await self._approvals.get(call.org_id, call.hotel_id, approval_id)
         if request is None:
-            return None, "approval not found"
+            return None, "approval not found", None
         if request.status != ApprovalStatus.APPROVED:
             if _is_due(request, now):
-                return request, "approval expired"
-            return request, f"approval is {request.status}"
+                return request, "approval expired", None
+            return request, f"approval is {request.status}", None
         if request.consumed_at is not None:
-            return request, "approval was already used"
+            return request, "approval was already used", None
         if request.use_by is None or now >= request.use_by:
-            return request, "approval expired"
+            return request, "approval expired", None
         if request.run_id != call.run_id or request.requester_id != call.requester_id:
-            return request, "approval belongs to another run"
+            return request, "approval belongs to another run", None
         if request.tool_call_id != call.tool_call_id:
-            return request, "approval belongs to another tool call"
+            return request, "approval belongs to another tool call", None
         assessment = await self._engine.assess(call)  # the current policy, at the time of use
         if assessment.decision.verdict == Verdict.DENY:
-            return request, f"the policy now denies this action: {assessment.decision.reason}"
+            reason = f"the policy now denies this action: {assessment.decision.reason}"
+            return request, reason, assessment
         if assessment.proposal_hash != request.proposal_hash:
-            return request, "action changed after approval; a new approval is needed"
-        return request, None
+            return request, "action changed after approval; a new approval is needed", assessment
+        return request, None, assessment
 
     async def _expire_if_due(self, request: ApprovalRequest, now: datetime) -> ApprovalRequest:
         if not _is_due(request, now):
@@ -444,7 +485,7 @@ class ApprovalService:
             request, status=ApprovalStatus.EXPIRED, decided_at=now, version=request.version + 1
         )
         event = _event(expired, ActorType.SYSTEM, None, "approval.expired", now)
-        if not await self._approvals.replace(request, expired, event):
+        if await self._approvals.replace(request, expired, event) != WriteResult.APPLIED:
             current = await self._approvals.get(request.org_id, request.hotel_id, request.id)
             return current or request
         await self._notify(expired)

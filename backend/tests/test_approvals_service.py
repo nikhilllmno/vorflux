@@ -23,6 +23,7 @@ from harness.approvals import (
     ConflictError,
     Effect,
     InMemoryApprovalStore,
+    InMemoryPolicyStore,
     ProposedCall,
     RiskLevel,
     Rule,
@@ -369,7 +370,8 @@ async def test_check_and_consume_fail_closed_on_store_errors() -> None:
         async def get(self, org_id: Any, hotel_id: Any, approval_id: Any) -> ApprovalRequest | None:
             raise RuntimeError("database is down")
 
-    world = World(approvals=BrokenStore())
+    policies = InMemoryPolicyStore()
+    world = World(policies=policies, approvals=BrokenStore(policies))
     call = world.call()
 
     assert (await world.service.check(uuid4(), call)).ok is False

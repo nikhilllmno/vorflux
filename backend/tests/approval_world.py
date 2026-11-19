@@ -124,10 +124,11 @@ class World:
     platform_rules: Sequence[Rule] = ()
 
     def __post_init__(self) -> None:
-        if self.approvals is None:
-            self.approvals = InMemoryApprovalStore(self.audit)
         if self.policies is None:
             self.policies = InMemoryPolicyStore(self.audit)
+        if self.approvals is None:
+            # Shares the policy store's lock and the fake clock (guarded writes).
+            self.approvals = InMemoryApprovalStore(self.policies, self.audit, self.clock)
         self.engine = PolicyEngine(self.policies, self.catalog, self.platform_rules)
         self.service = ApprovalService(
             self.engine, self.approvals, self.policies, self.audit, self.resumer, self.clock

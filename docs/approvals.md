@@ -152,8 +152,8 @@ as `high`.
   - the run, the requester and the tool call id;
   - the current policy and registry (a deny rule added after approval wins);
   - the proposal hash.
-- If all pass, `consume` sets `consumed_at` with a compare-and-set on `version`. Only one caller
-  wins.
+- If all pass, `consume` sets `consumed_at` with a guarded compare-and-set on `version` (see
+  "Atomic transitions"). Only one caller wins.
 - Only the requester can cancel a pending request.
 - Audit events:
   - State changes: `approval.requested`, `approval.approved`, `approval.rejected`,
@@ -178,6 +178,54 @@ as `high`.
   `version`. Two concurrent updates never lose a setting; the loser gets 409.
 - `tests/test_approvals_store.py` is the store contract. A future Postgres store must pass it,
   including the round trip of plain strings.
+
+## Atomic transitions
+
+The time-of-use checks and the current-role checks read the hotel policy, then write the approval.
+A policy change or a deadline that passes between the read and the write must not let the write
+through. So a decision and a use pass a `TransitionGuard` to `ApprovalStore.replace`:
+
+- `policy_version`: the stored policy version that the service assessed, or `NO_STORED_POLICY`
+  (-1) when the hotel uses the defaults.
+- `deadline`: `expires_at` for a decision, `use_by` for a use.
+
+The store checks both in the same atomic step as the compare-and-set on `version`. It uses its
+own clock at the time of the write, not a time that the service read before it awaited I/O. The
+result is a `WriteResult`:
+
+| Result | Service action |
+|---|---|
+| `APPLIED` | Done. |
+| `STALE` (another writer changed the row) | Read the row and the policy again and re-check. |
+| `POLICY_CHANGED` | Read the row and the policy again and re-check. |
+| `DEADLINE_PASSED` | Refuse: `consume` returns "approval expired"; a decision marks the request `expired` and returns 409. |
+
+- The service re-checks at most `MAX_TRANSITION_ATTEMPTS` (3) times. If every attempt loses a
+  race, `consume` refuses and a decision returns 409.
+- `WriteResult` cannot be used as a bool, so a caller cannot treat a refusal as success by
+  mistake.
+- `request` and `cancel` do not take a guard. A new request authorises nothing: its decision and
+  its use are guarded. A cancel only ends a pending request.
+- In memory: the approval store shares the lock of the policy store, so a guarded write and a
+  policy write of a hotel never overlap.
+- In Postgres (proposed; the store comes after PR #5):
+  - A policy write takes `pg_advisory_xact_lock(<hotel key>)` first. A guarded approval write takes
+    `pg_advisory_xact_lock_shared(<hotel key>)` first. The lock key is derived from `hotel_id`.
+    An advisory lock also covers a hotel with no policy row yet, where a row lock cannot.
+  - The guarded write is one statement in that transaction, followed by the audit insert:
+
+    ```sql
+    update public.approval_requests set ... , version = version + 1
+     where id = $1 and org_id = $2 and hotel_id = $3 and version = $4
+       and coalesce((select p.version from public.approval_policies p
+                      where p.org_id = $2 and p.hotel_id = $3), -1) = $5
+       and ($6::timestamptz is null or clock_timestamp() < $6);
+    ```
+
+  - If no row changes, the store reads the row version and the policy version in the same
+    transaction to return `STALE`, `POLICY_CHANGED` or `DEADLINE_PASSED`.
+  - `clock_timestamp()` is the time of the write. `now()` is the start of the transaction and
+    is not used.
 
 ## HTTP API
 
@@ -314,7 +362,7 @@ RLS notes:
   - the role checks;
   - the person-only check;
   - the binding checks;
-  - the compare-and-set.
+  - the guarded compare-and-set (see "Atomic transitions").
 - The store writes each audit event in the same transaction as the state change.
 - A hotel member can read the args of a request in their hotel. That is the same data that the
   preview shows.

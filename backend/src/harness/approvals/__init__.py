@@ -38,6 +38,7 @@ from harness.approvals.model import (
     proposal_hash,
 )
 from harness.approvals.policy import (
+    NO_STORED_POLICY,
     Effect,
     HotelPolicy,
     PolicyEngine,
@@ -61,9 +62,12 @@ from harness.approvals.store import (
     InMemoryApprovalStore,
     InMemoryPolicyStore,
     PolicyStore,
+    TransitionGuard,
+    WriteResult,
 )
 
 __all__ = [
+    "NO_STORED_POLICY",
     "PROPOSAL_TYPES",
     "ActionClass",
     "ActionDeniedError",
@@ -107,7 +111,9 @@ __all__ = [
     "TeamRole",
     "ToolCatalog",
     "ToolSpec",
+    "TransitionGuard",
     "Verdict",
+    "WriteResult",
     "canonical_json",
     "proposal_hash",
     "render_preview",
