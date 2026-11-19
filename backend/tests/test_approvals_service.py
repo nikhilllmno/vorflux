@@ -17,11 +17,15 @@ from harness.approvals import (
     ApprovalRequest,
     ApprovalResolution,
     ApprovalStatus,
+    AuditEvent,
     ConflictError,
     Effect,
     ForbiddenError,
+    HotelPolicy,
     HotelRole,
     InMemoryApprovalStore,
+    InMemoryAuditLog,
+    InMemoryPolicyStore,
     InvalidPolicyError,
     NotFoundError,
     Principal,
@@ -39,7 +43,9 @@ def _request(world: World, action: Action | None = None) -> tuple[Action, Approv
 
 
 def _approve(world: World, request: ApprovalRequest, who: Principal) -> ApprovalRequest:
-    return world.service.approve(who, request.org_id, request.hotel_id, request.id)
+    return world.service.approve(
+        who, world.tenant(request.org_id, request.hotel_id, who), request.id
+    )
 
 
 def test_service_satisfies_the_adapter_interface() -> None:
@@ -126,9 +132,19 @@ def test_concurrent_use_wins_only_once() -> None:
     _, request = _request(world)
     approved = _approve(world, request, world.operator)
     used = replace(approved, consumed_at=world.clock.now, version=approved.version + 1)
+    event = AuditEvent(
+        org_id=used.org_id,
+        hotel_id=used.hotel_id,
+        actor_id=used.requester_id,
+        action="approval.consumed",
+        subject_type="approval_request",
+        subject_id=str(used.id),
+        at=world.clock.now,
+    )
 
-    assert world.approvals.replace(approved, used) is True
-    assert world.approvals.replace(approved, used) is False  # stale version loses
+    assert world.approvals.replace(approved, used, event) is True
+    assert world.approvals.replace(approved, used, event) is False  # stale version loses
+    assert world.audit_actions().count("approval.consumed") == 1  # the loser writes no audit
 
 
 def test_reject_resumes_the_run_and_the_action_cannot_run() -> None:
@@ -136,7 +152,10 @@ def test_reject_resumes_the_run_and_the_action_cannot_run() -> None:
     action, request = _request(world)
 
     rejected = world.service.reject(
-        world.operator, world.org_a, world.hotel_a1, request.id, "Rate too high"
+        world.operator,
+        world.tenant(world.org_a, world.hotel_a1, world.operator),
+        request.id,
+        "Rate too high",
     )
 
     assert rejected.status is ApprovalStatus.REJECTED
@@ -152,7 +171,9 @@ def test_a_decided_approval_cannot_be_decided_again() -> None:
     _approve(world, request, world.operator)
 
     with pytest.raises(ConflictError):
-        world.service.reject(world.admin, world.org_a, world.hotel_a1, request.id)
+        world.service.reject(
+            world.admin, world.tenant(world.org_a, world.hotel_a1, world.admin), request.id
+        )
     with pytest.raises(ConflictError):
         _approve(world, request, world.admin)
 
@@ -210,11 +231,19 @@ def test_decision_resumes_the_paused_run(approve: bool) -> None:
     assert run.approval_id is not None
 
     if approve:
-        world.service.approve(world.operator, world.org_a, world.hotel_a1, run.approval_id)
+        world.service.approve(
+            world.operator,
+            world.tenant(world.org_a, world.hotel_a1, world.operator),
+            run.approval_id,
+        )
         assert run.tool_calls == [dict(run.action.payload)]
         assert run.tool_errors == []
     else:
-        world.service.reject(world.operator, world.org_a, world.hotel_a1, run.approval_id)
+        world.service.reject(
+            world.operator,
+            world.tenant(world.org_a, world.hotel_a1, world.operator),
+            run.approval_id,
+        )
         assert run.tool_calls == []
         assert run.tool_errors == ["not run: rejected"]
 
@@ -361,9 +390,15 @@ def test_cross_hotel_approval_is_not_found() -> None:
     with pytest.raises(NotFoundError):
         _approve(world, request, world.hotel_a2_owner)
     with pytest.raises(NotFoundError):
-        world.service.approve(world.hotel_a2_owner, world.org_a, world.hotel_a2, request.id)
+        world.service.approve(
+            world.hotel_a2_owner,
+            world.tenant(world.org_a, world.hotel_a2, world.hotel_a2_owner),
+            request.id,
+        )
     with pytest.raises(NotFoundError):
-        world.service.list_for(world.hotel_a2_owner, world.org_a, world.hotel_a1)
+        world.service.list_for(
+            world.hotel_a2_owner, world.tenant(world.org_a, world.hotel_a1, world.hotel_a2_owner)
+        )
 
 
 def test_cross_org_approval_is_not_found() -> None:
@@ -373,9 +408,17 @@ def test_cross_org_approval_is_not_found() -> None:
     with pytest.raises(NotFoundError):
         _approve(world, request, world.org_b_owner)
     with pytest.raises(NotFoundError):
-        world.service.approve(world.org_b_owner, world.org_b, world.hotel_b1, request.id)
+        world.service.approve(
+            world.org_b_owner,
+            world.tenant(world.org_b, world.hotel_b1, world.org_b_owner),
+            request.id,
+        )
     with pytest.raises(NotFoundError):
-        world.service.get_for(world.org_b_owner, world.org_a, world.hotel_a1, request.id)
+        world.service.get_for(
+            world.org_b_owner,
+            world.tenant(world.org_a, world.hotel_a1, world.org_b_owner),
+            request.id,
+        )
     assert world.resumer.resolutions == []
 
 
@@ -393,13 +436,18 @@ def test_viewer_can_see_but_cannot_decide() -> None:
     world = World()
     _, request = _request(world)
 
-    assert [r.id for r in world.service.list_for(world.viewer, world.org_a, world.hotel_a1)] == [
-        request.id
-    ]
+    assert [
+        r.id
+        for r in world.service.list_for(
+            world.viewer, world.tenant(world.org_a, world.hotel_a1, world.viewer)
+        )
+    ] == [request.id]
     with pytest.raises(ForbiddenError):
         _approve(world, request, world.viewer)
     with pytest.raises(ForbiddenError):
-        world.service.reject(world.viewer, world.org_a, world.hotel_a1, request.id)
+        world.service.reject(
+            world.viewer, world.tenant(world.org_a, world.hotel_a1, world.viewer), request.id
+        )
 
 
 def test_operator_cannot_approve_when_the_hotel_requires_admin() -> None:
@@ -424,7 +472,10 @@ def test_pending_request_keeps_the_approver_roles_it_was_created_with() -> None:
     world = World()
     _, request = _request(world)
     world.service.set_approver_min_role(
-        world.admin, world.org_a, world.hotel_a1, ActionKind.PMS_CHANGE, HotelRole.OWNER
+        world.admin,
+        world.tenant(world.org_a, world.hotel_a1, world.admin),
+        ActionKind.PMS_CHANGE,
+        HotelRole.OWNER,
     )
 
     assert _approve(world, request, world.operator).status is ApprovalStatus.APPROVED
@@ -451,7 +502,9 @@ def test_code_reviewer_sees_only_code_requests_of_a_hotel() -> None:
         world, world.action(ActionKind.CODE_CHANGE, toolset="coding", tool="git", run_id="run-2")
     )
 
-    seen = world.service.list_for(world.code_reviewer, world.org_a, world.hotel_a1)
+    seen = world.service.list_for(
+        world.code_reviewer, world.tenant(world.org_a, world.hotel_a1, world.code_reviewer)
+    )
 
     assert [r.id for r in seen] == [code_request.id]
     with pytest.raises(NotFoundError):
@@ -465,7 +518,9 @@ def test_list_filters_by_status() -> None:
     _approve(world, first, world.operator)
 
     pending = world.service.list_for(
-        world.operator, world.org_a, world.hotel_a1, ApprovalStatus.PENDING
+        world.operator,
+        world.tenant(world.org_a, world.hotel_a1, world.operator),
+        ApprovalStatus.PENDING,
     )
 
     assert [r.id for r in pending] == [second.id]
@@ -498,7 +553,9 @@ def test_requester_may_still_reject_their_own_high_risk_action() -> None:
     world.set_policy(forbid_self_approval_of_high_risk=True)
     _, request = _request(world, world.action(risk=RiskLevel.HIGH))
 
-    rejected = world.service.reject(world.requester, world.org_a, world.hotel_a1, request.id)
+    rejected = world.service.reject(
+        world.requester, world.tenant(world.org_a, world.hotel_a1, world.requester), request.id
+    )
 
     assert rejected.status is ApprovalStatus.REJECTED
 
@@ -538,10 +595,16 @@ def test_hotel_admin_sets_approver_role_with_an_audit_event() -> None:
     world = World()
 
     policy = world.service.set_approver_min_role(
-        world.admin, world.org_a, world.hotel_a1, ActionKind.PMS_CHANGE, HotelRole.ADMIN
+        world.admin,
+        world.tenant(world.org_a, world.hotel_a1, world.admin),
+        ActionKind.PMS_CHANGE,
+        HotelRole.ADMIN,
     )
     again = world.service.set_approver_min_role(
-        world.owner, world.org_a, world.hotel_a1, ActionKind.MESSAGE_SEND, HotelRole.OWNER
+        world.owner,
+        world.tenant(world.org_a, world.hotel_a1, world.owner),
+        ActionKind.MESSAGE_SEND,
+        HotelRole.OWNER,
     )
 
     assert policy.min_role_for(ActionKind.PMS_CHANGE) is HotelRole.ADMIN
@@ -553,16 +616,57 @@ def test_hotel_admin_sets_approver_role_with_an_audit_event() -> None:
 
 def test_only_admins_of_the_hotel_set_approver_roles() -> None:
     world = World()
-    args = (world.org_a, world.hotel_a1, ActionKind.PMS_CHANGE, HotelRole.ADMIN)
+
+    def attempt(who: Principal) -> None:
+        tenant = world.tenant(world.org_a, world.hotel_a1, who)
+        world.service.set_approver_min_role(who, tenant, ActionKind.PMS_CHANGE, HotelRole.ADMIN)
 
     with pytest.raises(ForbiddenError):
-        world.service.set_approver_min_role(world.operator, *args)
-    with pytest.raises(NotFoundError):
-        world.service.set_approver_min_role(world.hotel_a2_owner, *args)
-    with pytest.raises(NotFoundError):
-        world.service.set_approver_min_role(world.org_b_owner, *args)
-    with pytest.raises(NotFoundError):
-        world.service.set_approver_min_role(world.code_reviewer, *args)
+        attempt(world.operator)
+    for outsider in (world.hotel_a2_owner, world.org_b_owner, world.code_reviewer):
+        with pytest.raises(NotFoundError):
+            attempt(outsider)
+    assert world.audit.events == ()
+
+
+def test_tenant_context_must_belong_to_the_principal() -> None:
+    world = World()
+    _, request = _request(world)
+    borrowed = world.tenant(world.org_a, world.hotel_a1, world.operator)
+
+    with pytest.raises(ValueError, match="actor_id"):
+        world.service.approve(world.viewer, borrowed, request.id)
+    assert world.approvals.get(world.org_a, world.hotel_a1, request.id) == request
+
+
+def test_first_policy_writes_from_two_admins_never_lose_a_setting() -> None:
+    # Another admin inserts the first policy between this admin's read and write.
+    class RacingStore(InMemoryPolicyStore):
+        raced = False
+
+        def get(self, org_id: UUID, hotel_id: UUID) -> HotelPolicy | None:
+            seen = super().get(org_id, hotel_id)
+            if not self.raced:
+                self.raced = True
+                other = world.tenant(org_id, hotel_id, world.owner)
+                world.service.set_approver_min_role(
+                    world.owner, other, ActionKind.PMS_CHANGE, HotelRole.OWNER
+                )
+            return seen
+
+    audit = InMemoryAuditLog()
+    world = World(policies=RacingStore(audit), audit=audit)
+    tenant = world.tenant(world.org_a, world.hotel_a1, world.admin)
+
+    with pytest.raises(ConflictError):
+        world.service.set_approver_min_role(
+            world.admin, tenant, ActionKind.MESSAGE_SEND, HotelRole.ADMIN
+        )
+    stored = world.policies.get(world.org_a, world.hotel_a1)
+    assert stored is not None
+    assert stored.min_role_for(ActionKind.PMS_CHANGE) is HotelRole.OWNER
+    assert stored.min_role_for(ActionKind.MESSAGE_SEND) is HotelRole.OPERATOR
+    assert world.audit_actions() == ["approval_policy.updated"]
 
 
 @pytest.mark.parametrize(
@@ -578,5 +682,70 @@ def test_admin_cannot_set_a_forbidden_approver_role(kind: ActionKind, role: Hote
     world = World()
 
     with pytest.raises(InvalidPolicyError):
-        world.service.set_approver_min_role(world.admin, world.org_a, world.hotel_a1, kind, role)
+        world.service.set_approver_min_role(
+            world.admin, world.tenant(world.org_a, world.hotel_a1, world.admin), kind, role
+        )
     assert world.audit.events == ()
+
+
+# --- Audit and state change are atomic -----------------------------------------------------
+
+
+class FailingAudit:
+    def __init__(self) -> None:
+        self.fail = True
+
+    def record(self, event: Any) -> None:
+        if self.fail:
+            raise RuntimeError("audit store is down")
+
+
+def test_failed_audit_write_leaves_no_usable_approval() -> None:
+    world = World()
+    action, request = _request(world)
+    audit = FailingAudit()
+    world.approvals.audit = audit
+
+    with pytest.raises(RuntimeError, match="audit"):
+        _approve(world, request, world.operator)
+
+    assert world.approvals.get(world.org_a, world.hotel_a1, request.id) == request
+    assert world.service.check(request.id, action).ok is False
+    assert world.resumer.resolutions == []
+    audit.fail = False
+    assert _approve(world, request, world.operator).status is ApprovalStatus.APPROVED
+    assert world.service.consume(request.id, action).ok is True
+
+
+def test_failed_audit_write_blocks_consume() -> None:
+    world = World()
+    action, request = _request(world)
+    _approve(world, request, world.operator)
+    world.approvals.audit = FailingAudit()
+
+    result = world.service.consume(request.id, action)
+
+    assert result.ok is False
+    world.approvals.audit = world.audit
+    assert world.service.consume(request.id, action).ok is True
+    assert world.audit_actions()[-1] == "approval.consumed"
+
+
+def test_orchestrator_recovers_a_decision_when_resume_failed() -> None:
+    class DownResumer:
+        def resume(self, resolution: ApprovalResolution) -> None:
+            raise RuntimeError("orchestrator is down")
+
+    world = World()
+    action, request = _request(world)
+    world.service._resumer = DownResumer()
+    run = world.tenant(world.org_a, world.hotel_a1, world.requester)
+
+    assert world.service.resolution(run, request.id) is None  # still pending
+    _approve(world, request, world.operator)
+
+    resolution = world.service.resolution(run, request.id)
+    assert resolution is not None
+    assert (resolution.outcome, resolution.run_id) == (ApprovalStatus.APPROVED, action.run_id)
+    other = world.tenant(world.org_a, world.hotel_a1, world.operator)
+    assert world.service.resolution(other, request.id) is None  # not their run

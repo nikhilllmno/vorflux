@@ -33,6 +33,7 @@ from harness.approvals.service import (
     InvalidPolicyError,
     NotFoundError,
 )
+from harness.tenancy import TenantContext
 
 
 def get_principal() -> Principal:
@@ -134,6 +135,11 @@ def _errors() -> Iterator[None]:
 router = APIRouter(prefix="/v1/orgs/{org_id}/hotels/{hotel_id}", tags=["approvals"])
 
 
+def _tenant(principal: Principal, org_id: UUID, hotel_id: UUID) -> TenantContext:
+    """The request's tenant scope, built once at the edge. Membership is checked by the service."""
+    return TenantContext(org_id=org_id, hotel_id=hotel_id, actor_id=principal.user_id)
+
+
 @router.get("/approvals")
 def list_approvals(
     org_id: UUID,
@@ -143,7 +149,7 @@ def list_approvals(
     status_filter: Annotated[ApprovalStatus | None, Query(alias="status")] = None,
 ) -> ApprovalList:
     with _errors():
-        rows = service.list_for(principal, org_id, hotel_id, status_filter)
+        rows = service.list_for(principal, _tenant(principal, org_id, hotel_id), status_filter)
     return ApprovalList(approvals=[ApprovalOut.of(row) for row in rows])
 
 
@@ -152,7 +158,9 @@ def get_approval(
     org_id: UUID, hotel_id: UUID, approval_id: UUID, principal: PrincipalDep, service: ServiceDep
 ) -> ApprovalOut:
     with _errors():
-        return ApprovalOut.of(service.get_for(principal, org_id, hotel_id, approval_id))
+        return ApprovalOut.of(
+            service.get_for(principal, _tenant(principal, org_id, hotel_id), approval_id)
+        )
 
 
 @router.post("/approvals/{approval_id}/approve")
@@ -165,7 +173,9 @@ def approve(
     service: ServiceDep,
 ) -> ApprovalOut:
     with _errors():
-        decided = service.approve(principal, org_id, hotel_id, approval_id, body.reason)
+        decided = service.approve(
+            principal, _tenant(principal, org_id, hotel_id), approval_id, body.reason
+        )
     return ApprovalOut.of(decided)
 
 
@@ -179,7 +189,9 @@ def reject(
     service: ServiceDep,
 ) -> ApprovalOut:
     with _errors():
-        decided = service.reject(principal, org_id, hotel_id, approval_id, body.reason)
+        decided = service.reject(
+            principal, _tenant(principal, org_id, hotel_id), approval_id, body.reason
+        )
     return ApprovalOut.of(decided)
 
 
@@ -193,5 +205,7 @@ def set_approver_role(
     service: ServiceDep,
 ) -> ApproverRoleOut:
     with _errors():
-        policy = service.set_approver_min_role(principal, org_id, hotel_id, kind, body.min_role)
+        policy = service.set_approver_min_role(
+            principal, _tenant(principal, org_id, hotel_id), kind, body.min_role
+        )
     return ApproverRoleOut(kind=kind, min_role=policy.min_role_for(kind))

@@ -91,8 +91,16 @@ Hotel rules cannot target code kinds. Only platform rules can.
   `approval.rejected`, `approval.expired`, `approval.cancelled`, `approval.consumed` and
   `approval_policy.updated`. The details hold kind, risk, status, run id, call id, payload hash and
   reason. They never hold the raw payload.
+- The store writes the state change and its audit event together or not at all
+  (`ApprovalStore.add/replace` and `PolicyStore.put` take the event). If the audit write fails,
+  the state does not change, so no approval can be used without its audit event.
 - A decision calls `RunResumer.resume(ApprovalResolution)`. A resumer error is logged and does
-  not undo the decision.
+  not undo the decision. The orchestrator recovers the outcome with
+  `ApprovalService.resolution(tenant, approval_id)`, scoped to the requester's run.
+- Staff operations take the caller's `Principal` (role checks) and an explicit `TenantContext`
+  (storage scope). The API builds the `TenantContext` from the path once, at the edge.
+- A policy update reads the stored policy once and writes it with a compare-and-set on
+  `version`. Two concurrent updates never lose a setting; the loser gets 409.
 
 ## HTTP API
 
@@ -120,7 +128,7 @@ The routes fail closed until they are wired:
 
 This SQL is a proposal for review. It is not in `supabase/migrations/`. It depends on the
 PR #5 tenancy schema (`public.orgs`, `public.hotels`, `public.hotel_role`,
-`private.has_hotel_role`). The service writes the audit event in the same transaction as the
+`private.has_hotel_role`). The store writes the audit event in the same transaction as the
 state change.
 
 ```sql

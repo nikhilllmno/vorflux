@@ -11,6 +11,7 @@ from harness.approvals import (
     ActionKind,
     ApprovalResolution,
     ApprovalService,
+    AuditEvent,
     HotelPolicy,
     HotelRole,
     InMemoryApprovalStore,
@@ -53,16 +54,21 @@ class World:
     hotel_a2: UUID = field(default_factory=uuid4)
     hotel_b1: UUID = field(default_factory=uuid4)
     clock: FakeClock = field(default_factory=FakeClock)
-    approvals: InMemoryApprovalStore = field(default_factory=InMemoryApprovalStore)
-    policies: InMemoryPolicyStore = field(default_factory=InMemoryPolicyStore)
+    # Stores default to ones that write to `audit`; a test can pass its own store.
+    approvals: InMemoryApprovalStore = None  # type: ignore[assignment]
+    policies: InMemoryPolicyStore = None  # type: ignore[assignment]
     audit: InMemoryAuditLog = field(default_factory=InMemoryAuditLog)
     resumer: RecordingResumer = field(default_factory=RecordingResumer)
     platform_rules: Sequence[Rule] = ()
 
     def __post_init__(self) -> None:
+        if self.approvals is None:
+            self.approvals = InMemoryApprovalStore(self.audit)
+        if self.policies is None:
+            self.policies = InMemoryPolicyStore(self.audit)
         self.engine = PolicyEngine(self.policies, self.platform_rules)
         self.service = ApprovalService(
-            self.engine, self.approvals, self.policies, self.audit, self.resumer, self.clock
+            self.engine, self.approvals, self.policies, self.resumer, self.clock
         )
         # Requester: an operator of hotel A1 who starts runs.
         self.requester = self.person(Membership(self.org_a, HotelRole.OPERATOR, self.hotel_a1))
@@ -118,8 +124,22 @@ class World:
         )
 
     def set_policy(self, **kwargs: Any) -> HotelPolicy:
+        """Seed the hotel A1 policy. The seed's audit event goes to a scratch log, not `audit`."""
         policy = HotelPolicy(org_id=self.org_a, hotel_id=self.hotel_a1, **kwargs)
-        assert self.policies.put(policy)
+        seed = AuditEvent(
+            org_id=self.org_a,
+            hotel_id=self.hotel_a1,
+            actor_id=None,
+            action="test.seed",
+            subject_type="approval_policy",
+            subject_id=str(self.hotel_a1),
+            at=self.clock.now,
+        )
+        audit, self.policies.audit = self.policies.audit, InMemoryAuditLog()
+        try:
+            assert self.policies.put(policy, seed)
+        finally:
+            self.policies.audit = audit
         return policy
 
     def audit_actions(self) -> list[str]:

@@ -1,8 +1,13 @@
 """Approval service: request, decide, cancel, expire, check, and consume approvals.
 
 It implements `ApprovalPolicy` (the adapter interface) and the staff-facing operations behind the
-API. Every state change writes an audit event, and every exit from `pending` notifies the
-`RunResumer` so that the paused run continues (docs/architecture.md Section 4.1).
+API. Every state change goes to the store together with its audit event (one transaction), and
+every exit from `pending` notifies the `RunResumer` so that the paused run continues
+(docs/architecture.md Section 4.1). If a notification fails, the orchestrator reads the stored
+outcome with `resolution()`.
+
+Staff-facing operations take the caller's `Principal` (for role checks) and an explicit
+`TenantContext` (for storage scope). The context's `actor_id` must be the principal.
 """
 
 import logging
@@ -12,7 +17,7 @@ from datetime import UTC, datetime
 from typing import Protocol
 from uuid import UUID, uuid4
 
-from harness.approvals.audit import AuditEvent, AuditSink
+from harness.approvals.audit import AuditEvent
 from harness.approvals.model import (
     Action,
     ActionKind,
@@ -84,14 +89,12 @@ class ApprovalService:
         engine: PolicyEngine,
         approvals: ApprovalStore,
         policies: PolicyStore,
-        audit: AuditSink,
         resumer: RunResumer | None = None,
         clock: Clock = _utc_now,
     ) -> None:
         self._engine = engine
         self._approvals = approvals
         self._policies = policies
-        self._audit = audit
         self._resumer = resumer
         self._clock = clock
 
@@ -132,8 +135,9 @@ class ApprovalService:
             created_at=now,
             expires_at=now + policy.approval_ttl,
         )
-        self._approvals.add(request)
-        self._record(request, action.requester_id, "approval.requested", now)
+        self._approvals.add(
+            request, _event(request, action.requester_id, "approval.requested", now)
+        )
         return request
 
     def check(self, approval_id: UUID, action: Action) -> ApprovalCheck:
@@ -155,9 +159,9 @@ class ApprovalService:
             if request is None or failure is not None:
                 return ApprovalCheck(False, failure or "approval not found", _status(request))
             used = replace(request, consumed_at=now, version=request.version + 1)
-            if not self._approvals.replace(request, used):
+            event = _event(used, action.requester_id, "approval.consumed", now)
+            if not self._approvals.replace(request, used, event):
                 return ApprovalCheck(False, "approval was already used", request.status)
-            self._record(used, action.requester_id, "approval.consumed", now)
             return ApprovalCheck(True, "approval used", used.status)
         except Exception:
             logger.exception("approval consume failed; treating it as not approved")
@@ -168,20 +172,21 @@ class ApprovalService:
     def list_for(
         self,
         principal: Principal,
-        org_id: UUID,
-        hotel_id: UUID,
+        tenant: TenantContext,
         status: ApprovalStatus | None = None,
     ) -> list[ApprovalRequest]:
-        if not self._can_view_hotel(principal, org_id, hotel_id):
+        _check_actor(principal, tenant)
+        if not self._can_view_hotel(principal, tenant.org_id, tenant.hotel_id):
             raise NotFoundError("hotel not found")
-        self.expire_due(org_id, hotel_id)
-        rows = self._approvals.list(org_id, hotel_id, status=status)
+        self.expire_due(tenant.org_id, tenant.hotel_id)
+        rows = self._approvals.list(tenant.org_id, tenant.hotel_id, status=status)
         return [row for row in rows if self._can_view(principal, row)]
 
     def get_for(
-        self, principal: Principal, org_id: UUID, hotel_id: UUID, approval_id: UUID
+        self, principal: Principal, tenant: TenantContext, approval_id: UUID
     ) -> ApprovalRequest:
-        request = self._approvals.get(org_id, hotel_id, approval_id)
+        _check_actor(principal, tenant)
+        request = self._approvals.get(tenant.org_id, tenant.hotel_id, approval_id)
         if request is None or not self._can_view(principal, request):
             raise NotFoundError("approval not found")
         return self._expire_if_due(request, self._clock())
@@ -189,22 +194,33 @@ class ApprovalService:
     def approve(
         self,
         principal: Principal,
-        org_id: UUID,
-        hotel_id: UUID,
+        tenant: TenantContext,
         approval_id: UUID,
         reason: str | None = None,
     ) -> ApprovalRequest:
-        return self._decide(principal, org_id, hotel_id, approval_id, True, reason)
+        return self._decide(principal, tenant, approval_id, True, reason)
 
     def reject(
         self,
         principal: Principal,
-        org_id: UUID,
-        hotel_id: UUID,
+        tenant: TenantContext,
         approval_id: UUID,
         reason: str | None = None,
     ) -> ApprovalRequest:
-        return self._decide(principal, org_id, hotel_id, approval_id, False, reason)
+        return self._decide(principal, tenant, approval_id, False, reason)
+
+    def resolution(self, tenant: TenantContext, approval_id: UUID) -> ApprovalResolution | None:
+        """The stored outcome for the requester's run, or None while pending or unknown.
+
+        The orchestrator uses this to resume a paused run when a `RunResumer` call failed.
+        """
+        request = self._approvals.get(tenant.org_id, tenant.hotel_id, approval_id)
+        if request is None or request.requester_id != tenant.actor_id:
+            return None
+        request = self._expire_if_due(request, self._clock())
+        if request.status is ApprovalStatus.PENDING:
+            return None
+        return _resolution(request)
 
     def cancel(
         self, tenant: TenantContext, approval_id: UUID, reason: str | None = None
@@ -224,9 +240,9 @@ class ApprovalService:
             reason=_clean_reason(reason),
             version=request.version + 1,
         )
-        if not self._approvals.replace(request, cancelled):
+        event = _event(cancelled, tenant.actor_id, "approval.cancelled", now)
+        if not self._approvals.replace(request, cancelled, event):
             raise ConflictError("approval changed; reload it")
-        self._record(cancelled, tenant.actor_id, "approval.cancelled", now)
         self._notify(cancelled)
         return cancelled
 
@@ -243,12 +259,13 @@ class ApprovalService:
     def set_approver_min_role(
         self,
         principal: Principal,
-        org_id: UUID,
-        hotel_id: UUID,
+        tenant: TenantContext,
         kind: ActionKind,
         min_role: HotelRole,
     ) -> HotelPolicy:
         """A hotel `admin` or `owner` sets which roles may approve one action kind."""
+        _check_actor(principal, tenant)
+        org_id, hotel_id = tenant.org_id, tenant.hotel_id
         roles = principal.hotel_roles(org_id, hotel_id)
         if not roles:
             raise NotFoundError("hotel not found")
@@ -259,27 +276,27 @@ class ApprovalService:
         except ValueError as error:
             raise InvalidPolicyError(str(error)) from None
 
-        current = self._engine.hotel_policy(org_id, hotel_id)
+        # One read: the base settings and the next version come from the same snapshot. With no
+        # stored policy, the write is an insert (version 0) that fails if another admin won.
         stored = self._policies.get(org_id, hotel_id)
+        base = stored if stored is not None else HotelPolicy(org_id=org_id, hotel_id=hotel_id)
         updated = replace(
-            current,
-            approver_min_roles={**current.approver_min_roles, kind: min_role},
-            version=0 if stored is None else current.version + 1,
+            base,
+            approver_min_roles={**base.approver_min_roles, kind: min_role},
+            version=0 if stored is None else stored.version + 1,
         )
-        if not self._policies.put(updated):
+        event = AuditEvent(
+            org_id=org_id,
+            hotel_id=hotel_id,
+            actor_id=principal.user_id,
+            action="approval_policy.updated",
+            subject_type="approval_policy",
+            subject_id=f"{hotel_id}:{kind}",
+            at=self._clock(),
+            details={"kind": str(kind), "min_role": str(min_role)},
+        )
+        if not self._policies.put(updated, event):
             raise ConflictError("policy changed; reload it")
-        self._audit.record(
-            AuditEvent(
-                org_id=org_id,
-                hotel_id=hotel_id,
-                actor_id=principal.user_id,
-                action="approval_policy.updated",
-                subject_type="approval_policy",
-                subject_id=f"{hotel_id}:{kind}",
-                at=self._clock(),
-                details={"kind": str(kind), "min_role": str(min_role)},
-            )
-        )
         return updated
 
     # --- Internals ---------------------------------------------------------------------------
@@ -287,13 +304,13 @@ class ApprovalService:
     def _decide(
         self,
         principal: Principal,
-        org_id: UUID,
-        hotel_id: UUID,
+        tenant: TenantContext,
         approval_id: UUID,
         approve: bool,
         reason: str | None,
     ) -> ApprovalRequest:
-        request = self._approvals.get(org_id, hotel_id, approval_id)
+        _check_actor(principal, tenant)
+        request = self._approvals.get(tenant.org_id, tenant.hotel_id, approval_id)
         if request is None or not self._can_view(principal, request):
             raise NotFoundError("approval not found")
         now = self._clock()
@@ -314,9 +331,9 @@ class ApprovalService:
             reason=_clean_reason(reason),
             version=request.version + 1,
         )
-        if not self._approvals.replace(request, decided):
+        event = _event(decided, principal.user_id, f"approval.{status}", now)
+        if not self._approvals.replace(request, decided, event):
             raise ConflictError("approval changed; reload it")
-        self._record(decided, principal.user_id, f"approval.{status}", now)
         self._notify(decided)
         return decided
 
@@ -344,10 +361,11 @@ class ApprovalService:
         expired = replace(
             request, status=ApprovalStatus.EXPIRED, decided_at=now, version=request.version + 1
         )
-        if not self._approvals.replace(request, expired):
+        if not self._approvals.replace(
+            request, expired, _event(expired, None, "approval.expired", now)
+        ):
             current = self._approvals.get(request.org_id, request.hotel_id, request.id)
             return current or request
-        self._record(expired, None, "approval.expired", now)
         self._notify(expired)
         return expired
 
@@ -375,48 +393,13 @@ class ApprovalService:
     def _is_code_reviewer(principal: Principal) -> bool:
         return TeamRole.CODE_REVIEWER in principal.team_roles
 
-    def _record(
-        self, request: ApprovalRequest, actor_id: UUID | None, action: str, at: datetime
-    ) -> None:
-        details = {
-            "kind": str(request.kind),
-            "risk": str(request.risk),
-            "status": str(request.status),
-            "run_id": request.run_id,
-            "call_id": request.call_id,
-            "payload_hash": request.payload_hash,
-        }
-        if request.reason:
-            details["reason"] = request.reason
-        self._audit.record(
-            AuditEvent(
-                org_id=request.org_id,
-                hotel_id=request.hotel_id,
-                actor_id=actor_id,
-                action=action,
-                subject_type="approval_request",
-                subject_id=str(request.id),
-                at=at,
-                details=details,
-            )
-        )
-
     def _notify(self, request: ApprovalRequest) -> None:
         if self._resumer is None:
             return
-        resolution = ApprovalResolution(
-            approval_id=request.id,
-            org_id=request.org_id,
-            hotel_id=request.hotel_id,
-            run_id=request.run_id,
-            call_id=request.call_id,
-            outcome=request.status,
-            reason=request.reason,
-        )
         try:
-            self._resumer.resume(resolution)
+            self._resumer.resume(_resolution(request))
         except Exception:
-            # The decision is stored; the orchestrator can resume from the stored state.
+            # The decision is stored; the orchestrator recovers it with `resolution()`.
             logger.exception("run resume failed for approval %s", request.id)
 
 
@@ -435,3 +418,45 @@ def _clean_reason(reason: str | None) -> str | None:
     if len(reason) > MAX_REASON_LENGTH:
         raise ValueError(f"reason must have at most {MAX_REASON_LENGTH} characters")
     return reason
+
+
+def _check_actor(principal: Principal, tenant: TenantContext) -> None:
+    if tenant.actor_id != principal.user_id:
+        raise ValueError("tenant.actor_id must be the principal's user id")
+
+
+def _resolution(request: ApprovalRequest) -> ApprovalResolution:
+    return ApprovalResolution(
+        approval_id=request.id,
+        org_id=request.org_id,
+        hotel_id=request.hotel_id,
+        run_id=request.run_id,
+        call_id=request.call_id,
+        outcome=request.status,
+        reason=request.reason,
+    )
+
+
+def _event(
+    request: ApprovalRequest, actor_id: UUID | None, action: str, at: datetime
+) -> AuditEvent:
+    details = {
+        "kind": str(request.kind),
+        "risk": str(request.risk),
+        "status": str(request.status),
+        "run_id": request.run_id,
+        "call_id": request.call_id,
+        "payload_hash": request.payload_hash,
+    }
+    if request.reason:
+        details["reason"] = request.reason
+    return AuditEvent(
+        org_id=request.org_id,
+        hotel_id=request.hotel_id,
+        actor_id=actor_id,
+        action=action,
+        subject_type="approval_request",
+        subject_id=str(request.id),
+        at=at,
+        details=details,
+    )
