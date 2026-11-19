@@ -323,6 +323,16 @@ async def test_values_that_only_the_agent_reports_are_marked_as_not_checked() ->
     }
 
 
+def test_a_code_change_description_is_marked_as_not_checked() -> None:
+    # The description is agent prose. The branch and the files are what the approval binds.
+    kind = ActionKind.CODE_CHANGE
+    preview = render_preview(kind, DEFAULT_ARGS[kind], preview_context(kind))
+
+    checked = {f.label: f.verified for f in preview.fields}
+    assert checked == {"Branch": True, "Files": True, "Description": False, "Tool": True}
+    assert "Description (agent reported, not checked):" in preview.text()
+
+
 async def test_agent_reported_fields_are_left_out_when_the_agent_gives_none() -> None:
     world = World()
     args = {"target_id": "room-type:dk", "setting": "rate", "new": 9900}

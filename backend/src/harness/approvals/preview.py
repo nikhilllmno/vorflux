@@ -255,7 +255,7 @@ class CodeChange(Proposal):
             (
                 PreviewField("Branch", self.branch),
                 PreviewField("Files", ", ".join(self.paths)),
-                PreviewField("Description", self.description),
+                _reported("Description", self.description),
                 context.tool_field(),
             ),
         )

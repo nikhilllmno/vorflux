@@ -101,7 +101,8 @@ never the main content, and the card says which values the harness did not check
   - A date must be an ISO date (`2026-12-24`); the card shows it as "24 Dec 2026".
 - Values that only the agent reports are marked `verified: false`, and the card labels them
   "(agent reported, not checked)": the old value and the guests affected of a PMS change, and the
-  record count and guests affected of a delete. They are left out when the agent gives none.
+  record count and guests affected of a delete, and the description of a code change. Optional
+  values are left out when the agent gives none.
   `TODO(DEX-19)`: read the old value from the PMS and mark it checked.
 - Some values are `sensitive`: message recipients, subject and body, the changes of an external
   write, and every argument of a read. Only a principal who can decide the request sees them
