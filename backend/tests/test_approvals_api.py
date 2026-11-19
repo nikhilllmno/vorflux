@@ -1,13 +1,15 @@
 """HTTP contract of the approval inbox: fail closed, 404 across tenants, and role checks."""
 
+import asyncio
 from collections.abc import Iterator
+from typing import Any
 from uuid import uuid4
 
 import pytest
 from approval_world import World
 from fastapi.testclient import TestClient
 
-from harness.approvals import ActionKind, ApprovalRequest, ApprovalStatus, Principal
+from harness.approvals import ActionKind, ApprovalRequest, ApprovalStatus, Principal, RiskLevel
 from harness.approvals.api import get_principal
 from harness.config import Settings
 from harness.main import create_app
@@ -38,10 +40,9 @@ def api(world: World) -> Iterator[Api]:
     yield Api(world)
 
 
-def _pending(world: World, **kwargs: object) -> ApprovalRequest:
-    return world.service.request_approval(
-        world.action(**kwargs), call_id="call-1", summary="Change Deluxe King rate"
-    )
+def _pending(world: World, **kwargs: Any) -> ApprovalRequest:
+    call = world.call(**kwargs)
+    return asyncio.run(world.service.request(call, note="Christmas demand is high"))
 
 
 def test_routes_fail_closed_without_auth(world: World) -> None:
@@ -69,7 +70,16 @@ def test_list_and_get_show_the_card_without_the_raw_payload(api: Api, world: Wor
     one = api.client.get(f"{api.base()}/approvals/{request.id}").json()
 
     assert [card["id"] for card in listed] == [str(request.id)]
-    assert one["summary"] == "Change Deluxe King rate"
+    assert one["preview"] == {
+        "title": "Change rate of Deluxe King, 24 Dec 2026 in Beds24",
+        "fields": [
+            {"label": "From", "value": "9000"},
+            {"label": "To", "value": "9900"},
+            {"label": "Guests affected", "value": "0"},
+        ],
+    }
+    assert one["note"] == "Christmas demand is high"
+    assert one["tool_call_id"] == "call-1"
     assert one["status"] == "pending"
     assert one["approver_roles"] == ["admin", "operator", "owner"]
     assert one["used"] is False
@@ -123,7 +133,7 @@ def test_viewer_gets_403(api: Api, world: World) -> None:
 
 
 def test_hotel_owner_gets_403_for_code(api: Api, world: World) -> None:
-    request = _pending(world, kind=ActionKind.CODE_CHANGE, toolset="coding", tool="git")
+    request = _pending(world, kind=ActionKind.CODE_CHANGE)
     api.as_user(world.owner)
 
     response = api.client.post(f"{api.base()}/approvals/{request.id}/approve", json={})
@@ -195,3 +205,13 @@ def test_approver_role_setting_is_checked(
     response = api.client.put(f"{api.base()}/approval-policy/approvers/{kind}", json=body)
 
     assert response.status_code == code
+
+
+def test_a_run_principal_gets_403_on_its_own_request(api: Api, world: World) -> None:
+    request = _pending(world, risk=RiskLevel.HIGH)
+    api.as_user(world.run)
+
+    approve = api.client.post(f"{api.base()}/approvals/{request.id}/approve", json={})
+    reject = api.client.post(f"{api.base()}/approvals/{request.id}/reject", json={})
+
+    assert (approve.status_code, reject.status_code) == (403, 403)

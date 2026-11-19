@@ -1,27 +1,32 @@
-"""Policy evaluation contract: allow, require approval with approver roles, or deny; fail closed."""
+"""Policy contract: per-toolset and per-hotel allow/ask/deny, no yolo, the tool registry, typed
+previews, and deny by default (docs/approvals.md, "Evaluation order")."""
 
 from datetime import timedelta
 from typing import Any
 from uuid import uuid4
 
 import pytest
-from approval_world import World
+from approval_world import DEFAULT_ARGS, World, tool_name
 
 from harness.approvals import (
     ActionKind,
-    Allow,
-    Deny,
+    Decision,
     Effect,
     HotelPolicy,
     HotelRole,
     InMemoryPolicyStore,
-    PolicyEngine,
-    RequireApproval,
+    ProposedCall,
     RiskLevel,
     Rule,
     TeamRole,
-    payload_hash,
+    ToolCatalog,
+    ToolSpec,
+    Verdict,
+    proposal_hash,
+    render_preview,
 )
+
+pytestmark = pytest.mark.anyio
 
 HOTEL_OPERATIONS = [
     ActionKind.MESSAGE_SEND,
@@ -30,200 +35,364 @@ HOTEL_OPERATIONS = [
     ActionKind.DELETE,
 ]
 CODE_KINDS = [ActionKind.GIT_PUSH, ActionKind.CODE_CHANGE]
-OPERATOR_AND_UP = frozenset({HotelRole.OPERATOR, HotelRole.ADMIN, HotelRole.OWNER})
+HOTEL_ROLES_FROM_OPERATOR = frozenset({HotelRole.OPERATOR, HotelRole.ADMIN, HotelRole.OWNER})
 
 
-def test_read_only_action_is_allowed_without_approval() -> None:
+async def _evaluate(world: World, call: ProposedCall | None = None) -> Decision:
+    return await world.service.evaluate(call or world.call())
+
+
+async def test_read_only_action_is_allowed_without_approval() -> None:
     world = World()
 
-    decision = world.engine.evaluate(world.action(ActionKind.READ, RiskLevel.LOW))
+    decision = await _evaluate(world, world.call(ActionKind.READ, RiskLevel.LOW))
 
-    assert isinstance(decision, Allow)
+    assert decision.verdict == Verdict.ALLOW
+    assert decision.tool_call_id == "call-1"
 
 
 @pytest.mark.parametrize("kind", HOTEL_OPERATIONS)
-def test_hotel_operation_requires_operator_or_higher_by_default(kind: ActionKind) -> None:
+async def test_hotel_operation_requires_operator_or_higher_by_default(kind: ActionKind) -> None:
     world = World()
 
-    decision = world.engine.evaluate(world.action(kind))
+    decision = await _evaluate(world, world.call(kind, RiskLevel.LOW))
 
-    assert isinstance(decision, RequireApproval)
-    assert decision.approver_roles == OPERATOR_AND_UP
+    assert decision.verdict == Verdict.ASK
+    assert decision.approver_roles == HOTEL_ROLES_FROM_OPERATOR
 
 
 @pytest.mark.parametrize("kind", CODE_KINDS)
-def test_code_action_requires_a_code_reviewer_and_no_hotel_role(kind: ActionKind) -> None:
+async def test_code_action_requires_a_code_reviewer_and_no_hotel_role(kind: ActionKind) -> None:
     world = World()
 
-    decision = world.engine.evaluate(world.action(kind, toolset="coding", tool="git"))
+    decision = await _evaluate(world, world.call(kind))
 
-    assert isinstance(decision, RequireApproval)
+    assert decision.verdict == Verdict.ASK
     assert decision.approver_roles == frozenset({TeamRole.CODE_REVIEWER})
 
 
-def test_hotel_admin_setting_narrows_the_approver_roles() -> None:
+async def test_hotel_admin_setting_narrows_the_approver_roles() -> None:
     world = World()
-    world.set_policy(approver_min_roles={ActionKind.PMS_CHANGE: HotelRole.ADMIN})
+    await world.set_policy(approver_min_roles={ActionKind.PMS_CHANGE: HotelRole.ADMIN})
 
-    decision = world.engine.evaluate(world.action(ActionKind.PMS_CHANGE))
+    decision = await _evaluate(world)
 
-    assert isinstance(decision, RequireApproval)
     assert decision.approver_roles == frozenset({HotelRole.ADMIN, HotelRole.OWNER})
 
 
-def test_platform_rule_denies_a_kind_in_one_toolset_only() -> None:
-    world = World(platform_rules=[Rule(ActionKind.DELETE, Effect.DENY, toolset="connector-safe")])
+async def test_platform_rule_denies_a_kind_in_one_toolset_only() -> None:
+    world = World(platform_rules=[Rule(ActionKind.MESSAGE_SEND, Effect.DENY, toolset="reports")])
 
-    denied = world.engine.evaluate(world.action(ActionKind.DELETE, toolset="connector-safe"))
-    elsewhere = world.engine.evaluate(world.action(ActionKind.DELETE, toolset="ops"))
+    in_reports = await _evaluate(world, world.call(ActionKind.MESSAGE_SEND, toolset="reports"))
+    in_ops = await _evaluate(world, world.call(ActionKind.MESSAGE_SEND, toolset="ops"))
 
-    assert isinstance(denied, Deny)
-    assert isinstance(elsewhere, RequireApproval)
+    assert in_reports.verdict == Verdict.DENY
+    assert in_ops.verdict == Verdict.ASK
 
 
-def test_hotel_rule_can_deny_and_the_strictest_matching_rule_wins() -> None:
+async def test_hotel_rule_can_deny_and_the_strictest_matching_rule_wins() -> None:
     world = World(platform_rules=[Rule(ActionKind.READ, Effect.ALLOW)])
-    world.set_policy(rules=(Rule(ActionKind.READ, Effect.DENY, toolset="ops"),))
+    await world.set_policy(rules=(Rule(ActionKind.READ, Effect.DENY, toolset="reports"),))
 
-    assert isinstance(world.engine.evaluate(world.action(ActionKind.READ, toolset="ops")), Deny)
-    assert isinstance(world.engine.evaluate(world.action(ActionKind.READ, toolset="coding")), Allow)
+    denied = await _evaluate(world, world.call(ActionKind.READ, toolset="reports"))
+    allowed = await _evaluate(world, world.call(ActionKind.READ, toolset="ops"))
+
+    assert denied.verdict == Verdict.DENY
+    assert allowed.verdict == Verdict.ALLOW
 
 
-def test_hotel_rules_are_per_hotel() -> None:
+async def test_hotel_rules_are_per_hotel() -> None:
     world = World()
-    world.set_policy(rules=(Rule(ActionKind.MESSAGE_SEND, Effect.DENY),))
-    other_hotel = world.tenant(hotel_id=world.hotel_a2)
+    await world.set_policy(rules=(Rule(ActionKind.READ, Effect.DENY),))
+    other_hotel = world.tenant(world.org_a, world.hotel_a2)
 
-    here = world.engine.evaluate(world.action(ActionKind.MESSAGE_SEND))
-    there = world.engine.evaluate(world.action(ActionKind.MESSAGE_SEND, tenant=other_hotel))
+    here = await _evaluate(world, world.call(ActionKind.READ))
+    there = await _evaluate(world, world.call(ActionKind.READ, tenant=other_hotel))
 
-    assert isinstance(here, Deny)
-    assert isinstance(there, RequireApproval)
+    assert here.verdict == Verdict.DENY
+    assert there.verdict == Verdict.ALLOW
 
 
-def test_platform_allow_rule_allows_a_low_risk_code_push() -> None:
-    world = World(platform_rules=[Rule(ActionKind.GIT_PUSH, Effect.ALLOW, toolset="coding")])
+async def test_read_can_be_made_to_ask_and_its_preview_lists_every_argument() -> None:
+    world = World()
+    await world.set_policy(rules=(Rule(ActionKind.READ, Effect.ASK),))
 
-    decision = world.engine.evaluate(
-        world.action(ActionKind.GIT_PUSH, RiskLevel.LOW, toolset="coding", tool="git")
-    )
+    _, request = await world.request(world.call(ActionKind.READ))
 
-    assert isinstance(decision, Allow)
+    assert request.approver_roles == HOTEL_ROLES_FROM_OPERATOR
+    assert request.preview.text() == "Read data\ndate: 2026-12-24\nreport: occupancy"
+
+
+# --- No yolo -----------------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize("kind", HOTEL_OPERATIONS)
-def test_no_yolo_an_allow_rule_never_skips_approval_of_a_hotel_operation(kind: ActionKind) -> None:
+async def test_no_yolo_an_allow_rule_never_skips_approval_of_a_hotel_operation(
+    kind: ActionKind,
+) -> None:
     world = World(platform_rules=[Rule(kind, Effect.ALLOW)])
-    world.set_policy(rules=(Rule(kind, Effect.ALLOW),))
+    await world.set_policy(rules=(Rule(kind, Effect.ALLOW),))
 
-    decision = world.engine.evaluate(world.action(kind, RiskLevel.LOW))
+    decision = await _evaluate(world, world.call(kind, RiskLevel.LOW))
 
-    assert isinstance(decision, RequireApproval)
+    assert decision.verdict == Verdict.ASK
 
 
-def test_no_yolo_an_allow_rule_never_skips_approval_of_a_high_risk_action() -> None:
-    world = World(platform_rules=[Rule(ActionKind.GIT_PUSH, Effect.ALLOW)])
+@pytest.mark.parametrize("kind", CODE_KINDS)
+async def test_no_yolo_a_platform_allow_rule_never_skips_approval_of_code(
+    kind: ActionKind,
+) -> None:
+    # Decision to confirm: code kinds always ask, even under a platform allow rule.
+    world = World(platform_rules=[Rule(kind, Effect.ALLOW)])
 
-    decision = world.engine.evaluate(
-        world.action(ActionKind.GIT_PUSH, RiskLevel.HIGH, toolset="coding", tool="git")
-    )
+    decision = await _evaluate(world, world.call(kind, RiskLevel.LOW))
 
-    assert isinstance(decision, RequireApproval)
+    assert decision.verdict == Verdict.ASK
     assert decision.approver_roles == frozenset({TeamRole.CODE_REVIEWER})
 
 
-# --- Deny by default -------------------------------------------------------------------------
+async def test_no_yolo_an_allow_rule_never_skips_approval_of_a_high_risk_action() -> None:
+    world = World(platform_rules=[Rule(ActionKind.READ, Effect.ALLOW)])
+
+    decision = await _evaluate(world, world.call(ActionKind.READ, RiskLevel.HIGH))
+
+    assert decision.verdict == Verdict.ASK
+
+
+# --- The tool registry -------------------------------------------------------------------------
+
+
+async def test_unregistered_tool_is_denied() -> None:
+    world = World()
+
+    decision = await _evaluate(world, world.call(toolset="totally_new", tool="mystery_tool"))
+
+    assert decision.verdict == Verdict.DENY
+    assert decision.reason == "tool totally_new/mystery_tool is not registered"
+    assert world.audit_actions() == ["policy.denied"]
+
+
+async def test_registered_tool_in_another_toolset_is_denied() -> None:
+    world = World(catalog=ToolCatalog([ToolSpec("ops", "read_low", "read", "low")]))
+
+    allowed = await _evaluate(world, world.call(toolset="ops", tool="read_low"))
+    elsewhere = await _evaluate(world, world.call(toolset="reports", tool="read_low"))
+
+    assert allowed.verdict == Verdict.ALLOW
+    assert elsewhere.verdict == Verdict.DENY
+
+
+async def test_the_registry_sets_kind_and_risk_not_the_caller() -> None:
+    # The tool's name says "read" but the registry says it changes the PMS at high risk.
+    catalog = ToolCatalog([ToolSpec("ops", "read_rates", ActionKind.PMS_CHANGE, RiskLevel.HIGH)])
+    world = World(catalog=catalog)
+
+    _, request = await world.request(world.call(toolset="ops", tool="read_rates"))
+
+    assert (request.kind, request.risk) == (ActionKind.PMS_CHANGE, RiskLevel.HIGH)
+
+
+def test_registry_refuses_a_duplicate_or_an_unknown_kind_or_risk() -> None:
+    spec = ToolSpec("ops", "t", ActionKind.READ, RiskLevel.LOW)
+    with pytest.raises(ValueError, match="twice"):
+        ToolCatalog([spec, spec])
+    with pytest.raises(ValueError):
+        ToolSpec("ops", "t", "wire_transfer", RiskLevel.LOW)  # type: ignore[arg-type]
+    with pytest.raises(ValueError):
+        ToolSpec("ops", "t", ActionKind.READ, "extreme")  # type: ignore[arg-type]
+
+
+# --- Typed previews ----------------------------------------------------------------------------
+
+
+def test_pms_change_preview_is_rendered_from_the_arguments() -> None:
+    preview = render_preview(ActionKind.PMS_CHANGE, DEFAULT_ARGS[ActionKind.PMS_CHANGE])
+
+    assert preview.text() == (
+        "Change rate of Deluxe King, 24 Dec 2026 in Beds24\n"
+        "From: 9000\nTo: 9900\nGuests affected: 0"
+    )
+
+
+@pytest.mark.parametrize("kind", [*HOTEL_OPERATIONS, *CODE_KINDS])
+def test_every_kind_that_can_ask_has_a_typed_preview(kind: ActionKind) -> None:
+    preview = render_preview(kind, DEFAULT_ARGS[kind])
+
+    assert preview.title
+    assert preview.fields
 
 
 @pytest.mark.parametrize(
-    ("overrides", "reason"),
+    ("change", "why"),
     [
-        ({"kind": "wire_transfer"}, "unknown action kind"),
-        ({"risk": "extreme"}, "unknown risk level"),
-        ({"payload": {"when": object()}}, "not plain JSON"),
-        ({"payload": {"rate": float("nan")}}, "not plain JSON"),
-        ({"toolset": ""}, "needs a toolset"),
-        ({"run_id": ""}, "needs a toolset"),
+        ({"note_to_self": "x"}, "unknown field"),
+        ({"guests_affected": "3"}, "a string is not coerced to a number"),
+        ({"guests_affected": -1}, "negative count"),
+        ({"setting": ""}, "empty text"),
     ],
 )
-def test_bad_or_unknown_input_is_denied(overrides: dict[str, Any], reason: str) -> None:
+async def test_arguments_that_do_not_fit_the_kind_are_denied(
+    change: dict[str, Any], why: str
+) -> None:
+    world = World()
+    args = {**DEFAULT_ARGS[ActionKind.PMS_CHANGE], **change}
+
+    decision = await _evaluate(world, world.call(args=args))
+
+    assert decision.verdict == Verdict.DENY, why
+    assert decision.reason == "arguments do not match the pms_change proposal"
+
+
+# --- Deny by default ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [{"run_id": ""}, {"tool_call_id": ""}, {"toolset": ""}, {"tool": ""}],
+)
+async def test_missing_identifiers_are_denied(overrides: dict[str, str]) -> None:
+    world = World()
+    fields: dict[str, Any] = {
+        "tenant": world.tenant(),
+        "run_id": "run-1",
+        "tool_call_id": "call-1",
+        "toolset": "ops",
+        "tool": tool_name(ActionKind.READ, RiskLevel.LOW),
+        **overrides,
+    }
+
+    decision = await _evaluate(world, ProposedCall(**fields))
+
+    assert decision.verdict == Verdict.DENY
+
+
+async def test_call_without_tenant_context_is_denied() -> None:
+    world = World()
+    call = ProposedCall(
+        tenant=None,  # type: ignore[arg-type]
+        run_id="run-1",
+        tool_call_id="call-1",
+        toolset="ops",
+        tool=tool_name(ActionKind.READ, RiskLevel.LOW),
+    )
+
+    decision = await _evaluate(world, call)
+
+    assert decision.verdict == Verdict.DENY
+    assert decision.reason == "tool call has no tenant context"
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        {"when": object()},
+        {"rate": float("nan")},
+        {1: "a"},
+        {"nested": {2: "b"}},
+        {"tags": {"a", "b"}},
+    ],
+)
+def test_arguments_that_are_not_plain_json_cannot_build_a_call(args: Any) -> None:
     world = World()
 
-    decision = world.engine.evaluate(world.action(**overrides))
-
-    assert isinstance(decision, Deny)
-    assert reason in decision.reason
+    with pytest.raises((TypeError, ValueError)):
+        world.call(args=args)
 
 
-def test_known_kind_given_as_plain_string_is_still_evaluated() -> None:
-    world = World()
-
-    decision = world.engine.evaluate(world.action("pms_change", "medium"))
-
-    assert isinstance(decision, RequireApproval)
-
-
-def test_action_without_tenant_context_is_denied() -> None:
-    world = World()
-    action = world.action()
-    object.__setattr__(action, "tenant", {"org_id": str(world.org_a)})
-
-    assert isinstance(world.engine.evaluate(action), Deny)
-
-
-def test_policy_store_error_becomes_deny_not_allow() -> None:
+async def test_policy_store_error_becomes_deny_not_allow() -> None:
     class BrokenStore(InMemoryPolicyStore):
-        def get(self, org_id: Any, hotel_id: Any) -> HotelPolicy | None:
+        async def get(self, org_id: Any, hotel_id: Any) -> HotelPolicy | None:
             raise RuntimeError("database is down")
 
-    world = World()
-    engine = PolicyEngine(BrokenStore())
+    world = World(policies=BrokenStore())
 
     for kind in ActionKind:
-        decision = engine.evaluate(world.action(kind, RiskLevel.LOW))
-        assert isinstance(decision, Deny), kind
+        decision = await _evaluate(world, world.call(kind, RiskLevel.LOW))
+        assert decision.verdict == Verdict.DENY
         assert decision.reason == "policy evaluation failed"
 
 
-# --- Hotel policy settings -----------------------------------------------------------------
+# --- Values loaded as plain strings (a database row) -------------------------------------------
+
+
+async def test_a_stored_deny_rule_given_as_strings_stays_deny() -> None:
+    world = World()
+    await world.set_policy(rules=({"kind": "message_send", "effect": "deny"},))
+
+    decision = await _evaluate(world, world.call(ActionKind.MESSAGE_SEND))
+
+    assert decision.verdict == Verdict.DENY
+
+
+async def test_a_stored_read_deny_rule_given_as_strings_applies() -> None:
+    world = World()
+    await world.set_policy(rules=(Rule("read", "deny"),))  # type: ignore[arg-type]
+
+    decision = await _evaluate(world, world.call(ActionKind.READ, RiskLevel.LOW))
+
+    assert decision.verdict == Verdict.DENY
+
+
+async def test_stored_min_roles_given_as_strings_apply() -> None:
+    world = World()
+    await world.set_policy(approver_min_roles={"pms_change": "owner"})
+
+    decision = await _evaluate(world)
+
+    assert decision.approver_roles == frozenset({HotelRole.OWNER})
 
 
 @pytest.mark.parametrize(
-    ("kwargs", "message"),
+    "rule",
+    [{"kind": "message_send", "effect": "maybe"}, {"kind": "wire_transfer", "effect": "deny"}],
+)
+def test_a_stored_rule_with_an_unknown_value_cannot_load(rule: dict[str, str]) -> None:
+    # The store cannot build the policy, so `evaluate` gets an error and denies.
+    with pytest.raises(ValueError):
+        HotelPolicy(org_id=uuid4(), hotel_id=uuid4(), rules=(rule,))  # type: ignore[arg-type]
+
+
+# --- Policy validation and the proposal hash ---------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "settings",
     [
-        ({"approver_min_roles": {ActionKind.PMS_CHANGE: HotelRole.VIEWER}}, "viewers"),
-        ({"approver_min_roles": {ActionKind.GIT_PUSH: HotelRole.OWNER}}, "never approve code"),
-        ({"approver_min_roles": {ActionKind.READ: HotelRole.ADMIN}}, "need no approval"),
-        ({"rules": (Rule(ActionKind.CODE_CHANGE, Effect.ALLOW),)}, "code actions"),
-        ({"approval_ttl": timedelta(seconds=10)}, "approval_ttl"),
-        ({"approval_ttl": timedelta(days=30)}, "approval_ttl"),
+        {"approver_min_roles": {ActionKind.PMS_CHANGE: HotelRole.VIEWER}},
+        {"approver_min_roles": {ActionKind.GIT_PUSH: HotelRole.OWNER}},
+        {"approver_min_roles": {ActionKind.READ: HotelRole.OWNER}},
+        {"rules": (Rule(ActionKind.CODE_CHANGE, Effect.ALLOW),)},
+        {"approval_ttl": timedelta(seconds=10)},
+        {"approval_ttl": timedelta(days=30)},
+        {"use_window": timedelta(seconds=10)},
+        {"use_window": timedelta(days=2)},
     ],
 )
-def test_hotel_policy_rejects_settings_the_design_forbids(
-    kwargs: dict[str, Any], message: str
-) -> None:
-    with pytest.raises(ValueError, match=message):
-        HotelPolicy(org_id=uuid4(), hotel_id=uuid4(), **kwargs)
+def test_hotel_policy_rejects_settings_the_design_forbids(settings: dict[str, Any]) -> None:
+    with pytest.raises(ValueError):
+        HotelPolicy(org_id=uuid4(), hotel_id=uuid4(), **settings)
 
 
-# --- Payload hash ------------------------------------------------------------------------------
+def test_hotel_policy_defaults_are_the_safe_ones() -> None:
+    policy = HotelPolicy(org_id=uuid4(), hotel_id=uuid4())
+
+    assert policy.forbid_self_approval_of_high_risk is True
+    assert policy.use_window == timedelta(minutes=15)
 
 
-def test_payload_hash_ignores_key_order_but_binds_every_field_of_the_proposal() -> None:
+def test_proposal_hash_ignores_key_order_but_binds_args_and_preview() -> None:
     world = World()
-    base = world.action(payload={"a": 1, "b": [1, 2]})
+    args = DEFAULT_ARGS[ActionKind.PMS_CHANGE]
+    call = world.call(args=args)
+    reordered = world.call(args=dict(reversed(list(args.items()))))
+    preview = render_preview(ActionKind.PMS_CHANGE, args)
+    kind, risk = ActionKind.PMS_CHANGE, RiskLevel.MEDIUM
+    base = proposal_hash(call, kind, risk, preview)
 
-    same = world.action(payload={"b": [1, 2], "a": 1})
-    variants = [
-        world.action(payload={"a": 2, "b": [1, 2]}),
-        world.action(payload={"a": 1.0, "b": [1, 2]}),
-        world.action(ActionKind.EXTERNAL_WRITE, payload={"a": 1, "b": [1, 2]}),
-        world.action(risk=RiskLevel.LOW, payload={"a": 1, "b": [1, 2]}),
-        world.action(tool="pms_other", payload={"a": 1, "b": [1, 2]}),
-        world.action(toolset="coding", payload={"a": 1, "b": [1, 2]}),
-        world.action(tenant=world.tenant(hotel_id=world.hotel_a2), payload={"a": 1, "b": [1, 2]}),
-    ]
-
-    assert payload_hash(base) == payload_hash(same)
-    assert payload_hash(base).startswith("sha256:")
-    assert len({payload_hash(base), *(payload_hash(v) for v in variants)}) == len(variants) + 1
+    assert proposal_hash(reordered, kind, risk, preview) == base
+    assert proposal_hash(world.call(args={**args, "new": 99}), kind, risk, preview) != base
+    assert proposal_hash(call, kind, RiskLevel.HIGH, preview) != base
+    other_preview = render_preview(ActionKind.PMS_CHANGE, {**args, "new": 99})
+    assert proposal_hash(call, kind, risk, other_preview) != base
+    other_hotel = world.call(args=args, tenant=world.tenant(world.org_a, world.hotel_a2))
+    assert proposal_hash(other_hotel, kind, risk, preview) != base

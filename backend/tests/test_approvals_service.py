@@ -1,751 +1,544 @@
-"""Approval lifecycle contract: request, decide, resume, expire, bind to the payload, use once."""
+"""Approval lifecycle contract: request, decide, resume, expire, bind to the exact proposal, use
+once at the time of the write, and audit every outcome."""
 
+import asyncio
+import inspect
 from dataclasses import replace
 from datetime import timedelta
 from typing import Any
 from uuid import UUID, uuid4
 
 import pytest
-from approval_world import World
+from approval_world import DEFAULT_ARGS, World
 
 from harness.approvals import (
-    Action,
     ActionDeniedError,
     ActionKind,
+    ActorType,
     ApprovalNotRequiredError,
     ApprovalPolicy,
     ApprovalRequest,
     ApprovalResolution,
     ApprovalStatus,
-    AuditEvent,
     ConflictError,
     Effect,
-    ForbiddenError,
-    HotelPolicy,
-    HotelRole,
     InMemoryApprovalStore,
-    InMemoryAuditLog,
-    InMemoryPolicyStore,
-    InvalidPolicyError,
-    NotFoundError,
-    Principal,
+    ProposedCall,
     RiskLevel,
     Rule,
+    Verdict,
 )
 
+pytestmark = pytest.mark.anyio
 
-def _request(world: World, action: Action | None = None) -> tuple[Action, ApprovalRequest]:
-    action = action or world.action()
-    request = world.service.request_approval(
-        action, call_id="call-1", summary="Change Deluxe King on 24 Dec from 9000 to 9900"
-    )
-    return action, request
+PMS_ARGS = DEFAULT_ARGS[ActionKind.PMS_CHANGE]
 
 
-def _approve(world: World, request: ApprovalRequest, who: Principal) -> ApprovalRequest:
-    return world.service.approve(
-        who, world.tenant(request.org_id, request.hotel_id, who), request.id
-    )
-
-
-def test_service_satisfies_the_adapter_interface() -> None:
+def test_service_satisfies_the_async_adapter_interface() -> None:
     assert isinstance(World().service, ApprovalPolicy)
+    for name in ("evaluate", "request", "check", "consume"):
+        assert inspect.iscoroutinefunction(getattr(ApprovalPolicy, name)), name
 
 
-def test_request_creates_a_pending_approval_with_an_expiry_and_an_audit_event() -> None:
+async def test_request_creates_a_pending_approval_with_a_harness_preview() -> None:
     world = World()
 
-    action, request = _request(world)
+    call, request = await world.request(note="Guests asked for a higher rate on Christmas")
 
-    assert request.status is ApprovalStatus.PENDING
+    assert request.status == ApprovalStatus.PENDING
     assert request.expires_at == world.clock.now + timedelta(hours=24)
     assert request.requester_id == world.requester.user_id
     assert (request.org_id, request.hotel_id) == (world.org_a, world.hotel_a1)
+    assert (request.run_id, request.tool_call_id) == ("run-1", "call-1")
+    assert request.preview.text() == (
+        "Change rate of Deluxe King, 24 Dec 2026 in Beds24\n"
+        "From: 9000\nTo: 9900\nGuests affected: 0"
+    )
+    assert request.note == "Guests asked for a higher rate on Christmas"
     assert world.audit_actions() == ["approval.requested"]
-    assert world.service.check(request.id, action).ok is False  # not approved yet
+    assert world.audit.events[0].actor_type == ActorType.RUN
+    assert (await world.service.check(request.id, call)).ok is False  # not approved yet
 
 
-def test_request_uses_the_hotel_ttl() -> None:
+async def test_the_preview_shows_the_bound_value_not_the_agent_text() -> None:
+    # Review probe: the agent says 9,900 but the arguments say 99. The approver sees 99.
     world = World()
-    world.set_policy(approval_ttl=timedelta(minutes=30))
+    call = world.call(args={**PMS_ARGS, "new": 99})
 
-    _, request = _request(world)
+    _, request = await world.request(call, note="Change DK rate to 9,900")
+
+    assert "To: 99\n" in request.preview.text()
+    assert "9,900" not in request.preview.text()
+
+
+async def test_request_uses_the_hotel_ttl() -> None:
+    world = World()
+    await world.set_policy(approval_ttl=timedelta(minutes=30))
+
+    _, request = await world.request()
 
     assert request.expires_at - request.created_at == timedelta(minutes=30)
 
 
-def test_request_refuses_denied_and_allowed_actions() -> None:
+async def test_request_refuses_denied_and_allowed_actions() -> None:
     world = World(platform_rules=[Rule(ActionKind.DELETE, Effect.DENY)])
 
     with pytest.raises(ActionDeniedError):
-        _request(world, world.action(ActionKind.DELETE))
-    with pytest.raises(ActionDeniedError):
-        _request(world, world.action("unknown_kind"))
+        await world.service.request(world.call(ActionKind.DELETE))
     with pytest.raises(ApprovalNotRequiredError):
-        _request(world, world.action(ActionKind.READ, RiskLevel.LOW))
-    assert world.audit_actions() == []
+        await world.service.request(world.call(ActionKind.READ, RiskLevel.LOW))
+    with pytest.raises(ActionDeniedError):
+        await world.service.request(world.call(toolset="nope", tool="nope"))
+    assert world.audit_actions() == ["policy.denied", "policy.denied"]
 
 
-# --- Approve, reject, and resume ---------------------------------------------------------------
+# --- One approval per tool call ----------------------------------------------------------------
 
 
-def test_approve_resumes_the_run_and_the_approval_can_be_used_once() -> None:
+async def test_a_second_request_for_the_same_tool_call_returns_the_same_approval() -> None:
     world = World()
-    action, request = _request(world)
+    call, first = await world.request()
 
-    approved = _approve(world, request, world.operator)
+    _, second = await world.request(call)
 
-    assert approved.status is ApprovalStatus.APPROVED
+    assert second.id == first.id
+    assert world.audit_actions() == ["approval.requested"]
+
+
+async def test_a_tool_call_cannot_get_a_second_approval_for_other_arguments() -> None:
+    world = World()
+    await world.request()
+
+    with pytest.raises(ConflictError, match="different proposal"):
+        await world.request(world.call(args={**PMS_ARGS, "new": 1}))
+
+
+async def test_a_used_or_rejected_tool_call_cannot_be_requested_again() -> None:
+    world = World()
+    call, request = await world.request()
+    await world.approve(request, world.operator)
+    assert (await world.service.consume(request.id, call)).ok is True
+
+    with pytest.raises(ConflictError, match="used"):
+        await world.request(call)
+
+    other = world.call(tool_call_id="call-2")
+    _, rejected = await world.request(other)
+    await world.reject(rejected, world.operator)
+    with pytest.raises(ConflictError, match="rejected"):
+        await world.request(other)
+
+
+async def test_two_racing_requests_for_one_tool_call_give_one_approval() -> None:
+    world = World()
+    call = world.call()
+
+    first, second = await asyncio.gather(world.service.request(call), world.service.request(call))
+
+    assert first.id == second.id
+    assert len(await world.approvals.list(world.org_a, world.hotel_a1)) == 1
+
+
+# --- Decide and use ----------------------------------------------------------------------------
+
+
+async def test_approve_resumes_the_run_and_consume_returns_the_approved_arguments() -> None:
+    world = World()
+    call, request = await world.request()
+
+    approved = await world.approve(request, world.operator)
+    result = await world.service.consume(request.id, call)
+
+    assert approved.status == ApprovalStatus.APPROVED
     assert approved.decided_by == world.operator.user_id
-    assert world.resumer.resolutions == [
-        ApprovalResolution(
-            approval_id=request.id,
-            org_id=world.org_a,
-            hotel_id=world.hotel_a1,
-            run_id="run-1",
-            call_id="call-1",
-            outcome=ApprovalStatus.APPROVED,
-            reason=None,
-        )
-    ]
-    assert world.service.check(request.id, action).ok is True
-    first = world.service.consume(request.id, action)
-    assert first.ok is True
+    assert approved.use_by == world.clock.now + timedelta(minutes=15)
+    assert [r.outcome for r in world.resumer.resolutions] == [ApprovalStatus.APPROVED]
+    assert result.ok is True
+    assert dict(result.args or {}) == PMS_ARGS
+    assert result.idempotency_key == str(request.id)
     assert world.audit_actions() == ["approval.requested", "approval.approved", "approval.consumed"]
+    consumed = world.audit.events[-1]
+    assert (consumed.actor_type, consumed.actor_id) == (ActorType.RUN, "run-1")
+    assert consumed.details["requester_id"] == str(world.requester.user_id)
 
 
-def test_replay_a_used_approval_is_refused() -> None:
+async def test_replay_of_a_used_approval_is_refused_and_audited() -> None:
     world = World()
-    action, request = _request(world)
-    _approve(world, request, world.operator)
-    assert world.service.consume(request.id, action).ok
+    call, request = await world.request()
+    await world.approve(request, world.operator)
+    await world.service.consume(request.id, call)
 
-    replay = world.service.consume(request.id, action)
-    check = world.service.check(request.id, action)
+    replay = await world.service.consume(request.id, call)
 
     assert (replay.ok, replay.reason) == (False, "approval was already used")
-    assert check.ok is False
+    assert (await world.service.check(request.id, call)).ok is False
+    assert world.audit_actions()[-1] == "approval.use_refused"
+    assert world.audit.events[-1].details["reason"] == "approval was already used"
 
 
-def test_concurrent_use_wins_only_once() -> None:
+async def test_concurrent_use_wins_only_once() -> None:
     world = World()
-    _, request = _request(world)
-    approved = _approve(world, request, world.operator)
-    used = replace(approved, consumed_at=world.clock.now, version=approved.version + 1)
-    event = AuditEvent(
-        org_id=used.org_id,
-        hotel_id=used.hotel_id,
-        actor_id=used.requester_id,
-        action="approval.consumed",
-        subject_type="approval_request",
-        subject_id=str(used.id),
-        at=world.clock.now,
-    )
+    call, request = await world.request()
+    await world.approve(request, world.operator)
 
-    assert world.approvals.replace(approved, used, event) is True
-    assert world.approvals.replace(approved, used, event) is False  # stale version loses
-    assert world.audit_actions().count("approval.consumed") == 1  # the loser writes no audit
+    results = await asyncio.gather(*(world.service.consume(request.id, call) for _ in range(5)))
+
+    assert sorted(r.ok for r in results) == [False, False, False, False, True]
+    assert world.audit_actions().count("approval.consumed") == 1
 
 
-def test_reject_resumes_the_run_and_the_action_cannot_run() -> None:
+async def test_reject_resumes_the_run_and_the_action_cannot_run() -> None:
     world = World()
-    action, request = _request(world)
+    call, request = await world.request()
 
-    rejected = world.service.reject(
+    rejected = await world.service.reject(
         world.operator,
         world.tenant(world.org_a, world.hotel_a1, world.operator),
         request.id,
-        "Rate too high",
+        reason="Too high for this week",
     )
 
-    assert rejected.status is ApprovalStatus.REJECTED
-    assert rejected.reason == "Rate too high"
+    assert rejected.status == ApprovalStatus.REJECTED
+    assert rejected.reason == "Too high for this week"
     assert [r.outcome for r in world.resumer.resolutions] == [ApprovalStatus.REJECTED]
-    assert world.service.consume(request.id, action).ok is False
-    assert world.audit_actions()[-1] == "approval.rejected"
+    assert (await world.service.consume(request.id, call)).ok is False
+    assert world.audit_actions() == [
+        "approval.requested",
+        "approval.rejected",
+        "approval.use_refused",
+    ]
 
 
-def test_a_decided_approval_cannot_be_decided_again() -> None:
+async def test_a_decided_approval_cannot_be_decided_again() -> None:
     world = World()
-    _, request = _request(world)
-    _approve(world, request, world.operator)
+    _, request = await world.request()
+    await world.approve(request, world.operator)
 
     with pytest.raises(ConflictError):
-        world.service.reject(
-            world.admin, world.tenant(world.org_a, world.hotel_a1, world.admin), request.id
-        )
+        await world.reject(request, world.admin)
     with pytest.raises(ConflictError):
-        _approve(world, request, world.admin)
-
-
-def test_resumer_failure_does_not_undo_the_decision() -> None:
-    world = World()
-
-    class BrokenResumer:
-        def resume(self, resolution: ApprovalResolution) -> None:
-            raise RuntimeError("orchestrator is down")
-
-    world.service._resumer = BrokenResumer()
-    action, request = _request(world)
-
-    _approve(world, request, world.operator)
-
-    assert world.service.consume(request.id, action).ok is True
+        await world.approve(request, world.admin)
 
 
 class PausedRun:
-    """A stand-in for the orchestrator: it holds the gated tool call and resumes it."""
+    """A stand-in for the orchestrator and the control-plane executor."""
 
-    def __init__(self, world: World, action: Action) -> None:
+    def __init__(self, world: World, call: ProposedCall) -> None:
         self.world = world
-        self.action = action
+        self.call = call
         self.approval_id: UUID | None = None
-        self.tool_calls: list[dict[str, Any]] = []
+        self.executed: list[dict[str, Any]] = []
         self.tool_errors: list[str] = []
 
-    def gate(self) -> None:
-        decision = self.world.service.evaluate(self.action)
-        assert decision.__class__.__name__ == "RequireApproval"
-        self.approval_id = self.world.service.request_approval(
-            self.action, call_id="call-1", summary="Raise the rate"
-        ).id
+    async def gate(self) -> None:
+        decision = await self.world.service.evaluate(self.call)
+        assert decision.verdict == Verdict.ASK
+        self.approval_id = (await self.world.service.request(self.call)).id
 
-    def resume(self, resolution: ApprovalResolution) -> None:
-        assert resolution.approval_id == self.approval_id
-        if resolution.outcome is not ApprovalStatus.APPROVED:
+    async def resume(self, resolution: ApprovalResolution) -> None:
+        assert (resolution.approval_id, resolution.tool_call_id) == (self.approval_id, "call-1")
+        if resolution.outcome != ApprovalStatus.APPROVED:
             self.tool_errors.append(f"not run: {resolution.outcome}")
             return
-        check = self.world.service.consume(resolution.approval_id, self.action)
-        if check.ok:
-            self.tool_calls.append(dict(self.action.payload))
+        result = await self.world.service.consume(resolution.approval_id, self.call)
+        if result.ok and result.args is not None:
+            self.executed.append(dict(result.args))
         else:
-            self.tool_errors.append(check.reason)
+            self.tool_errors.append(result.reason)
 
 
 @pytest.mark.parametrize("approve", [True, False])
-def test_decision_resumes_the_paused_run(approve: bool) -> None:
+async def test_decision_resumes_the_paused_run(approve: bool) -> None:
     world = World()
-    run = PausedRun(world, world.action())
+    run = PausedRun(world, world.call())
     world.service._resumer = run
-    run.gate()
+    await run.gate()
     assert run.approval_id is not None
+    tenant = world.tenant(world.org_a, world.hotel_a1, world.operator)
 
     if approve:
-        world.service.approve(
-            world.operator,
-            world.tenant(world.org_a, world.hotel_a1, world.operator),
-            run.approval_id,
-        )
-        assert run.tool_calls == [dict(run.action.payload)]
+        await world.service.approve(world.operator, tenant, run.approval_id)
+        assert run.executed == [PMS_ARGS]
         assert run.tool_errors == []
     else:
-        world.service.reject(
-            world.operator,
-            world.tenant(world.org_a, world.hotel_a1, world.operator),
-            run.approval_id,
-        )
-        assert run.tool_calls == []
+        await world.service.reject(world.operator, tenant, run.approval_id)
+        assert run.executed == []
         assert run.tool_errors == ["not run: rejected"]
 
 
-# --- Expiry --------------------------------------------------------------------------------
+# --- Re-check at the time of use ---------------------------------------------------------------
 
 
-def test_pending_approval_expires_and_cannot_be_approved() -> None:
+async def test_a_deny_rule_added_after_approval_wins_at_the_time_of_use() -> None:
     world = World()
-    action, request = _request(world)
-    world.clock.advance(timedelta(hours=24))
+    call, request = await world.request()
+    await world.approve(request, world.operator)
+    await world.set_policy(rules=(Rule(ActionKind.PMS_CHANGE, Effect.DENY),))
 
-    with pytest.raises(ConflictError, match="expired"):
-        _approve(world, request, world.operator)
+    result = await world.service.consume(request.id, call)
 
-    stored = world.approvals.get(world.org_a, world.hotel_a1, request.id)
-    assert stored is not None and stored.status is ApprovalStatus.EXPIRED
-    assert [r.outcome for r in world.resumer.resolutions] == [ApprovalStatus.EXPIRED]
-    assert world.audit_actions() == ["approval.requested", "approval.expired"]
-    assert world.service.consume(request.id, action).ok is False
+    assert result.ok is False
+    assert result.reason.startswith("the policy now denies this action")
+    assert world.audit_actions()[-1] == "approval.use_refused"
 
 
-def test_pending_approval_is_still_valid_one_second_before_expiry() -> None:
+async def test_a_tool_removed_from_the_registry_cannot_use_its_approval() -> None:
     world = World()
-    _, request = _request(world)
-    world.clock.advance(timedelta(hours=24) - timedelta(seconds=1))
+    call, request = await world.request()
+    await world.approve(request, world.operator)
+    world.engine._catalog = type(world.catalog)()  # empty registry
 
-    assert _approve(world, request, world.operator).status is ApprovalStatus.APPROVED
+    result = await world.service.consume(request.id, call)
+
+    assert result.ok is False
+    assert "not registered" in result.reason
 
 
-def test_expiry_sweep_expires_only_due_requests_of_one_hotel() -> None:
+async def test_approval_is_bound_to_its_tool_call_id() -> None:
     world = World()
-    _, old = _request(world)
-    world.clock.advance(timedelta(hours=23))
-    _, fresh = _request(world, world.action(run_id="run-2"))
-    _, other_hotel = _request(
-        world, world.action(tenant=world.tenant(hotel_id=world.hotel_a2), run_id="run-3")
-    )
-    world.clock.advance(timedelta(hours=1))
+    call, request = await world.request()
+    await world.approve(request, world.operator)
 
-    expired = world.service.expire_due(world.org_a, world.hotel_a1)
+    result = await world.service.consume(request.id, replace(call, tool_call_id="call-2"))
 
-    assert [r.id for r in expired] == [old.id]
-    statuses = {r.id: r.status for r in world.approvals.list(world.org_a, world.hotel_a1)}
-    assert statuses == {old.id: ApprovalStatus.EXPIRED, fresh.id: ApprovalStatus.PENDING}
-    still = world.approvals.get(world.org_a, world.hotel_a2, other_hotel.id)
-    assert still is not None and still.status is ApprovalStatus.PENDING
-
-
-def test_approved_but_unused_approval_cannot_be_used_after_expiry() -> None:
-    world = World()
-    action, request = _request(world)
-    _approve(world, request, world.operator)
-    world.clock.advance(timedelta(hours=24))
-
-    result = world.service.consume(request.id, action)
-
-    assert (result.ok, result.reason) == (False, "approval expired")
-
-
-# --- Binding to the exact proposal ------------------------------------------------------------
+    assert (result.ok, result.reason) == (False, "approval belongs to another tool call")
+    assert (await world.service.consume(request.id, call)).ok is True
 
 
 @pytest.mark.parametrize(
     "change",
     [
-        {"payload": {"room": "Deluxe King", "date": "2026-12-24", "old": 9000, "new": 99000}},
-        {"payload": {"room": "Suite", "date": "2026-12-24", "old": 9000, "new": 9900}},
-        {"kind": ActionKind.EXTERNAL_WRITE},
-        {"risk": RiskLevel.LOW},
-        {"tool": "pms_set_inventory"},
-        {"toolset": "coding"},
+        {"args": {**PMS_ARGS, "new": 99000}},
+        {"args": {**PMS_ARGS, "target": "Suite, 24 Dec 2026"}},
+        {"args": {**PMS_ARGS, "guests_affected": 3}},
+        {"tool": "pms_change_low"},
+        {"toolset": "reports"},
     ],
 )
-def test_changed_proposal_needs_a_new_approval(change: dict[str, Any]) -> None:
+async def test_changed_proposal_needs_a_new_approval(change: dict[str, Any]) -> None:
     world = World()
-    action, request = _request(world)
-    _approve(world, request, world.operator)
-    changed = replace(action, **change)
+    call, request = await world.request()
+    await world.approve(request, world.operator)
 
-    result = world.service.consume(request.id, changed)
+    result = await world.service.consume(request.id, replace(call, **change))
 
     assert result.ok is False
     assert result.reason == "action changed after approval; a new approval is needed"
-    assert world.service.consume(request.id, action).ok is True  # the original is untouched
+    assert (await world.service.consume(request.id, call)).ok is True  # the original is untouched
 
 
-def test_payload_mutated_in_place_after_approval_is_refused() -> None:
+async def test_arguments_mutated_by_the_caller_after_the_request_do_not_change_the_call() -> None:
     world = World()
-    payload = {"room": "Deluxe King", "new": 9900}
-    action, request = _request(world, world.action(payload=payload))
-    _approve(world, request, world.operator)
+    args = dict(PMS_ARGS)
+    call, request = await world.request(world.call(args=args))
+    await world.approve(request, world.operator)
 
-    payload["new"] = 19900
+    args["new"] = 19900  # the call holds its own frozen copy
 
-    assert world.service.consume(request.id, action).ok is False
+    result = await world.service.consume(request.id, call)
+    assert result.ok is True
+    assert dict(result.args or {})["new"] == 9900
 
 
-def test_approval_cannot_be_used_by_another_run_or_requester() -> None:
+async def test_approval_cannot_be_used_by_another_run_or_requester() -> None:
     world = World()
-    action, request = _request(world)
-    _approve(world, request, world.operator)
+    call, request = await world.request()
+    await world.approve(request, world.operator)
+    someone_else = world.tenant(actor=world.operator)
 
-    other_run = replace(action, run_id="run-2")
-    other_requester = replace(action, tenant=world.tenant(actor=world.operator))
+    other_run = await world.service.consume(request.id, replace(call, run_id="run-2"))
+    other_requester = await world.service.consume(request.id, replace(call, tenant=someone_else))
 
-    assert world.service.consume(request.id, other_run).reason == "approval belongs to another run"
-    assert world.service.consume(request.id, other_requester).ok is False
+    assert other_run.reason == "approval belongs to another run"
+    assert other_requester.reason == "approval belongs to another run"
 
 
-def test_approval_cannot_be_used_in_another_hotel_or_org() -> None:
+async def test_approval_cannot_be_used_in_another_hotel_or_org() -> None:
     world = World()
-    action, request = _request(world)
-    _approve(world, request, world.operator)
+    call, request = await world.request()
+    await world.approve(request, world.operator)
 
-    other_hotel = replace(action, tenant=world.tenant(hotel_id=world.hotel_a2))
-    other_org = replace(action, tenant=world.tenant(org_id=world.org_b, hotel_id=world.hotel_b1))
-
-    for wrong in (other_hotel, other_org):
-        result = world.service.consume(request.id, wrong)
+    for org, hotel in [(world.org_a, world.hotel_a2), (world.org_b, world.hotel_b1)]:
+        moved = replace(call, tenant=world.tenant(org, hotel))
+        result = await world.service.consume(request.id, moved)
         assert (result.ok, result.reason) == (False, "approval not found")
 
 
-def test_check_and_consume_fail_closed_on_store_errors() -> None:
+async def test_check_and_consume_fail_closed_on_store_errors() -> None:
     class BrokenStore(InMemoryApprovalStore):
-        def get(self, org_id: Any, hotel_id: Any, approval_id: Any) -> ApprovalRequest | None:
+        async def get(self, org_id: Any, hotel_id: Any, approval_id: Any) -> ApprovalRequest | None:
             raise RuntimeError("database is down")
 
     world = World(approvals=BrokenStore())
-    action = world.action()
+    call = world.call()
 
-    assert world.service.check(uuid4(), action).ok is False
-    assert world.service.consume(uuid4(), action).ok is False
-
-
-# --- Tenant scope ----------------------------------------------------------------------------
+    assert (await world.service.check(uuid4(), call)).ok is False
+    assert (await world.service.consume(uuid4(), call)).ok is False
+    assert world.audit_actions() == ["approval.use_refused"]
 
 
-def test_cross_hotel_approval_is_not_found() -> None:
+# --- Expiry ------------------------------------------------------------------------------------
+
+
+async def test_pending_approval_expires_and_cannot_be_approved() -> None:
     world = World()
-    _, request = _request(world)
+    call, request = await world.request()
+    world.clock.advance(timedelta(hours=24))
 
-    # An owner of hotel A2 (same org) neither sees nor approves a hotel A1 request.
-    with pytest.raises(NotFoundError):
-        _approve(world, request, world.hotel_a2_owner)
-    with pytest.raises(NotFoundError):
-        world.service.approve(
-            world.hotel_a2_owner,
-            world.tenant(world.org_a, world.hotel_a2, world.hotel_a2_owner),
-            request.id,
-        )
-    with pytest.raises(NotFoundError):
-        world.service.list_for(
-            world.hotel_a2_owner, world.tenant(world.org_a, world.hotel_a1, world.hotel_a2_owner)
-        )
+    with pytest.raises(ConflictError):
+        await world.approve(request, world.operator)
+
+    stored = await world.approvals.get(world.org_a, world.hotel_a1, request.id)
+    assert stored.status == ApprovalStatus.EXPIRED
+    assert [r.outcome for r in world.resumer.resolutions] == [ApprovalStatus.EXPIRED]
+    assert (await world.service.consume(request.id, call)).reason == "approval is expired"
 
 
-def test_cross_org_approval_is_not_found() -> None:
+async def test_pending_approval_is_still_valid_one_second_before_expiry() -> None:
     world = World()
-    _, request = _request(world)
+    _, request = await world.request()
+    world.clock.advance(timedelta(hours=24) - timedelta(seconds=1))
 
-    with pytest.raises(NotFoundError):
-        _approve(world, request, world.org_b_owner)
-    with pytest.raises(NotFoundError):
-        world.service.approve(
-            world.org_b_owner,
-            world.tenant(world.org_b, world.hotel_b1, world.org_b_owner),
-            request.id,
-        )
-    with pytest.raises(NotFoundError):
-        world.service.get_for(
-            world.org_b_owner,
-            world.tenant(world.org_a, world.hotel_a1, world.org_b_owner),
-            request.id,
-        )
-    assert world.resumer.resolutions == []
+    assert (await world.approve(request, world.operator)).status == ApprovalStatus.APPROVED
 
 
-def test_org_wide_admin_approves_in_every_hotel_of_the_org() -> None:
+async def test_expiry_sweep_expires_only_due_requests_of_one_hotel() -> None:
     world = World()
-    _, request = _request(world, world.action(tenant=world.tenant(hotel_id=world.hotel_a2)))
+    _, old = await world.request()
+    world.clock.advance(timedelta(hours=12))
+    _, new = await world.request(world.call(tool_call_id="call-2"))
+    other_hotel = world.call(tenant=world.tenant(world.org_a, world.hotel_a2))
+    _, elsewhere = await world.request(other_hotel)
+    world.clock.advance(timedelta(hours=12))
 
-    assert _approve(world, request, world.org_a_admin).status is ApprovalStatus.APPROVED
+    expired = await world.service.expire_due(world.org_a, world.hotel_a1)
 
-
-# --- Roles -------------------------------------------------------------------------------------
-
-
-def test_viewer_can_see_but_cannot_decide() -> None:
-    world = World()
-    _, request = _request(world)
-
-    assert [
-        r.id
-        for r in world.service.list_for(
-            world.viewer, world.tenant(world.org_a, world.hotel_a1, world.viewer)
-        )
-    ] == [request.id]
-    with pytest.raises(ForbiddenError):
-        _approve(world, request, world.viewer)
-    with pytest.raises(ForbiddenError):
-        world.service.reject(
-            world.viewer, world.tenant(world.org_a, world.hotel_a1, world.viewer), request.id
-        )
-
-
-def test_operator_cannot_approve_when_the_hotel_requires_admin() -> None:
-    world = World()
-    world.set_policy(approver_min_roles={ActionKind.PMS_CHANGE: HotelRole.ADMIN})
-    _, request = _request(world)
-
-    with pytest.raises(ForbiddenError):
-        _approve(world, request, world.operator)
-    assert _approve(world, request, world.admin).status is ApprovalStatus.APPROVED
-
-
-def test_owner_can_approve_when_the_hotel_requires_admin() -> None:
-    world = World()
-    world.set_policy(approver_min_roles={ActionKind.PMS_CHANGE: HotelRole.ADMIN})
-    _, request = _request(world)
-
-    assert _approve(world, request, world.owner).status is ApprovalStatus.APPROVED
-
-
-def test_pending_request_keeps_the_approver_roles_it_was_created_with() -> None:
-    world = World()
-    _, request = _request(world)
-    world.service.set_approver_min_role(
-        world.admin,
-        world.tenant(world.org_a, world.hotel_a1, world.admin),
-        ActionKind.PMS_CHANGE,
-        HotelRole.OWNER,
+    assert [r.id for r in expired] == [old.id]
+    assert (await world.approvals.get(world.org_a, world.hotel_a1, new.id)).status == "pending"
+    assert (await world.approvals.get(world.org_a, world.hotel_a2, elsewhere.id)).status == (
+        "pending"
     )
 
-    assert _approve(world, request, world.operator).status is ApprovalStatus.APPROVED
 
-
-@pytest.mark.parametrize("kind", [ActionKind.GIT_PUSH, ActionKind.CODE_CHANGE])
-def test_hotel_roles_can_never_approve_code(kind: ActionKind) -> None:
+async def test_an_approval_given_just_before_the_deadline_is_usable_for_the_use_window() -> None:
+    # Review probe: approved 5 s before the decide deadline, used 6 s later.
     world = World()
-    _, request = _request(world, world.action(kind, toolset="coding", tool="git"))
+    call, request = await world.request()
+    world.clock.advance(timedelta(hours=24) - timedelta(seconds=5))
+    await world.approve(request, world.operator)
+    world.clock.advance(timedelta(seconds=6))
 
-    for hotel_person in (world.owner, world.admin, world.operator, world.org_a_admin):
-        with pytest.raises(ForbiddenError):
-            _approve(world, request, hotel_person)
-    with pytest.raises(NotFoundError):
-        _approve(world, request, world.platform)  # break-glass is not an approver
-
-    assert _approve(world, request, world.code_reviewer).status is ApprovalStatus.APPROVED
+    assert (await world.service.consume(request.id, call)).ok is True
 
 
-def test_code_reviewer_sees_only_code_requests_of_a_hotel() -> None:
+async def test_an_approved_but_unused_approval_expires_after_the_use_window() -> None:
     world = World()
-    _, ops_request = _request(world)
-    _, code_request = _request(
-        world, world.action(ActionKind.CODE_CHANGE, toolset="coding", tool="git", run_id="run-2")
-    )
+    await world.set_policy(use_window=timedelta(minutes=5))
+    call, request = await world.request()
+    await world.approve(request, world.operator)
+    world.clock.advance(timedelta(minutes=5))
 
-    seen = world.service.list_for(
-        world.code_reviewer, world.tenant(world.org_a, world.hotel_a1, world.code_reviewer)
-    )
+    result = await world.service.consume(request.id, call)
 
-    assert [r.id for r in seen] == [code_request.id]
-    with pytest.raises(NotFoundError):
-        _approve(world, ops_request, world.code_reviewer)
+    assert (result.ok, result.reason) == (False, "approval expired")
 
 
-def test_list_filters_by_status() -> None:
+# --- Cancel, resume recovery, and audit atomicity ----------------------------------------------
+
+
+async def test_requester_run_can_cancel_a_pending_approval() -> None:
     world = World()
-    _, first = _request(world)
-    _, second = _request(world, world.action(run_id="run-2"))
-    _approve(world, first, world.operator)
+    _, request = await world.request()
 
-    pending = world.service.list_for(
-        world.operator,
-        world.tenant(world.org_a, world.hotel_a1, world.operator),
-        ApprovalStatus.PENDING,
-    )
+    cancelled = await world.service.cancel(world.tenant(), request.id, reason="run cancelled")
 
-    assert [r.id for r in pending] == [second.id]
-
-
-# --- Self-approval ---------------------------------------------------------------------------
-
-
-def test_requester_may_approve_their_own_action_by_default() -> None:
-    world = World()
-    _, request = _request(world, world.action(risk=RiskLevel.HIGH))
-
-    assert _approve(world, request, world.requester).status is ApprovalStatus.APPROVED
-
-
-def test_hotel_can_forbid_self_approval_of_high_risk_actions() -> None:
-    world = World()
-    world.set_policy(forbid_self_approval_of_high_risk=True)
-    _, high = _request(world, world.action(risk=RiskLevel.HIGH))
-    _, medium = _request(world, world.action(risk=RiskLevel.MEDIUM, run_id="run-2"))
-
-    with pytest.raises(ForbiddenError, match="own high-risk"):
-        _approve(world, high, world.requester)
-    assert _approve(world, medium, world.requester).status is ApprovalStatus.APPROVED
-    assert _approve(world, high, world.operator).status is ApprovalStatus.APPROVED
-
-
-def test_requester_may_still_reject_their_own_high_risk_action() -> None:
-    world = World()
-    world.set_policy(forbid_self_approval_of_high_risk=True)
-    _, request = _request(world, world.action(risk=RiskLevel.HIGH))
-
-    rejected = world.service.reject(
-        world.requester, world.tenant(world.org_a, world.hotel_a1, world.requester), request.id
-    )
-
-    assert rejected.status is ApprovalStatus.REJECTED
-
-
-# --- Cancel ------------------------------------------------------------------------------------
-
-
-def test_requester_run_can_cancel_a_pending_approval() -> None:
-    world = World()
-    action, request = _request(world)
-
-    cancelled = world.service.cancel(world.tenant(), request.id, "run cancelled")
-
-    assert cancelled.status is ApprovalStatus.CANCELLED
+    assert cancelled.status == ApprovalStatus.CANCELLED
     assert [r.outcome for r in world.resumer.resolutions] == [ApprovalStatus.CANCELLED]
-    assert world.audit_actions()[-1] == "approval.cancelled"
-    assert world.service.consume(request.id, action).ok is False
-    with pytest.raises(ConflictError):
-        _approve(world, request, world.operator)
+    assert world.audit_actions() == ["approval.requested", "approval.cancelled"]
 
 
-def test_cancel_by_someone_else_or_after_a_decision_is_refused() -> None:
+async def test_cancel_by_someone_else_or_after_a_decision_is_refused() -> None:
+    from harness.approvals import NotFoundError
+
     world = World()
-    _, request = _request(world)
+    _, request = await world.request()
 
     with pytest.raises(NotFoundError):
-        world.service.cancel(world.tenant(actor=world.operator), request.id)
-    _approve(world, request, world.operator)
+        await world.service.cancel(world.tenant(actor=world.operator), request.id)
+    await world.approve(request, world.operator)
     with pytest.raises(ConflictError):
-        world.service.cancel(world.tenant(), request.id)
+        await world.service.cancel(world.tenant(), request.id)
 
 
-# --- Hotel admins set approver roles -------------------------------------------------------
+async def test_resumer_failure_does_not_undo_the_decision_and_can_be_recovered() -> None:
+    class DownResumer:
+        async def resume(self, resolution: ApprovalResolution) -> None:
+            raise RuntimeError("orchestrator is down")
 
-
-def test_hotel_admin_sets_approver_role_with_an_audit_event() -> None:
     world = World()
+    world.service._resumer = DownResumer()
+    call, request = await world.request()
+    run = world.tenant()
 
-    policy = world.service.set_approver_min_role(
-        world.admin,
-        world.tenant(world.org_a, world.hotel_a1, world.admin),
-        ActionKind.PMS_CHANGE,
-        HotelRole.ADMIN,
-    )
-    again = world.service.set_approver_min_role(
-        world.owner,
-        world.tenant(world.org_a, world.hotel_a1, world.owner),
-        ActionKind.MESSAGE_SEND,
-        HotelRole.OWNER,
-    )
+    assert await world.service.resolution(run, request.id) is None  # still pending
+    await world.approve(request, world.operator)
 
-    assert policy.min_role_for(ActionKind.PMS_CHANGE) is HotelRole.ADMIN
-    assert again.min_role_for(ActionKind.PMS_CHANGE) is HotelRole.ADMIN
-    assert again.min_role_for(ActionKind.MESSAGE_SEND) is HotelRole.OWNER
-    assert world.audit_actions() == ["approval_policy.updated", "approval_policy.updated"]
-    assert world.audit.events[0].actor_id == world.admin.user_id
-
-
-def test_only_admins_of_the_hotel_set_approver_roles() -> None:
-    world = World()
-
-    def attempt(who: Principal) -> None:
-        tenant = world.tenant(world.org_a, world.hotel_a1, who)
-        world.service.set_approver_min_role(who, tenant, ActionKind.PMS_CHANGE, HotelRole.ADMIN)
-
-    with pytest.raises(ForbiddenError):
-        attempt(world.operator)
-    for outsider in (world.hotel_a2_owner, world.org_b_owner, world.code_reviewer):
-        with pytest.raises(NotFoundError):
-            attempt(outsider)
-    assert world.audit.events == ()
-
-
-def test_tenant_context_must_belong_to_the_principal() -> None:
-    world = World()
-    _, request = _request(world)
-    borrowed = world.tenant(world.org_a, world.hotel_a1, world.operator)
-
-    with pytest.raises(ValueError, match="actor_id"):
-        world.service.approve(world.viewer, borrowed, request.id)
-    assert world.approvals.get(world.org_a, world.hotel_a1, request.id) == request
-
-
-def test_first_policy_writes_from_two_admins_never_lose_a_setting() -> None:
-    # Another admin inserts the first policy between this admin's read and write.
-    class RacingStore(InMemoryPolicyStore):
-        raced = False
-
-        def get(self, org_id: UUID, hotel_id: UUID) -> HotelPolicy | None:
-            seen = super().get(org_id, hotel_id)
-            if not self.raced:
-                self.raced = True
-                other = world.tenant(org_id, hotel_id, world.owner)
-                world.service.set_approver_min_role(
-                    world.owner, other, ActionKind.PMS_CHANGE, HotelRole.OWNER
-                )
-            return seen
-
-    audit = InMemoryAuditLog()
-    world = World(policies=RacingStore(audit), audit=audit)
-    tenant = world.tenant(world.org_a, world.hotel_a1, world.admin)
-
-    with pytest.raises(ConflictError):
-        world.service.set_approver_min_role(
-            world.admin, tenant, ActionKind.MESSAGE_SEND, HotelRole.ADMIN
-        )
-    stored = world.policies.get(world.org_a, world.hotel_a1)
-    assert stored is not None
-    assert stored.min_role_for(ActionKind.PMS_CHANGE) is HotelRole.OWNER
-    assert stored.min_role_for(ActionKind.MESSAGE_SEND) is HotelRole.OPERATOR
-    assert world.audit_actions() == ["approval_policy.updated"]
-
-
-@pytest.mark.parametrize(
-    ("kind", "role"),
-    [
-        (ActionKind.CODE_CHANGE, HotelRole.OWNER),
-        (ActionKind.GIT_PUSH, HotelRole.ADMIN),
-        (ActionKind.PMS_CHANGE, HotelRole.VIEWER),
-        (ActionKind.READ, HotelRole.ADMIN),
-    ],
-)
-def test_admin_cannot_set_a_forbidden_approver_role(kind: ActionKind, role: HotelRole) -> None:
-    world = World()
-
-    with pytest.raises(InvalidPolicyError):
-        world.service.set_approver_min_role(
-            world.admin, world.tenant(world.org_a, world.hotel_a1, world.admin), kind, role
-        )
-    assert world.audit.events == ()
-
-
-# --- Audit and state change are atomic -----------------------------------------------------
+    resolution = await world.service.resolution(run, request.id)
+    assert resolution is not None
+    assert (resolution.outcome, resolution.run_id) == (ApprovalStatus.APPROVED, "run-1")
+    other = world.tenant(actor=world.operator)
+    assert await world.service.resolution(other, request.id) is None  # not their run
+    assert (await world.service.consume(request.id, call)).ok is True
 
 
 class FailingAudit:
     def __init__(self) -> None:
         self.fail = True
 
-    def record(self, event: Any) -> None:
+    def record_now(self, event: Any) -> None:
         if self.fail:
             raise RuntimeError("audit store is down")
 
 
-def test_failed_audit_write_leaves_no_usable_approval() -> None:
+async def test_failed_audit_write_leaves_no_usable_approval() -> None:
     world = World()
-    action, request = _request(world)
+    call, request = await world.request()
     audit = FailingAudit()
     world.approvals.audit = audit
 
     with pytest.raises(RuntimeError, match="audit"):
-        _approve(world, request, world.operator)
+        await world.approve(request, world.operator)
 
-    assert world.approvals.get(world.org_a, world.hotel_a1, request.id) == request
-    assert world.service.check(request.id, action).ok is False
+    assert await world.approvals.get(world.org_a, world.hotel_a1, request.id) == request
+    assert (await world.service.check(request.id, call)).ok is False
     assert world.resumer.resolutions == []
     audit.fail = False
-    assert _approve(world, request, world.operator).status is ApprovalStatus.APPROVED
-    assert world.service.consume(request.id, action).ok is True
+    assert (await world.approve(request, world.operator)).status == ApprovalStatus.APPROVED
+    assert (await world.service.consume(request.id, call)).ok is True
 
 
-def test_failed_audit_write_blocks_consume() -> None:
+async def test_failed_audit_write_blocks_consume() -> None:
     world = World()
-    action, request = _request(world)
-    _approve(world, request, world.operator)
+    call, request = await world.request()
+    await world.approve(request, world.operator)
     world.approvals.audit = FailingAudit()
 
-    result = world.service.consume(request.id, action)
+    result = await world.service.consume(request.id, call)
 
     assert result.ok is False
     world.approvals.audit = world.audit
-    assert world.service.consume(request.id, action).ok is True
+    assert (await world.service.consume(request.id, call)).ok is True
     assert world.audit_actions()[-1] == "approval.consumed"
 
 
-def test_orchestrator_recovers_a_decision_when_resume_failed() -> None:
-    class DownResumer:
-        def resume(self, resolution: ApprovalResolution) -> None:
-            raise RuntimeError("orchestrator is down")
+async def test_failed_audit_of_a_denial_still_denies() -> None:
+    class BrokenSink:
+        async def record(self, event: Any) -> None:
+            raise RuntimeError("audit store is down")
 
     world = World()
-    action, request = _request(world)
-    world.service._resumer = DownResumer()
-    run = world.tenant(world.org_a, world.hotel_a1, world.requester)
+    world.service._audit = BrokenSink()
 
-    assert world.service.resolution(run, request.id) is None  # still pending
-    _approve(world, request, world.operator)
+    decision = await world.service.evaluate(world.call(toolset="nope", tool="nope"))
 
-    resolution = world.service.resolution(run, request.id)
-    assert resolution is not None
-    assert (resolution.outcome, resolution.run_id) == (ApprovalStatus.APPROVED, action.run_id)
-    other = world.tenant(world.org_a, world.hotel_a1, world.operator)
-    assert world.service.resolution(other, request.id) is None  # not their run
+    assert decision.verdict == Verdict.DENY

@@ -1,8 +1,10 @@
 """Approval policy engine and approval service (DEX-20, Hermes parity HP-21).
 
-- `model`: actions, roles, decisions, approval requests (immutable values).
-- `policy`: `PolicyEngine.evaluate` -> allow, require approval, or deny. Fails closed.
-- `interface`: `ApprovalPolicy`, the small interface that runtime adapters call.
+- `model`: tool calls, roles, decisions, approval requests, previews (immutable values).
+- `catalog`: the tool registry; the only source of an action's kind and risk.
+- `preview`: typed proposals per action kind and the preview the harness renders from them.
+- `policy`: `PolicyEngine` -> allow, ask, or deny. Fails closed.
+- `interface`: `ApprovalPolicy`, the small async interface that runtime adapters call.
 - `service`: `ApprovalService`, which implements `ApprovalPolicy` and the staff operations.
 - `store`, `audit`: persistence and audit interfaces with in-memory implementations.
 - `api`: FastAPI routes to list, approve, and reject, and to set approver roles.
@@ -10,29 +12,38 @@
 Design: docs/approvals.md and docs/architecture.md (D19, Sections 4.2, 5.2, 7.1, 10.10).
 """
 
-from harness.approvals.audit import AuditEvent, AuditSink, InMemoryAuditLog
+from harness.approvals.audit import ActorType, AuditEvent, AuditSink, InMemoryAuditLog
+from harness.approvals.catalog import ToolCatalog, ToolSpec
 from harness.approvals.interface import ApprovalPolicy
 from harness.approvals.model import (
-    Action,
     ActionClass,
     ActionKind,
-    Allow,
     ApprovalCheck,
     ApprovalRequest,
     ApprovalResolution,
     ApprovalStatus,
     ApproverRole,
     Decision,
-    Deny,
     HotelRole,
     Membership,
+    Preview,
+    PreviewField,
     Principal,
-    RequireApproval,
+    PrincipalKind,
+    ProposedCall,
     RiskLevel,
     TeamRole,
-    payload_hash,
+    Verdict,
+    canonical_json,
+    proposal_hash,
 )
-from harness.approvals.policy import Effect, HotelPolicy, PolicyEngine, Rule
+from harness.approvals.policy import (
+    Effect,
+    HotelPolicy,
+    PolicyEngine,
+    Rule,
+)
+from harness.approvals.preview import PROPOSAL_TYPES, render_preview
 from harness.approvals.service import (
     ActionDeniedError,
     ApprovalError,
@@ -46,17 +57,18 @@ from harness.approvals.service import (
 )
 from harness.approvals.store import (
     ApprovalStore,
+    DuplicateToolCallError,
     InMemoryApprovalStore,
     InMemoryPolicyStore,
     PolicyStore,
 )
 
 __all__ = [
-    "Action",
+    "PROPOSAL_TYPES",
     "ActionClass",
     "ActionDeniedError",
     "ActionKind",
-    "Allow",
+    "ActorType",
     "ApprovalCheck",
     "ApprovalError",
     "ApprovalNotRequiredError",
@@ -71,7 +83,7 @@ __all__ = [
     "AuditSink",
     "ConflictError",
     "Decision",
-    "Deny",
+    "DuplicateToolCallError",
     "Effect",
     "ForbiddenError",
     "HotelPolicy",
@@ -84,11 +96,19 @@ __all__ = [
     "NotFoundError",
     "PolicyEngine",
     "PolicyStore",
+    "Preview",
+    "PreviewField",
     "Principal",
-    "RequireApproval",
+    "PrincipalKind",
+    "ProposedCall",
     "RiskLevel",
     "Rule",
     "RunResumer",
     "TeamRole",
-    "payload_hash",
+    "ToolCatalog",
+    "ToolSpec",
+    "Verdict",
+    "canonical_json",
+    "proposal_hash",
+    "render_preview",
 ]

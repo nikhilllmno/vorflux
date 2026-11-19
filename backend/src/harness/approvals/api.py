@@ -3,6 +3,8 @@
 The routes fail closed until their two dependencies exist:
 
 - `get_principal` returns 401 until Supabase JWT auth lands (DEX-12), which will override it.
+  DEX-12 must build a `human` principal only from a user session JWT. A run token or an MCP
+  tool credential gives a `run` principal, which can never approve or reject.
 - `get_approval_service` returns 503 until the app has an `approval_service` with a Postgres
   store. Tests set both.
 
@@ -51,25 +53,41 @@ PrincipalDep = Annotated[Principal, Depends(get_principal)]
 ServiceDep = Annotated[ApprovalService, Depends(get_approval_service)]
 
 
+class PreviewFieldOut(BaseModel):
+    label: str
+    value: str
+
+
+class PreviewOut(BaseModel):
+    title: str
+    fields: list[PreviewFieldOut]
+
+
 class ApprovalOut(BaseModel):
-    """The approval card. The raw payload is not exposed; `summary` is the staff preview."""
+    """The approval card.
+
+    `preview` is rendered by the harness from the bound arguments, so it shows every argument
+    that the approval binds to. `note` is optional agent text, shown as context only.
+    """
 
     id: UUID
     run_id: str
-    call_id: str
+    tool_call_id: str
     requester_id: UUID
     kind: ActionKind
     risk: RiskLevel
     toolset: str
     tool: str
-    summary: str
-    payload_hash: str
+    preview: PreviewOut
+    note: str | None
+    proposal_hash: str
     approver_roles: list[str]
     status: ApprovalStatus
     created_at: datetime
     expires_at: datetime
     decided_by: UUID | None
     decided_at: datetime | None
+    use_by: datetime | None
     reason: str | None
     used: bool
 
@@ -78,20 +96,22 @@ class ApprovalOut(BaseModel):
         return cls(
             id=request.id,
             run_id=request.run_id,
-            call_id=request.call_id,
+            tool_call_id=request.tool_call_id,
             requester_id=request.requester_id,
             kind=request.kind,
             risk=request.risk,
             toolset=request.toolset,
             tool=request.tool,
-            summary=request.summary,
-            payload_hash=request.payload_hash,
+            preview=PreviewOut.model_validate(request.preview.as_json()),
+            note=request.note,
+            proposal_hash=request.proposal_hash,
             approver_roles=sorted(str(role) for role in request.approver_roles),
             status=request.status,
             created_at=request.created_at,
             expires_at=request.expires_at,
             decided_by=request.decided_by,
             decided_at=request.decided_at,
+            use_by=request.use_by,
             reason=request.reason,
             used=request.consumed_at is not None,
         )
@@ -141,7 +161,7 @@ def _tenant(principal: Principal, org_id: UUID, hotel_id: UUID) -> TenantContext
 
 
 @router.get("/approvals")
-def list_approvals(
+async def list_approvals(
     org_id: UUID,
     hotel_id: UUID,
     principal: PrincipalDep,
@@ -149,22 +169,23 @@ def list_approvals(
     status_filter: Annotated[ApprovalStatus | None, Query(alias="status")] = None,
 ) -> ApprovalList:
     with _errors():
-        rows = service.list_for(principal, _tenant(principal, org_id, hotel_id), status_filter)
+        tenant = _tenant(principal, org_id, hotel_id)
+        rows = await service.list_for(principal, tenant, status_filter)
     return ApprovalList(approvals=[ApprovalOut.of(row) for row in rows])
 
 
 @router.get("/approvals/{approval_id}")
-def get_approval(
+async def get_approval(
     org_id: UUID, hotel_id: UUID, approval_id: UUID, principal: PrincipalDep, service: ServiceDep
 ) -> ApprovalOut:
     with _errors():
-        return ApprovalOut.of(
-            service.get_for(principal, _tenant(principal, org_id, hotel_id), approval_id)
-        )
+        tenant = _tenant(principal, org_id, hotel_id)
+        request = await service.get_for(principal, tenant, approval_id)
+    return ApprovalOut.of(request)
 
 
 @router.post("/approvals/{approval_id}/approve")
-def approve(
+async def approve(
     org_id: UUID,
     hotel_id: UUID,
     approval_id: UUID,
@@ -173,14 +194,14 @@ def approve(
     service: ServiceDep,
 ) -> ApprovalOut:
     with _errors():
-        decided = service.approve(
+        decided = await service.approve(
             principal, _tenant(principal, org_id, hotel_id), approval_id, body.reason
         )
     return ApprovalOut.of(decided)
 
 
 @router.post("/approvals/{approval_id}/reject")
-def reject(
+async def reject(
     org_id: UUID,
     hotel_id: UUID,
     approval_id: UUID,
@@ -189,14 +210,14 @@ def reject(
     service: ServiceDep,
 ) -> ApprovalOut:
     with _errors():
-        decided = service.reject(
+        decided = await service.reject(
             principal, _tenant(principal, org_id, hotel_id), approval_id, body.reason
         )
     return ApprovalOut.of(decided)
 
 
 @router.put("/approval-policy/approvers/{kind}")
-def set_approver_role(
+async def set_approver_role(
     org_id: UUID,
     hotel_id: UUID,
     kind: ActionKind,
@@ -205,7 +226,7 @@ def set_approver_role(
     service: ServiceDep,
 ) -> ApproverRoleOut:
     with _errors():
-        policy = service.set_approver_min_role(
+        policy = await service.set_approver_min_role(
             principal, _tenant(principal, org_id, hotel_id), kind, body.min_role
         )
     return ApproverRoleOut(kind=kind, min_role=policy.min_role_for(kind))
