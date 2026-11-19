@@ -1,13 +1,16 @@
 """Schema-wide guarantees read from the Postgres catalog (DEX-10, DEX-11).
 
 These tests fail when a new table or migration breaks a tenancy rule, before any data exists:
-a table without RLS or without a policy, a table that the isolation tests do not cover, a
-client write grant, a tenant table without `org_id`, or an index that does not start with
-`org_id`.
+a table without RLS (enabled and forced) or without a policy, a table that the isolation tests
+do not cover, a client write grant, a tenant table without `org_id`, an index that does not
+start with `org_id`, a new role that bypasses RLS, or an object in `public` that
+supabase/checks/public_exposure.sql reports.
 """
 
 from __future__ import annotations
 
+from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 
 import psycopg
@@ -24,6 +27,19 @@ TENANT_ROOT = "orgs"
 GLOBAL_TABLES = frozenset({"plans", "team_roles"})
 CLIENT_ROLES = ("anon", "authenticated")
 ALL_TABLE_PRIVILEGES = ("SELECT", "INSERT", "UPDATE", "DELETE", "TRUNCATE", "REFERENCES", "TRIGGER")
+EXPOSURE_CHECK = Path(__file__).resolve().parents[3] / "supabase" / "checks" / "public_exposure.sql"
+
+# Roles that skip every RLS policy, on the pinned local stack (Supabase CLI and Postgres image in
+# .github/workflows/ci.yml). `postgres` owns the tables and the RLS helpers; `service_role` is
+# the control plane; the `supabase_*` roles are Supabase's own. A change to this set needs a
+# security review: a role here reads every tenant's rows.
+BYPASSRLS_ROLES = frozenset(
+    {"postgres", "service_role", "supabase_admin", "supabase_etl_admin", "supabase_read_only_user"}
+)
+# Roles that can create objects in `public`. Each one needs a default-privileges answer in
+# docs/schema.md: `postgres` defaults are revoked by the migrations; `supabase_admin` defaults
+# cannot be changed by `postgres`, so the exposure check covers its objects.
+PUBLIC_CREATOR_ROLES = frozenset({"postgres", "supabase_admin"})
 
 
 def rows(conn: Conn, query: str, params: tuple[object, ...] = ()) -> list[tuple[Any, ...]]:
@@ -77,6 +93,78 @@ def test_rls_is_enabled_with_at_least_one_policy(conn: Conn, table: str) -> None
     assert policies, f"public.{table} has no RLS policy"
 
 
+@pytest.mark.parametrize("table", TABLES)
+def test_rls_is_forced(conn: Conn, table: str) -> None:
+    # FORCE applies RLS to a table owner without BYPASSRLS as well.
+    (forced,) = rows(
+        conn,
+        "select relforcerowsecurity from pg_class where oid = %s::regclass",
+        (f"public.{table}",),
+    )[0]
+    assert forced, f"RLS is not forced on public.{table}"
+
+
+def test_only_the_pinned_roles_bypass_rls(conn: Conn) -> None:
+    found = {name for (name,) in rows(conn, "select rolname from pg_roles where rolbypassrls")}
+    assert found == BYPASSRLS_ROLES
+
+
+def test_only_the_pinned_roles_can_create_in_public(conn: Conn) -> None:
+    found = {
+        name
+        for (name,) in rows(
+            conn,
+            "select rolname from pg_roles where left(rolname, 3) <> 'pg_'"
+            " and has_schema_privilege(oid, 'public', 'CREATE')",
+        )
+    }
+    assert found == PUBLIC_CREATOR_ROLES
+
+
+def exposure_report(conn: Conn) -> list[tuple[str, str, str]]:
+    return [
+        (str(obj), str(owner), str(problem))
+        for obj, owner, problem in conn.execute(EXPOSURE_CHECK.read_text()).fetchall()
+    ]
+
+
+def test_public_exposure_check_is_clean(conn: Conn) -> None:
+    # The same query runs on a hosted project after every push (docs/runbook-deploy.md).
+    assert exposure_report(conn) == []
+
+
+def test_exposure_check_reports_objects_that_supabase_admin_creates_in_public(
+    connect_as: Callable[[str], Conn],
+) -> None:
+    # `postgres` cannot change the default privileges of `supabase_admin`, so a table that
+    # `supabase_admin` creates in `public` still gets client grants with RLS off. Pin that
+    # behaviour, and prove that the exposure check reports the table and the sequence.
+    with connect_as("supabase_admin") as admin:
+        with pytest.raises(psycopg.errors.InsufficientPrivilege):
+            with connect_as("postgres") as other:
+                other.execute(
+                    "alter default privileges for role supabase_admin in schema public"
+                    " revoke all on tables from anon, authenticated"
+                )
+        with admin.transaction(force_rollback=True):
+            admin.execute("create table public.zz_admin_probe (id int)")
+            admin.execute("create sequence public.zz_admin_seq")
+            admin.execute("set local role postgres")
+            report = exposure_report(admin)
+    assert ("public.zz_admin_probe", "supabase_admin", "rls disabled") in report
+    assert ("public.zz_admin_probe", "supabase_admin", "anon has a privilege") in report
+    assert (
+        "public.zz_admin_probe",
+        "supabase_admin",
+        "authenticated has a write privilege",
+    ) in report
+    assert (
+        "public.zz_admin_seq",
+        "supabase_admin",
+        "client role can use the sequence",
+    ) in report
+
+
 def test_policies_are_select_only_for_authenticated(conn: Conn) -> None:
     # Writes go through the control plane (service role). A write policy, or a policy for
     # `anon` or PUBLIC, needs a design change and a new test.
@@ -110,8 +198,13 @@ def test_client_roles_get_select_only(conn: Conn, table: str) -> None:
 
 def test_new_objects_in_public_are_not_granted_to_client_roles(conn: Conn) -> None:
     # Default privileges: a table or function created later starts with no client access.
+    # The migrations revoke them for `postgres`, the role that runs migrations.
+    (user,) = rows(conn, "select current_user")[0]
+    assert user == "postgres"
     conn.execute("create table public.zz_probe (id int)")
+    conn.execute("create sequence public.zz_probe_seq")
     conn.execute("create function public.zz_probe_fn() returns int language sql as 'select 1'")
+    assert ("public.zz_probe", "postgres", "rls disabled") in exposure_report(conn)
     for role in CLIENT_ROLES:
         for privilege in ALL_TABLE_PRIVILEGES:
             assert not rows(
@@ -119,6 +212,11 @@ def test_new_objects_in_public_are_not_granted_to_client_roles(conn: Conn) -> No
             )[0][0], (role, privilege)
         assert not rows(
             conn, "select has_function_privilege(%s, 'public.zz_probe_fn()', 'EXECUTE')", (role,)
+        )[0][0], role
+        assert not rows(
+            conn,
+            "select has_sequence_privilege(%s, 'public.zz_probe_seq', 'USAGE, SELECT, UPDATE')",
+            (role,),
         )[0][0], role
 
 

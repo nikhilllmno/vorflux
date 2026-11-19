@@ -16,8 +16,13 @@ isolation, and tests). Linear: [DEX-10](https://linear.app/dextr-ai/issue/DEX-10
 
 ## Access model
 
-- **Deny by default.** RLS is on for every table in `public`. A table with RLS on and no policy
-  returns no rows to a client.
+- **Deny by default.** RLS is on and forced (`FORCE ROW LEVEL SECURITY`) for every table in
+  `public`. A table with RLS on and no policy returns no rows to a client. Forced RLS also applies
+  to the table owner when the owner role does not have `BYPASSRLS`.
+- **Few roles bypass RLS.** On the local stack these roles have `BYPASSRLS`: `postgres` (owns the
+  tables), `service_role` (the control plane), and Supabase's own `supabase_admin`,
+  `supabase_etl_admin`, and `supabase_read_only_user`. A catalog test pins this exact set and
+  fails when it changes.
 - **Clients read, the control plane writes.** The `anon` role has no privileges. The
   `authenticated` role has `SELECT` only, filtered by the policies below. There are no `INSERT`,
   `UPDATE`, or `DELETE` policies. Every write goes through the control-plane API, which uses the
@@ -28,10 +33,20 @@ isolation, and tests). Linear: [DEX-10](https://linear.app/dextr-ai/issue/DEX-10
 - **Our team's roles grant no data access through RLS.** `code_reviewer` and `platform` rows in
   `team_roles` only let the user see their own role. Break-glass access goes through the control
   plane with an audit event (DEX-24), never through a hidden RLS bypass.
-- **New objects start closed.** The first migration revokes the default grants that Supabase
-  gives `anon` and `authenticated` on new tables, sequences, and functions in `public`, and
-  `supabase/config.toml` sets `auto_expose_new_tables = false`. Each table grants what it needs
-  explicitly.
+- **New objects start closed, for `postgres`.** Only `postgres` and `supabase_admin` can create
+  objects in `public`. The first migration revokes the default grants that Supabase gives `anon`
+  and `authenticated` on new tables, sequences, and functions that `postgres` creates, and
+  `supabase/config.toml` sets `auto_expose_new_tables = false`. Migrations run as `postgres`.
+  Each table grants what it needs explicitly.
+- **Objects from `supabase_admin` are detected, not prevented.** `supabase_admin` also has
+  default grants to `anon` and `authenticated` (all table privileges) in `public`. A migration
+  cannot remove them: `postgres` is not a superuser and gets "permission denied to change default
+  privileges", and Supabase skips a `postgres`-owned event trigger for superuser DDL. So
+  `supabase/checks/public_exposure.sql` lists every object in `public` that has RLS off or not
+  forced, a table without a policy, any `anon` privilege, an `authenticated` write privilege, or
+  client access to a sequence or function. It must return zero rows. CI runs it (catalog tests),
+  and the runbook runs it on a hosted project after every push. A test proves that it reports a
+  table that `supabase_admin` creates.
 
 ## Tables
 
@@ -41,9 +56,9 @@ All ids are `uuid` (`gen_random_uuid()`). Every table has `created_at` and `upda
 
 | Table | Scope | Columns (besides id and timestamps) | Key rules |
 |---|---|---|---|
-| `plans` | Global | `code` (unique), `name`, `max_hotels`, `max_concurrent_runs`, `monthly_budget_usd`, `allowed_runtimes text[]`, `allowed_models text[]` | Limits are positive. `allowed_runtimes` is non-empty and holds only `claude_agent_sdk`, `openai_agents_sdk`, `deep_agents`, `opencode` (the `RuntimeName` ids). An empty `allowed_models` allows no model. |
+| `plans` | Global | `code` (unique), `name`, `max_hotels`, `max_concurrent_runs`, `monthly_budget_usd`, `allowed_runtimes text[]`, `allowed_models text[]` | Limits are positive. `allowed_runtimes` is non-empty, has no duplicates, and holds only `claude_agent_sdk` and `openai_agents_sdk` (the plan-allowed values of `RuntimeKind`; a test keeps the two in step). `allowed_models` has no null, blank, or duplicate element; an empty list allows no model. The database does not check that a model belongs to an allowed runtime; the control plane does (see the PR decisions). |
 | `orgs` | Tenant root (`id` is the org id) | `slug` (unique), `name`, `plan_id` | `plan_id` is required. A plan in use cannot be deleted. |
-| `hotels` | Org | `org_id`, `slug` (globally unique), `name` | `slug` is unique across orgs because the repo is `hotel-<slug>` in one GitHub org (D24). `unique (org_id, id)` is the target of composite foreign keys. `org_id` cannot change. |
+| `hotels` | Org | `org_id`, `slug` (globally unique), `name` | `slug` is unique across orgs because the repo is `hotel-<slug>` in one GitHub org (D24). `unique (org_id, id)` is the target of composite foreign keys. `org_id` and `slug` cannot change (the repo name depends on the slug). |
 | `memberships` | Org, optionally one hotel | `org_id`, `hotel_id` (null = org-wide), `user_id` (`auth.users`), `role` (`owner`, `admin`, `operator`, `viewer`) | `(org_id, hotel_id)` references `hotels (org_id, id)`, so the hotel must belong to the org. One row per `(org_id, user_id, hotel_id)`, nulls not distinct. `owner` is org-wide only. `org_id` and `hotel_id` cannot change. |
 | `team_roles` | Global (our team) | `user_id` (`auth.users`), `role` (`code_reviewer`, `platform`), `reason`, `expires_at` | One row per user and role. `platform` needs `expires_at` and `reason` (time-boxed break-glass, §7.1). |
 
@@ -89,7 +104,7 @@ Nobody sees any row of another org.
 2. Start every composite index with `org_id`. Add an index that starts with `org_id` if none does.
 3. Add `created_at`, `updated_at`, and the triggers `private.set_updated_at()` and
    `private.prevent_tenant_key_change()`.
-4. In the same migration: `enable row level security`, `revoke all ... from public, anon,
+4. In the same migration: `enable row level security`, `force row level security`, `revoke all ... from public, anon,
    authenticated`, `grant all ... to service_role`, `grant select ... to authenticated`, and a
    `for select to authenticated` policy. For a hotel-scoped table the usual policy is
    `using (private.can_read_hotel(org_id, hotel_id))`.
@@ -97,7 +112,8 @@ Nobody sees any row of another org.
    `World.expected_visible`, with seed rows for both orgs.
 
 The tests fail until each step is done: the catalog tests compare the set of tables in `public`
-with `TABLES`, and check RLS, policies, grants, `org_id`, indexes, foreign keys, and triggers.
+with `TABLES`, and check RLS (enabled and forced), policies, grants, `org_id`, indexes, foreign
+keys, triggers, and the exposure check.
 A write policy for clients, or a policy for `anon`, also fails them; that needs a design change.
 
 ## Tests
@@ -105,8 +121,8 @@ A write policy for clients, or a policy for `anon`, also fails them; that needs 
 | File | What it proves |
 |---|---|
 | `backend/tests/rls/test_rls_isolation.py` | Two orgs (A and B), each with two hotels, every hotel role org-wide and hotel-scoped, plus two users that mix roles and scopes (admin of one hotel and viewer of another; org-wide admin of A and viewer of a hotel in B), and users with no membership and with each team role. For every user and table, the visible rows equal the expected set. No user of org A reads, inserts, updates, or deletes a row of org B, and no client role can write its own org either (by privilege, and by RLS alone if privileges were granted by mistake). A hotel-scoped member sees only their hotel, and admin rights never carry into a scope where the user is only a viewer. Also: no `sub` claim reads nothing, `anon` is denied, a removed membership takes effect at once, self-promotion fails. |
-| `backend/tests/rls/test_rls_catalog.py` | Schema-wide rules from the catalog: every `public` table is covered, RLS is on with a policy, policies are select-only for `authenticated`, grants, default privileges for new objects, tenant columns, foreign keys, `org_id`-first indexes, triggers, `SECURITY DEFINER` functions pin `search_path`. |
-| `backend/tests/rls/test_tenancy_constraints.py` | Data rules that hold for the service role too: cross-org hotel in a membership, hotel-scoped owner, duplicate membership, tenant key changes, time-boxed `platform`, unknown runtime ids, global hotel slugs, cascade on org delete, plan in use. |
+| `backend/tests/rls/test_rls_catalog.py` | Schema-wide rules from the catalog: every `public` table is covered, RLS is on and forced with a policy, the `BYPASSRLS` roles and the roles that can create in `public` are pinned, `supabase/checks/public_exposure.sql` returns no rows and reports a table that `supabase_admin` creates, policies are select-only for `authenticated`, grants, default privileges for new objects, tenant columns, foreign keys, `org_id`-first indexes, triggers, `SECURITY DEFINER` functions pin `search_path`. |
+| `backend/tests/rls/test_tenancy_constraints.py` | Data rules that hold for the service role too: cross-org hotel in a membership, hotel-scoped owner, duplicate membership, tenant key changes, time-boxed `platform`, the runtime list matches `RuntimeKind`, bad runtime and model lists, global and fixed hotel slugs, cascade on org delete, plan in use. |
 | `backend/tests/rls/test_local_db_guard.py` | Offline: the local-only guard rejects URLs that libpq could send to another server (`?host=`, `?hostaddr=`, services, several hosts, no host, `PGHOSTADDR` and `PGSERVICE`). |
 | `backend/tests/test_supabase_migrations.py` | Offline (runs in the backend job): migration file names, RLS enabled in the same file as each `create table`, no client write grants, `supabase/config.toml` keeps `private` unexposed and seeds off, `web/` never names the service role. |
 

@@ -75,7 +75,7 @@ India (architecture D25; infra-map, "Regions").
 - **S5 [APPROVAL]** Before the first push: Project settings → Data API → turn off automatic exposure
   of new tables, and keep `private` out of the exposed schemas (matches `supabase/config.toml`; see
   [`schema.md`](schema.md)). Then `supabase db push --dry-run --remote`, then
-  `supabase db push --remote`. Then run Section 4 Supabase checks.
+  `supabase db push --remote`. Then run Section 4 Supabase checks, including the exposure check.
 
 ### Fly.io: API
 
@@ -283,6 +283,7 @@ revert.
 | API | `fly logs -a <app> --no-tail` | no errors or restarts since the deploy |
 | Web | `curl -fsSI https://vorflux-harness-web-staging.vercel.app/` | HTTP 200; page loads and calls the API without CORS errors |
 | Supabase | `supabase migration list --remote` | local and remote columns match |
+| Supabase | after every push: run `supabase/checks/public_exposure.sql` in the dashboard SQL editor (read-only) | zero rows. A row is an object in `public` that clients can reach; fix it before the API uses the project |
 | Supabase | dashboard → Database health; `supabase db lint --remote`; RLS test suite on the same commit is green in CI (the suite runs on a local stack only and refuses hosted hosts) | no errors; tenant tests pass |
 | Sandbox (M2) | test run per runtime; `fly machines list -a <sandbox-app>` | run completes; no machine older than the max run time |
 | Proxy (M2) | proxy logs for the test run | only allow-listed hosts |

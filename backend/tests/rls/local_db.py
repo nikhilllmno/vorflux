@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 
-from psycopg.conninfo import conninfo_to_dict
+from psycopg.conninfo import conninfo_to_dict, make_conninfo
 
 LOCAL_HOSTS = frozenset({"127.0.0.1", "localhost", "::1", "db", "postgres", "supabase_db"})
 
@@ -46,3 +46,12 @@ def check_local_database_url(url: str, environ: Mapping[str, str]) -> str:
     if not host or "," in host or host not in LOCAL_HOSTS:
         raise NonLocalDatabaseError(f"Refusing to run against a non-local host: {host!r}")
     return url
+
+
+def as_database_user(url: str, user: str) -> str:
+    """Return `url` with another login role, for catalog probes that need that role.
+
+    The local Supabase stack uses one password for its built-in roles. The result goes through
+    the local-only guard again before any connection.
+    """
+    return make_conninfo(url, user=user)

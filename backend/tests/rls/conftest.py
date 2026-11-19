@@ -13,13 +13,13 @@ a failure instead of a silent skip.
 from __future__ import annotations
 
 import os
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from typing import Any
 
 import psycopg
 import pytest
 
-from .local_db import NonLocalDatabaseError, check_local_database_url
+from .local_db import NonLocalDatabaseError, as_database_user, check_local_database_url
 from .world import World, seed
 
 
@@ -33,6 +33,21 @@ def _database_url() -> str:
         return check_local_database_url(url, os.environ)
     except NonLocalDatabaseError as exc:
         pytest.fail(f"Refusing to run the isolation tests: {exc}")
+
+
+@pytest.fixture
+def connect_as() -> Callable[[str], psycopg.Connection[Any]]:
+    """Open a separate connection to the same local database as another built-in role."""
+
+    def connect(user: str) -> psycopg.Connection[Any]:
+        url = as_database_user(_database_url(), user)
+        try:
+            check_local_database_url(url, os.environ)
+        except NonLocalDatabaseError as exc:
+            pytest.fail(f"Refusing to connect as {user}: {exc}")
+        return psycopg.connect(url)
+
+    return connect
 
 
 @pytest.fixture(scope="session")

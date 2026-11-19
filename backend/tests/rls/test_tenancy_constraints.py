@@ -13,6 +13,8 @@ import psycopg
 import pytest
 from psycopg import errors
 
+from harness.runtimes.base import RuntimeKind
+
 from .world import World
 
 Conn = psycopg.Connection[Any]
@@ -108,13 +110,98 @@ def test_platform_team_role_is_time_boxed_with_a_reason(conn: Conn) -> None:
     )
 
 
-def test_plan_runtimes_are_known_runtime_ids(conn: Conn) -> None:
+# The runtimes a plan may allow: `RuntimeKind` without the test-only `fake` runtime.
+# TODO(https://github.com/nikhilllmno/vorflux/pull/4): when that PR is on main, `RuntimeKind`
+# lists only these two runtimes. Then replace this constant with
+# `frozenset(kind.value for kind in RuntimeKind if kind is not RuntimeKind.FAKE)`.
+PLAN_RUNTIMES = frozenset({"claude_agent_sdk", "openai_agents_sdk"})
+
+
+def insert_plan(conn: Conn, **limits: object) -> None:
+    columns = ["code", "name", "max_hotels", "max_concurrent_runs", "monthly_budget_usd", *limits]
+    values = [f"p-{uuid.uuid4().hex[:8]}", "Plan", 1, 1, 0, *limits.values()]
+    placeholders = ", ".join(["%s"] * len(values))
+    conn.execute(
+        f"insert into public.plans ({', '.join(columns)}) values ({placeholders})",  # noqa: S608
+        values,
+    )
+
+
+def plan_is_accepted(conn: Conn, **limits: object) -> bool:
+    try:
+        with conn.transaction():
+            insert_plan(conn, **limits)
+    except errors.CheckViolation:
+        return False
+    return True
+
+
+def test_plan_runtime_list_matches_runtime_kind(conn: Conn) -> None:
+    # Every runtime id that the code knows, plus the pinned list, tried one by one. The database
+    # must accept exactly the pinned list, and the pinned list must exist in the code.
+    assert {kind.value for kind in RuntimeKind} >= PLAN_RUNTIMES
+    candidates = {kind.value for kind in RuntimeKind} | PLAN_RUNTIMES
+    accepted = {r for r in candidates if plan_is_accepted(conn, allowed_runtimes=[r])}
+    assert accepted == PLAN_RUNTIMES
+
+
+@pytest.mark.parametrize(
+    "runtimes",
+    [
+        [],
+        ["my_runtime"],
+        ["deep_agents"],
+        ["opencode"],
+        ["fake"],
+        ["claude_agent_sdk", "my_runtime"],
+        ["claude_agent_sdk", "claude_agent_sdk"],
+        ["claude_agent_sdk", None],
+        None,
+    ],
+)
+def test_plan_rejects_bad_runtime_lists(conn: Conn, runtimes: list[str | None] | None) -> None:
+    with pytest.raises((errors.CheckViolation, errors.NotNullViolation)), conn.transaction():
+        insert_plan(conn, allowed_runtimes=runtimes)
+
+
+@pytest.mark.parametrize(
+    "models",
+    [
+        [""],
+        ["  "],
+        [None],
+        ["claude-sonnet-4-5", None],
+        ["claude-sonnet-4-5", "claude-sonnet-4-5"],
+        None,
+    ],
+)
+def test_plan_rejects_bad_model_lists(conn: Conn, models: list[str | None] | None) -> None:
+    with pytest.raises((errors.CheckViolation, errors.NotNullViolation)), conn.transaction():
+        insert_plan(conn, allowed_models=models)
+
+
+def test_service_role_writes_a_valid_plan(conn: Conn) -> None:
+    # The check constraints call a helper in `private`; the control plane role must reach it.
+    conn.execute("set local role service_role")
+    insert_plan(
+        conn,
+        allowed_runtimes=["claude_agent_sdk", "openai_agents_sdk"],
+        allowed_models=["claude-sonnet-4-5", "gpt-5"],
+    )
+    insert_plan(conn, allowed_models=[])
     with pytest.raises(errors.CheckViolation), conn.transaction():
+        insert_plan(conn, allowed_models=["gpt-5", "gpt-5"])
+
+
+def test_hotel_slug_cannot_change(conn: Conn, world: World) -> None:
+    # The slug names the repo `hotel-<slug>` (D24); a rename would break the repo mapping.
+    hotel = world.org("A").hotels[0]
+    with pytest.raises(errors.CheckViolation, match="slug is immutable"), conn.transaction():
         conn.execute(
-            "insert into public.plans (code, name, max_hotels, max_concurrent_runs,"
-            " monthly_budget_usd, allowed_runtimes) values ('bad', 'Bad', 1, 1, 0,"
-            " array['claude_agent_sdk', 'my_runtime'])"
+            "update public.hotels set slug = %s where id = %s", (f"{hotel.slug}-new", hotel.id)
         )
+    # Other columns still change.
+    conn.execute("update public.hotels set name = 'Renamed' where id = %s", (hotel.id,))
 
 
 def test_hotel_slug_is_globally_unique(conn: Conn, world: World) -> None:
