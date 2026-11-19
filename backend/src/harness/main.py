@@ -7,6 +7,7 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 
 from harness import __version__
+from harness.approvals.api import router as approvals_router
 from harness.config import Settings, get_settings
 from harness.runtimes import FakeRuntime, RuntimeRegistry
 
@@ -44,6 +45,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             ]
         }
 
+    app.include_router(approvals_router)
     return app
 
 
