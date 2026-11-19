@@ -10,7 +10,7 @@ from datetime import timedelta
 from uuid import UUID
 
 import pytest
-from approval_world import World
+from approval_world import FakeClock, World
 
 from harness.approvals import (
     ActionKind,
@@ -20,6 +20,7 @@ from harness.approvals import (
     ForbiddenError,
     HotelPolicy,
     HotelRole,
+    InMemoryApprovalStore,
     InMemoryPolicyStore,
     Rule,
 )
@@ -119,3 +120,24 @@ async def test_a_decision_that_reaches_the_decide_deadline_while_waiting_is_refu
     assert stored is not None and stored.status == ApprovalStatus.EXPIRED
     assert "approval.approved" not in world.audit_actions()
     assert (await world.service.consume(request.id, call)).ok is False
+
+
+async def test_a_deadline_seen_only_by_the_store_still_expires_the_request() -> None:
+    # The store's clock is authoritative. Here it runs 2 s ahead of the service clock.
+    store_clock = FakeClock()
+    policies = InMemoryPolicyStore()
+    world = World(policies=policies)
+    policies.audit = world.audit
+    world.approvals = InMemoryApprovalStore(policies, world.audit, store_clock)
+    world.service._approvals = world.approvals
+    _, request = await world.request()
+    world.clock.now = request.expires_at - timedelta(seconds=1)
+    store_clock.now = request.expires_at + timedelta(seconds=1)
+
+    with pytest.raises(ConflictError, match="expired"):
+        await world.approve(request, world.operator)
+
+    stored = await world.approvals.get(request.org_id, request.hotel_id, request.id)
+    assert stored is not None and stored.status == ApprovalStatus.EXPIRED
+    assert world.audit_actions()[-1] == "approval.expired"
+    assert [r.outcome for r in world.resumer.resolutions] == [ApprovalStatus.EXPIRED]

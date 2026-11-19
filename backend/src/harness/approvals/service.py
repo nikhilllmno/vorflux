@@ -443,7 +443,8 @@ class ApprovalService:
                 await self._notify(decided)
                 return decided
             if result == WriteResult.DEADLINE_PASSED:
-                await self._expire_if_due(request, self._clock())
+                # The store's clock is authoritative: expire now, even if this clock trails it.
+                await self._expire(request, max(self._clock(), request.expires_at))
                 raise ConflictError(f"approval is {ApprovalStatus.EXPIRED}")
             # STALE or POLICY_CHANGED: read the request and the policy again.
         raise ConflictError("approval changed; reload it")
@@ -481,6 +482,10 @@ class ApprovalService:
     async def _expire_if_due(self, request: ApprovalRequest, now: datetime) -> ApprovalRequest:
         if not _is_due(request, now):
             return request
+        return await self._expire(request, now)
+
+    async def _expire(self, request: ApprovalRequest, now: datetime) -> ApprovalRequest:
+        """Mark a pending request expired (compare-and-set), audit it, and resume the run."""
         expired = replace(
             request, status=ApprovalStatus.EXPIRED, decided_at=now, version=request.version + 1
         )

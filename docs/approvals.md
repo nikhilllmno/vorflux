@@ -212,9 +212,16 @@ result is a `WriteResult`:
   - A policy write takes `pg_advisory_xact_lock(<hotel key>)` first. A guarded approval write takes
     `pg_advisory_xact_lock_shared(<hotel key>)` first. The lock key is derived from `hotel_id`.
     An advisory lock also covers a hotel with no policy row yet, where a row lock cannot.
-  - The guarded write is one statement in that transaction, followed by the audit insert:
+  - Then the transaction locks the approval row, and checks the guard in a later statement.
+    `clock_timestamp()` is then read after any wait for the row lock. In one statement, Postgres
+    can evaluate the deadline before it waits for a row lock that another writer holds, and then
+    write after that writer rolls back.
 
     ```sql
+    select version from public.approval_requests
+     where id = $1 and org_id = $2 and hotel_id = $3
+       for update;
+
     update public.approval_requests set ... , version = version + 1
      where id = $1 and org_id = $2 and hotel_id = $3 and version = $4
        and coalesce((select p.version from public.approval_policies p
@@ -222,6 +229,7 @@ result is a `WriteResult`:
        and ($6::timestamptz is null or clock_timestamp() < $6);
     ```
 
+  - The transaction keeps both locks until the audit insert commits.
   - If no row changes, the store reads the row version and the policy version in the same
     transaction to return `STALE`, `POLICY_CHANGED` or `DEADLINE_PASSED`.
   - `clock_timestamp()` is the time of the write. `now()` is the start of the transaction and
