@@ -18,9 +18,10 @@ Rules (docs/approvals.md, "Evaluation order"):
 8. Any error: deny.
 """
 
+import hashlib
 import logging
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import timedelta
 from enum import StrEnum
 from types import MappingProxyType
@@ -151,6 +152,36 @@ def validate_approver_min_role(kind: ActionKind, role: HotelRole) -> None:
         raise ValueError("viewers cannot approve; the minimum role is operator")
 
 
+def parse_approver_min_roles(raw: object) -> dict[ActionKind, HotelRole]:
+    """Stored `approver_min_roles` to typed values, without raising. Policy stores use this.
+
+    A bad stored value must not break every read in the hotel, and must not lower the bar:
+    - a key that is not a hotel operation kind is ignored (no hotel role approves it anyway);
+    - a value that is not an allowed minimum role means the strictest role, `owner`;
+    - a value that is not an object means `owner` for every hotel operation kind.
+    """
+    hotel_kinds = [k for k, c in ACTION_CLASSES.items() if c == ActionClass.HOTEL_OPERATION]
+    if not isinstance(raw, Mapping):
+        logger.warning("stored approver_min_roles is not an object; using owner for every kind")
+        return dict.fromkeys(hotel_kinds, HotelRole.OWNER)
+    roles: dict[ActionKind, HotelRole] = {}
+    for key, value in raw.items():
+        if key not in hotel_kinds:
+            logger.warning("ignoring a stored minimum role for a kind that hotels cannot set")
+            continue
+        kind = ActionKind(key)
+        try:
+            role = HotelRole(value) if isinstance(value, str) else None
+            if role is None:
+                raise ValueError("not a string")
+            validate_approver_min_role(kind, role)
+        except ValueError:
+            logger.warning("bad stored minimum role for %s; using owner", kind)
+            role = HotelRole.OWNER
+        roles[kind] = role
+    return roles
+
+
 def hotel_roles_at_least(min_role: HotelRole) -> frozenset[ApproverRole]:
     return frozenset(role for role in HotelRole if role.at_least(min_role))
 
@@ -177,6 +208,14 @@ class Assessment:
     # The stored policy version this decision used (NO_STORED_POLICY for the defaults). A write
     # that relies on the decision passes it to the store in a TransitionGuard.
     policy_version: int | None = None
+    # Extra audit details for a deny. Never raw arguments.
+    audit_details: Mapping[str, str] = field(default_factory=lambda: MappingProxyType({}))
+
+
+def _target_hash(call: ProposedCall, target_id: str) -> str:
+    """A tenant-scoped hash of an agent-supplied target id, for the audit log only."""
+    text = "\n".join((str(call.org_id), str(call.hotel_id), call.toolset, target_id))
+    return "sha256:" + hashlib.sha256(text.encode()).hexdigest()
 
 
 def _deny(call: object, reason: str) -> Assessment:
@@ -258,8 +297,13 @@ class PolicyEngine:
         for target_id in proposal.target_ids() if proposal is not None else ():
             label = await self._target_label(call, target_id)
             if label is None:
-                return _deny(
-                    call, f"target {target_id} is not in the hotel config for {call.toolset}"
+                # The id is agent input and can hold guest data: a fixed reason, and only a
+                # tenant-scoped hash of the id in the audit details.
+                return replace(
+                    _deny(call, f"target is not in the hotel config for {call.toolset}"),
+                    audit_details=MappingProxyType(
+                        {"target_sha256": _target_hash(call, target_id)}
+                    ),
                 )
             targets[target_id] = label
         context = PreviewContext(call.toolset, call.tool, spec.system, targets)

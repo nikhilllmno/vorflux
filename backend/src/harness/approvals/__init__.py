@@ -46,6 +46,7 @@ from harness.approvals.policy import (
     HotelPolicy,
     PolicyEngine,
     Rule,
+    parse_approver_min_roles,
 )
 from harness.approvals.preview import (
     PROPOSAL_TYPES,
@@ -128,6 +129,7 @@ __all__ = [
     "Verdict",
     "WriteResult",
     "canonical_json",
+    "parse_approver_min_roles",
     "proposal_hash",
     "render_preview",
 ]

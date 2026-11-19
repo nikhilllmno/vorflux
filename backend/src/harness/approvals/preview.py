@@ -14,6 +14,9 @@ Rules:
   - the system name and the tool come from the tool registry;
   - a target is an id in the arguments, and its label comes from the hotel config. An unknown
     id gives `Deny`.
+- A card title holds only registry names, hotel-config labels, and closed or validated values:
+  the PMS `setting` and the message `channel` come from fixed lists with fixed labels, and a
+  repository or branch name must match a strict pattern (no spaces). Anything else gives `Deny`.
 - A value that only the agent knows (an old value, a count of guests or records) is shown as
   "agent reported, not checked" (`PreviewField.verified` is False), or left out if absent.
 - Guest data and written content are `sensitive`: only a principal who can decide sees them.
@@ -24,7 +27,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import date
 from types import MappingProxyType
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, field_validator
 
@@ -43,6 +46,39 @@ TargetId = Annotated[str, StringConstraints(min_length=1, max_length=200, patter
 IsoDate = Annotated[str, StringConstraints(pattern=r"^\d{4}-\d{2}-\d{2}$")]
 Scalar = str | int | float | bool | None
 CommitSha = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{7,40}$")]
+RepositoryName = Annotated[
+    str, StringConstraints(max_length=200, pattern=r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+]
+BranchName = Annotated[str, StringConstraints(max_length=200, pattern=r"^[A-Za-z0-9_./-]+$")]
+
+# The PMS settings that a `pms_change` can write, with the words that the card shows. A new
+# setting is a code change, so the agent cannot put its own words in the title.
+PmsSetting = Literal[
+    "rate",
+    "availability",
+    "min_stay",
+    "max_stay",
+    "stop_sell",
+    "closed_to_arrival",
+    "closed_to_departure",
+]
+PMS_SETTING_LABELS: Mapping[str, str] = MappingProxyType(
+    {
+        "rate": "rate",
+        "availability": "availability",
+        "min_stay": "minimum stay",
+        "max_stay": "maximum stay",
+        "stop_sell": "stop sell",
+        "closed_to_arrival": "closed to arrival",
+        "closed_to_departure": "closed to departure",
+    }
+)
+
+# The message channels, with the words that the card title shows.
+MessageChannel = Literal["email", "sms", "whatsapp"]
+MESSAGE_CHANNEL_LABELS: Mapping[str, str] = MappingProxyType(
+    {"email": "an email", "sms": "an SMS", "whatsapp": "a WhatsApp message"}
+)
 
 
 class UnknownTargetError(ValueError):
@@ -70,9 +106,8 @@ class PreviewContext:
     def target_label(self, target_id: str) -> str:
         label = self.targets.get(target_id)
         if label is None:
-            raise UnknownTargetError(
-                f"target {target_id} is not in the hotel config for {self.toolset}"
-            )
+            # A fixed text: the id is agent input and can hold guest data.
+            raise UnknownTargetError(f"target is not in the hotel config for {self.toolset}")
         return label
 
 
@@ -102,10 +137,10 @@ class Proposal(BaseModel):
 
 
 class PmsChange(Proposal):
-    """A rate, inventory, restriction, or booking change in a PMS."""
+    """A rate, availability, or restriction change in a PMS (one of `PmsSetting`)."""
 
     target_id: TargetId  # for example a room type id; the label comes from the hotel config
-    setting: Text  # for example "rate"
+    setting: PmsSetting
     new: Scalar
     date: IsoDate | None = None  # the day the change applies to, if any
     old: Scalar = None  # agent reported
@@ -133,14 +168,15 @@ class PmsChange(Proposal):
         if self.guests_affected is not None:
             fields.append(_reported("Guests affected", self.guests_affected))
         fields.append(context.tool_field())
-        title = f"Change {self.setting} of {target} in {context.system_name()}"
+        setting = PMS_SETTING_LABELS[self.setting]
+        title = f"Change {setting} of {target} in {context.system_name()}"
         return Preview(title, tuple(fields))
 
 
 class MessageSend(Proposal):
     """A guest message or campaign. It cannot be unsent."""
 
-    channel: Text  # for example "email" or "whatsapp"
+    channel: MessageChannel
     recipients: list[Text] = Field(min_length=1, max_length=100)
     subject: Text | None = None
     body: LongText
@@ -152,7 +188,8 @@ class MessageSend(Proposal):
         fields.append(PreviewField("Message", self.body, sensitive=True))
         fields.append(context.tool_field())
         recipients = _plural(len(self.recipients), "recipient")
-        title = f"Send a {self.channel} message to {recipients} via {context.system_name()}"
+        channel = MESSAGE_CHANNEL_LABELS[self.channel]
+        title = f"Send {channel} to {recipients} via {context.system_name()}"
         return Preview(title, tuple(fields))
 
 
@@ -195,8 +232,8 @@ class Delete(Proposal):
 
 
 class GitPush(Proposal):
-    repository: Text
-    branch: Text
+    repository: RepositoryName  # owner/name
+    branch: BranchName
     commit: CommitSha
 
     def preview(self, context: PreviewContext) -> Preview:
@@ -207,8 +244,8 @@ class GitPush(Proposal):
 
 
 class CodeChange(Proposal):
-    repository: Text
-    branch: Text
+    repository: RepositoryName
+    branch: BranchName
     paths: list[Text] = Field(min_length=1, max_length=200)
     description: LongText
 

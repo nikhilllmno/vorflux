@@ -364,7 +364,7 @@ async def test_a_member_who_cannot_decide_sees_a_redacted_card() -> None:
     assert view.full is False
     assert listed == [view]
     assert view.request.preview.text() == (
-        "Send a email message to 1 recipient via Beds24\n"
+        "Send an email to 1 recipient via Beds24\n"
         f"Recipients: {HIDDEN}\nSubject: {HIDDEN}\nMessage: {HIDDEN}\n"
         "Tool: ops/message_send_medium"
     )

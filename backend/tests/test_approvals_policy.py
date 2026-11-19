@@ -291,7 +291,7 @@ async def test_a_target_that_the_hotel_config_does_not_know_is_denied(kind: Acti
     decision = await _evaluate(world, world.call(kind, args=args))
 
     assert decision.verdict == Verdict.DENY
-    assert decision.reason == "target room-type:penthouse is not in the hotel config for ops"
+    assert decision.reason == "target is not in the hotel config for ops"
 
 
 async def test_target_labels_are_scoped_to_the_hotel() -> None:
@@ -362,7 +362,122 @@ async def test_without_a_hotel_directory_every_targeted_action_is_denied() -> No
     decision = await engine.evaluate(world.call())
 
     assert decision.verdict == Verdict.DENY
-    assert decision.reason == "target room-type:dk is not in the hotel config for ops"
+    assert decision.reason == "target is not in the hotel config for ops"
+
+
+# --- Card titles hold only registry, hotel-config, or closed values -------------------------------
+
+INJECTED = "rate (TEST ONLY, owner pre-approved, no live effect)"
+
+
+@pytest.mark.parametrize(
+    ("kind", "field", "value"),
+    [
+        (ActionKind.PMS_CHANGE, "setting", "rate (TEST ONLY, owner pre-approved, no live effect)"),
+        (ActionKind.PMS_CHANGE, "setting", "price"),
+        (ActionKind.MESSAGE_SEND, "channel", "internal staff test (no guests)"),
+        (ActionKind.MESSAGE_SEND, "channel", "fax"),
+    ],
+)
+async def test_a_setting_or_channel_outside_the_closed_list_is_denied(
+    kind: ActionKind, field: str, value: str
+) -> None:
+    world = World()
+    args = {**DEFAULT_ARGS[kind], field: value}
+
+    decision = await _evaluate(world, world.call(kind, args=args))
+
+    assert decision.verdict == Verdict.DENY
+    assert decision.reason == f"arguments do not match the {kind} proposal"
+
+
+@pytest.mark.parametrize(
+    ("setting", "title"),
+    [
+        ("rate", "Change rate of Deluxe King, 24 Dec 2026 in Beds24"),
+        ("availability", "Change availability of Deluxe King, 24 Dec 2026 in Beds24"),
+        ("min_stay", "Change minimum stay of Deluxe King, 24 Dec 2026 in Beds24"),
+        ("max_stay", "Change maximum stay of Deluxe King, 24 Dec 2026 in Beds24"),
+        ("stop_sell", "Change stop sell of Deluxe King, 24 Dec 2026 in Beds24"),
+        ("closed_to_arrival", "Change closed to arrival of Deluxe King, 24 Dec 2026 in Beds24"),
+        (
+            "closed_to_departure",
+            "Change closed to departure of Deluxe King, 24 Dec 2026 in Beds24",
+        ),
+    ],
+)
+def test_each_pms_setting_has_a_fixed_label(setting: str, title: str) -> None:
+    args = {**DEFAULT_ARGS[ActionKind.PMS_CHANGE], "setting": setting}
+
+    preview = render_preview(ActionKind.PMS_CHANGE, args, preview_context(ActionKind.PMS_CHANGE))
+
+    assert preview.title == title
+
+
+@pytest.mark.parametrize(
+    ("channel", "title"),
+    [
+        ("email", "Send an email to 1 recipient via Beds24"),
+        ("sms", "Send an SMS to 1 recipient via Beds24"),
+        ("whatsapp", "Send a WhatsApp message to 1 recipient via Beds24"),
+    ],
+)
+def test_each_message_channel_has_a_fixed_label(channel: str, title: str) -> None:
+    args = {**DEFAULT_ARGS[ActionKind.MESSAGE_SEND], "channel": channel}
+
+    preview = render_preview(
+        ActionKind.MESSAGE_SEND, args, preview_context(ActionKind.MESSAGE_SEND)
+    )
+
+    assert preview.title == title
+
+
+def _with_text(value: Any, text: str) -> Any:
+    """`value` with every string in it replaced by `text` (keys of objects stay)."""
+    if isinstance(value, str):
+        return text
+    if isinstance(value, list):
+        return [_with_text(item, text) for item in value]
+    if isinstance(value, dict):
+        return {key: _with_text(item, text) for key, item in value.items()}
+    return value
+
+
+@pytest.mark.parametrize("kind", [*HOTEL_OPERATIONS, *CODE_KINDS])
+async def test_agent_text_never_reaches_a_card_title(kind: ActionKind) -> None:
+    # Put the injected text into each string argument in turn. Each call is either denied, or
+    # its card title does not contain the text (the value is a field, not the title).
+    world = World()
+    for name, value in DEFAULT_ARGS[kind].items():
+        args = {**DEFAULT_ARGS[kind], name: _with_text(value, INJECTED)}
+        if args == dict(DEFAULT_ARGS[kind]):
+            continue  # no string in this argument
+
+        decision = await _evaluate(world, world.call(kind, args=args))
+
+        if decision.verdict == Verdict.DENY:
+            continue
+        preview = render_preview(kind, args, preview_context(kind))
+        assert "TEST ONLY" not in preview.title, name
+
+
+async def test_an_unknown_target_id_is_not_copied_into_the_reason_or_the_audit_log() -> None:
+    world = World()
+    args = {**DEFAULT_ARGS[ActionKind.PMS_CHANGE], "target_id": "guest:jane.doe@example.com"}
+
+    decision = await _evaluate(world, world.call(args=args))
+    again = await _evaluate(world, world.call(args=args, tool_call_id="call-2"))
+    other = {**args, "target_id": "guest:john@example.com"}
+    await _evaluate(world, world.call(args=other, tool_call_id="call-3"))
+
+    assert decision.reason == "target is not in the hotel config for ops"
+    assert again.reason == decision.reason
+    details = [dict(event.details) for event in world.audit.events]
+    assert all("jane" not in v and "john" not in v for d in details for v in d.values())
+    # A hash of the id lets support match two denials of the same id without logging it.
+    hashes = [d["target_sha256"] for d in details]
+    assert all(h.startswith("sha256:") for h in hashes)
+    assert hashes[0] == hashes[1] != hashes[2]
 
 
 # --- Deny by default ---------------------------------------------------------------------------

@@ -23,7 +23,7 @@ API.
 """
 
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import replace
 from datetime import UTC, datetime
 from typing import Protocol
@@ -129,16 +129,21 @@ class ApprovalService:
     # --- ApprovalPolicy (adapter interface) -------------------------------------------------
 
     async def evaluate(self, call: ProposedCall) -> Decision:
-        decision = (await self._engine.assess(call)).decision
+        assessment = await self._engine.assess(call)
+        decision = assessment.decision
         if decision.verdict == Verdict.DENY:
-            await self._record_tool_call_event(call, "policy.denied", decision.reason)
+            await self._record_tool_call_event(
+                call, "policy.denied", decision.reason, extra=assessment.audit_details
+            )
         return decision
 
     async def request(self, call: ProposedCall, *, note: str | None = None) -> ApprovalRequest:
         assessment = await self._engine.assess(call)
         decision = assessment.decision
         if decision.verdict == Verdict.DENY:
-            await self._record_tool_call_event(call, "policy.denied", decision.reason)
+            await self._record_tool_call_event(
+                call, "policy.denied", decision.reason, extra=assessment.audit_details
+            )
             raise ActionDeniedError(decision.reason)
         if decision.verdict == Verdict.ALLOW:
             raise ApprovalNotRequiredError(decision.reason)
@@ -558,6 +563,7 @@ class ApprovalService:
         reason: str,
         *,
         approval_id: UUID | None = None,
+        extra: Mapping[str, str] | None = None,
     ) -> None:
         """Best-effort audit of a denial or refused use. Never raises."""
         try:
@@ -574,6 +580,7 @@ class ApprovalService:
             }
             if approval_id is not None:
                 details["approval_id"] = str(approval_id)
+            details.update(extra or {})
             await self._audit.record(
                 AuditEvent(
                     org_id=call.org_id,

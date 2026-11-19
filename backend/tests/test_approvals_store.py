@@ -26,6 +26,7 @@ from harness.approvals import (
     DuplicateToolCallError,
     ForbiddenError,
     HotelPolicy,
+    HotelRole,
     InMemoryApprovalStore,
     InMemoryAuditLog,
     InMemoryPolicyStore,
@@ -33,6 +34,7 @@ from harness.approvals import (
     TransitionGuard,
     Verdict,
     WriteResult,
+    parse_approver_min_roles,
 )
 from harness.approvals.model import thaw_json
 from harness.approvals.store import Clock, SyncAuditLog, guard_failure
@@ -164,7 +166,8 @@ class JsonRowPolicyStore:
             org_id=org_id,
             hotel_id=hotel_id,
             rules=tuple(row["rules"]),  # plain dicts of strings
-            approver_min_roles=row["approver_min_roles"],  # plain strings
+            # Stored strings, parsed safely: a bad value cannot break the hotel's reads.
+            approver_min_roles=parse_approver_min_roles(row["approver_min_roles"]),
             approval_ttl=timedelta(seconds=row["approval_ttl"]),
             use_window=timedelta(seconds=row["use_window"]),
             forbid_self_approval_of_high_risk=row["forbid_self_approval_of_high_risk"],
@@ -342,6 +345,48 @@ async def test_stored_string_rules_and_roles_keep_their_meaning(world: World) ->
     assert (send.verdict, read.verdict) == (Verdict.DENY, Verdict.DENY)
     assert pms.verdict == Verdict.ASK
     assert {str(r) for r in pms.approver_roles} == {"admin", "owner"}
+
+
+async def test_a_bad_stored_min_role_fails_closed_for_that_kind_only() -> None:
+    world = _json_world()
+    _, request = await world.request(world.call(ActionKind.MESSAGE_SEND))
+    policies = world.policies
+    assert isinstance(policies, JsonRowPolicyStore)
+    # A row written around the service (for example by hand in SQL), with values that the
+    # service would refuse.
+    policies._rows[(world.org_a, world.hotel_a1)] = json.dumps(
+        {
+            "rules": [],
+            "approver_min_roles": {
+                "message_send": "superuser",
+                "pms_change": "viewer",
+                "git_push": "admin",
+                "no_such_kind": "admin",
+                "delete": 3,
+            },
+            "approval_ttl": 86400,
+            "use_window": 900,
+            "forbid_self_approval_of_high_risk": True,
+            "version": 1,
+        }
+    )
+
+    send = await world.service.evaluate(world.call(ActionKind.MESSAGE_SEND))
+    pms = await world.service.evaluate(world.call())
+    delete = await world.service.evaluate(world.call(ActionKind.DELETE))
+    write = await world.service.evaluate(world.call(ActionKind.EXTERNAL_WRITE))
+
+    # A bad value for a kind means the strictest role (owner); other kinds keep their setting.
+    assert set(send.approver_roles) == {HotelRole.OWNER}
+    assert set(pms.approver_roles) == {HotelRole.OWNER}
+    assert set(delete.approver_roles) == {HotelRole.OWNER}
+    assert set(write.approver_roles) == {HotelRole.OWNER, HotelRole.ADMIN, HotelRole.OPERATOR}
+    # Reads of the hotel's approvals still work: the operator now gets a redacted card.
+    tenant = world.tenant(actor=world.operator)
+    views = await world.service.list_for(world.operator, tenant)
+    view = await world.service.get_for(world.operator, tenant, request.id)
+    assert [v.id for v in views] == [request.id]
+    assert view.full is False
 
 
 async def test_stored_high_risk_blocks_self_approval(world: World) -> None:

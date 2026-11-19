@@ -83,8 +83,20 @@ never the main content, and the card says which values the harness did not check
   - The system ("Beds24") comes from the tool registry (`ToolSpec.system`).
   - The target is an id in the args (`target_id`, for example `room-type:dk`). The harness
     shows the label from the hotel config (`HotelDirectory`, scoped by org, hotel and toolset).
-    An id that the hotel config does not know gives `deny`. With no hotel directory, every
+    An id that the hotel config does not know gives `deny` with a fixed reason ("target is not
+    in the hotel config for ops"). The id is agent input and can hold guest data, so it never
+    goes into the reason or the audit log; the `policy.denied` event holds only
+    `target_sha256`, a hash of org, hotel, toolset and id. With no hotel directory, every
     targeted action is denied.
+  - The rest of a title comes from closed lists or strict patterns, never from free text:
+    - `setting` of a PMS change is one of `rate`, `availability`, `min_stay`, `max_stay`,
+      `stop_sell`, `closed_to_arrival` and `closed_to_departure`. The card shows a fixed label
+      ("minimum stay").
+    - `channel` of a message is one of `email`, `sms` and `whatsapp` ("Send an email to 1
+      recipient via Beds24").
+    - `repository` (`owner/name`) and `branch` of a code action must match a strict pattern
+      with no spaces.
+    - Any other value gives `deny`. A new setting or channel is a code change.
   - Each card ends with the tool (`Tool: ops/set_rate`).
   - A date must be an ISO date (`2026-12-24`); the card shows it as "24 Dec 2026".
 - Values that only the agent reports are marked `verified: false`, and the card labels them
@@ -110,8 +122,8 @@ Example: args `{"target_id": "room-type:dk", "date": "2026-12-24", "setting": "r
 "old": 9000, "new": 99, "guests_affected": 0}` on the registered tool `ops/set_rate` (system
 Beds24) render as "Change rate of Deluxe King, 24 Dec 2026 in Beds24 / From (agent reported, not
 checked): 9000 / To: 99 / Guests affected (agent reported, not checked): 0 / Tool: ops/set_rate".
-An agent note that says "9,900" cannot hide the 99, and the agent cannot rename the system or
-the room.
+An agent note that says "9,900" cannot hide the 99. The agent cannot rename the system, the room or
+the setting, and `"setting": "rate (TEST ONLY)"` gives `deny`.
 
 ### Who sees what
 
@@ -205,7 +217,7 @@ as `high`.
   - A replay: `approval.use_replayed` (from `consume`, with the approval id).
   - Each event has an actor type: `user`, `run` (with the run id) or `system`.
   - The details hold kind, risk, status, run id, tool call id, requester, proposal hash and
-    reason. They never hold the args.
+    reason. They never hold the args. A reason never quotes an argument value.
 - The store writes each state change and its audit event together or not at all
   (`ApprovalStore.add/replace` and `PolicyStore.put` take the event). If the audit write fails,
   the state does not change, so no approval can be used without its audit event.
@@ -224,6 +236,12 @@ as `high`.
   `version`. Two concurrent updates never lose a setting; the loser gets 409.
 - `tests/test_approvals_store.py` is the store contract. A future Postgres store must pass it,
   including the round trip of plain strings.
+- A policy store parses the stored minimum roles with `parse_approver_min_roles`, which never
+  raises. A bad value for a kind means `owner` (the strictest role) for that kind only, and a
+  key that is not a hotel operation kind is ignored. So one bad value cannot break the reads of
+  the whole hotel, and it never lowers the bar. The SQL check below also refuses such a row.
+- A Postgres store writes `preview.redacted()` to `approval_requests.preview`, and the full
+  preview, the args and the note to `approval_request_payloads`, in one transaction.
 
 ## Atomic transitions
 
@@ -359,6 +377,17 @@ create table public.approval_requests (
   constraint approval_requests_tool_call_key unique (org_id, hotel_id, run_id, tool_call_id),
   -- Target of the payload foreign key, so a payload cannot point at another tenant's request.
   constraint approval_requests_tenant_key unique (id, org_id, hotel_id),
+  -- Redaction holds in the database: each field has a string value and a boolean
+  -- `sensitive`, and a sensitive field holds only the hidden text.
+  constraint approval_requests_preview_redacted check (
+    coalesce(jsonb_typeof(preview -> 'fields'), 'missing') = 'array'
+    and not jsonb_path_exists(
+      preview,
+      '$.fields[*] ? (!(@.sensitive.type() == "boolean") || !(@.value.type() == "string")
+                      || (@.sensitive == true
+                          && !(@.value == "(hidden: only approvers see this)")))'
+    )
+  ),
   constraint approval_requests_decided check
     ((status = 'pending') = (decided_at is null)),
   constraint approval_requests_decider check
@@ -397,6 +426,17 @@ create table public.approval_policies (
   forbid_self_approval_of_high_risk boolean not null default true,
   version integer not null default 0,
   primary key (org_id, hotel_id),
+  -- Only hotel operation kinds, and only the minimum roles that the service allows.
+  constraint approval_policies_min_roles_check check (
+    jsonb_typeof(approver_min_roles) = 'object'
+    and not jsonb_path_exists(
+      approver_min_roles,
+      '$.keyvalue() ? (!(@.key == "message_send" || @.key == "pms_change"
+                         || @.key == "external_write" || @.key == "delete")
+                       || !(@.value.type() == "string")
+                       || !(@.value == "owner" || @.value == "admin" || @.value == "operator"))'
+    )
+  ),
   constraint approval_policies_hotel_fk
     foreign key (org_id, hotel_id) references public.hotels (org_id, id) on delete cascade
 );
@@ -420,6 +460,7 @@ grant select on table
 -- request's approver snapshot and at or above the hotel's current minimum role for the kind
 -- (default operator). Enum order is owner < admin < operator < viewer, so "at or above" is <=.
 -- Code requests snapshot only 'code_reviewer', which no hotel role matches.
+-- The minimum role is mapped, not cast, so a bad stored value means owner and never raises.
 create function private.can_see_approval_payload(target_approval_id uuid)
 returns boolean
 language sql
@@ -439,10 +480,12 @@ as $$
     where r.id = target_approval_id
       and m.user_id = (select auth.uid())
       and m.role::text = any (r.approver_roles)
-      and m.role <= coalesce(
-        (p.approver_min_roles ->> r.kind)::public.hotel_role,
-        'operator'::public.hotel_role
-      )
+      and m.role <= case coalesce(p.approver_min_roles ->> r.kind, 'operator')
+        when 'owner' then 'owner'::public.hotel_role
+        when 'admin' then 'admin'::public.hotel_role
+        when 'operator' then 'operator'::public.hotel_role
+        else 'owner'::public.hotel_role
+      end
   );
 $$;
 
