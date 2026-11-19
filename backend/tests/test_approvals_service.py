@@ -9,7 +9,7 @@ from typing import Any
 from uuid import UUID, uuid4
 
 import pytest
-from approval_world import DEFAULT_ARGS, World
+from approval_world import DEFAULT_ARGS, FakeClock, World
 
 from harness.approvals import (
     ActionDeniedError,
@@ -23,6 +23,7 @@ from harness.approvals import (
     ConflictError,
     Effect,
     InMemoryApprovalStore,
+    InMemoryAuditLog,
     InMemoryPolicyStore,
     ProposedCall,
     RiskLevel,
@@ -53,7 +54,10 @@ async def test_request_creates_a_pending_approval_with_a_harness_preview() -> No
     assert (request.run_id, request.tool_call_id) == ("run-1", "call-1")
     assert request.preview.text() == (
         "Change rate of Deluxe King, 24 Dec 2026 in Beds24\n"
-        "From: 9000\nTo: 9900\nGuests affected: 0"
+        "From (agent reported, not checked): 9000\n"
+        "To: 9900\n"
+        "Guests affected (agent reported, not checked): 0\n"
+        "Tool: ops/pms_change_medium"
     )
     assert request.note == "Guests asked for a higher rate on Christmas"
     assert world.audit_actions() == ["approval.requested"]
@@ -163,29 +167,147 @@ async def test_approve_resumes_the_run_and_consume_returns_the_approved_argument
     assert consumed.details["requester_id"] == str(world.requester.user_id)
 
 
-async def test_replay_of_a_used_approval_is_refused_and_audited() -> None:
+# Review 2 (N1): `consume` is idempotent per tool call. A repeat for the same approval and tool
+# call returns the same grant (the executor dedupes on the idempotency key). Anything else is
+# still refused.
+
+
+async def test_a_repeated_use_by_the_same_tool_call_returns_the_same_grant() -> None:
+    world = World()
+    call, request = await world.request()
+    await world.approve(request, world.operator)
+    first = await world.service.consume(request.id, call)
+
+    again = await world.service.consume(request.id, call)
+
+    assert (first.ok, first.replayed) == (True, False)
+    assert (again.ok, again.replayed) == (True, True)
+    assert again.idempotency_key == first.idempotency_key == str(request.id)
+    assert dict(again.args or {}) == dict(first.args or {}) == PMS_ARGS
+    assert world.audit_actions() == [
+        "approval.requested",
+        "approval.approved",
+        "approval.consumed",
+        "approval.use_replayed",
+    ]
+    assert world.audit.events[-1].details["approval_id"] == str(request.id)
+    # `check` is read-only and still says that the approval is used.
+    checked = await world.service.check(request.id, call)
+    assert (checked.ok, checked.reason) == (False, "approval was already used")
+
+
+async def test_a_used_approval_is_refused_for_another_tool_call() -> None:
     world = World()
     call, request = await world.request()
     await world.approve(request, world.operator)
     await world.service.consume(request.id, call)
 
-    replay = await world.service.consume(request.id, call)
+    other = await world.service.consume(request.id, replace(call, tool_call_id="call-2"))
+    changed = await world.service.consume(request.id, replace(call, args={**PMS_ARGS, "new": 1}))
 
-    assert (replay.ok, replay.reason) == (False, "approval was already used")
-    assert (await world.service.check(request.id, call)).ok is False
-    assert world.audit_actions()[-1] == "approval.use_refused"
-    assert world.audit.events[-1].details["reason"] == "approval was already used"
+    assert (other.ok, other.reason) == (False, "approval belongs to another tool call")
+    assert (changed.ok, changed.reason) == (
+        False,
+        "action changed after approval; a new approval is needed",
+    )
+    assert world.audit_actions()[-2:] == ["approval.use_refused", "approval.use_refused"]
 
 
-async def test_concurrent_use_wins_only_once() -> None:
+async def test_a_repeated_use_is_refused_when_the_policy_now_denies_it() -> None:
+    world = World()
+    call, request = await world.request()
+    await world.approve(request, world.operator)
+    await world.service.consume(request.id, call)
+    await world.set_policy(rules=(Rule(ActionKind.PMS_CHANGE, Effect.DENY),))
+
+    again = await world.service.consume(request.id, call)
+
+    assert again.ok is False
+    assert again.reason.startswith("the policy now denies this action")
+
+
+async def test_a_repeated_use_is_refused_after_the_use_window() -> None:
+    world = World()
+    call, request = await world.request()
+    await world.approve(request, world.operator)
+    await world.service.consume(request.id, call)
+    world.clock.advance(timedelta(minutes=15))
+
+    again = await world.service.consume(request.id, call)
+
+    assert (again.ok, again.reason) == (False, "approval expired")
+
+
+class PausingApprovalStore(InMemoryApprovalStore):
+    """Once armed, applies the next write and then waits. A test cancels the caller there."""
+
+    def __init__(self, *args: Any) -> None:
+        super().__init__(*args)
+        self.armed = False
+        self.written = asyncio.Event()
+
+    async def replace(self, *args: Any, **kwargs: Any) -> Any:
+        result = await super().replace(*args, **kwargs)
+        if self.armed:
+            self.armed = False
+            self.written.set()
+            await asyncio.Event().wait()
+        return result
+
+
+async def test_a_use_cancelled_after_the_store_write_can_be_retried() -> None:
+    # Review probe: the task stops after `consumed_at` is stored but before the grant returns.
+    audit, clock = InMemoryAuditLog(), FakeClock()
+    policies = InMemoryPolicyStore(audit)
+    store = PausingApprovalStore(policies, audit, clock)
+    world = World(clock=clock, audit=audit, policies=policies, approvals=store)
+    call, request = await world.request()
+    await world.approve(request, world.operator)
+
+    store.armed = True
+    task = asyncio.create_task(world.service.consume(request.id, call))
+    await store.written.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    stored = await store.get(world.org_a, world.hotel_a1, request.id)
+    assert stored is not None and stored.consumed_at is not None
+
+    retry = await world.service.consume(request.id, call)
+
+    assert (retry.ok, retry.replayed) == (True, True)
+    assert retry.idempotency_key == str(request.id)
+    assert dict(retry.args or {}) == PMS_ARGS
+    assert world.audit_actions().count("approval.consumed") == 1
+
+
+async def test_concurrent_use_writes_once_and_every_caller_gets_the_same_grant() -> None:
     world = World()
     call, request = await world.request()
     await world.approve(request, world.operator)
 
     results = await asyncio.gather(*(world.service.consume(request.id, call) for _ in range(5)))
 
-    assert sorted(r.ok for r in results) == [False, False, False, False, True]
+    assert all(r.ok for r in results)
+    assert sorted(r.replayed for r in results) == [False, True, True, True, True]
+    assert {r.idempotency_key for r in results} == {str(request.id)}
     assert world.audit_actions().count("approval.consumed") == 1
+
+
+async def test_a_target_label_change_after_approval_needs_a_new_approval() -> None:
+    # The preview is part of the hash: if the hotel config renames the target, the approver
+    # saw something else, so the use is refused (fail closed).
+    world = World()
+    call, request = await world.request()
+    await world.approve(request, world.operator)
+    world.directory.set_label(world.org_a, world.hotel_a1, "ops", "room-type:dk", "Suite")
+
+    result = await world.service.consume(request.id, call)
+
+    assert (result.ok, result.reason) == (
+        False,
+        "action changed after approval; a new approval is needed",
+    )
 
 
 async def test_reject_resumes_the_run_and_the_action_cannot_run() -> None:
@@ -310,7 +432,8 @@ async def test_approval_is_bound_to_its_tool_call_id() -> None:
     "change",
     [
         {"args": {**PMS_ARGS, "new": 99000}},
-        {"args": {**PMS_ARGS, "target": "Suite, 24 Dec 2026"}},
+        {"args": {**PMS_ARGS, "target_id": "room-type:suite"}},
+        {"args": {**PMS_ARGS, "date": "2026-12-25"}},
         {"args": {**PMS_ARGS, "guests_affected": 3}},
         {"tool": "pms_change_low"},
         {"toolset": "reports"},
@@ -491,6 +614,40 @@ async def test_resumer_failure_does_not_undo_the_decision_and_can_be_recovered()
     other = world.tenant(actor=world.operator)
     assert await world.service.resolution(other, request.id) is None  # not their run
     assert (await world.service.consume(request.id, call)).ok is True
+
+
+class BlockingResumer:
+    def __init__(self) -> None:
+        self.entered = asyncio.Event()
+
+    async def resume(self, resolution: ApprovalResolution) -> None:
+        self.entered.set()
+        await asyncio.Event().wait()  # the orchestrator hangs
+
+
+@pytest.mark.parametrize("approve", [True, False])
+async def test_a_decision_cancelled_while_it_resumes_the_run_is_kept_and_recoverable(
+    approve: bool,
+) -> None:
+    # Review probe (N3): the decision is stored, then the task stops inside `RunResumer.resume`.
+    # The orchestrator recovers the outcome with `resolution()` (regular polling is DEX-16).
+    world = World()
+    resumer = BlockingResumer()
+    world.service._resumer = resumer
+    call, request = await world.request()
+    decide = world.approve if approve else world.reject
+
+    task = asyncio.create_task(decide(request, world.operator))
+    await resumer.entered.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    resolution = await world.service.resolution(world.tenant(), request.id)
+    expected = ApprovalStatus.APPROVED if approve else ApprovalStatus.REJECTED
+    assert resolution is not None
+    assert (resolution.outcome, resolution.tool_call_id) == (expected, "call-1")
+    assert (await world.service.consume(request.id, call)).ok is approve
 
 
 class FailingAudit:

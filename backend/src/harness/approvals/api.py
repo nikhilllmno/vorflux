@@ -9,6 +9,9 @@ The routes fail closed until their two dependencies exist:
   store. Tests set both.
 
 Another tenant's ids return 404, never 403 (docs/architecture.md Section 7.4).
+
+A card is `redacted` for a principal who cannot decide the request: sensitive preview values
+are hidden and the note is left out (docs/approvals.md, "Who sees what").
 """
 
 from collections.abc import Iterator
@@ -22,8 +25,8 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from harness.approvals.model import (
     ActionKind,
-    ApprovalRequest,
     ApprovalStatus,
+    ApprovalView,
     HotelRole,
     Principal,
     RiskLevel,
@@ -56,6 +59,8 @@ ServiceDep = Annotated[ApprovalService, Depends(get_approval_service)]
 class PreviewFieldOut(BaseModel):
     label: str
     value: str
+    verified: bool  # False: the agent reported this value; the harness did not check it
+    sensitive: bool  # True: hidden on a redacted card
 
 
 class PreviewOut(BaseModel):
@@ -66,8 +71,10 @@ class PreviewOut(BaseModel):
 class ApprovalOut(BaseModel):
     """The approval card.
 
-    `preview` is rendered by the harness from the bound arguments, so it shows every argument
-    that the approval binds to. `note` is optional agent text, shown as context only.
+    `preview` is rendered by the harness from the bound arguments, the tool registry, and the
+    hotel config, so it shows every argument that the approval binds to. `note` is optional
+    agent text, shown as context only. On a `redacted` card the sensitive values are hidden and
+    `note` is null.
     """
 
     id: UUID
@@ -90,9 +97,11 @@ class ApprovalOut(BaseModel):
     use_by: datetime | None
     reason: str | None
     used: bool
+    redacted: bool
 
     @classmethod
-    def of(cls, request: ApprovalRequest) -> "ApprovalOut":
+    def of(cls, view: ApprovalView) -> "ApprovalOut":
+        request = view.request
         return cls(
             id=request.id,
             run_id=request.run_id,
@@ -114,6 +123,7 @@ class ApprovalOut(BaseModel):
             use_by=request.use_by,
             reason=request.reason,
             used=request.consumed_at is not None,
+            redacted=not view.full,
         )
 
 
@@ -171,7 +181,7 @@ async def list_approvals(
     with _errors():
         tenant = _tenant(principal, org_id, hotel_id)
         rows = await service.list_for(principal, tenant, status_filter)
-    return ApprovalList(approvals=[ApprovalOut.of(row) for row in rows])
+    return ApprovalList(approvals=[ApprovalOut.of(view) for view in rows])
 
 
 @router.get("/approvals/{approval_id}")
@@ -180,8 +190,8 @@ async def get_approval(
 ) -> ApprovalOut:
     with _errors():
         tenant = _tenant(principal, org_id, hotel_id)
-        request = await service.get_for(principal, tenant, approval_id)
-    return ApprovalOut.of(request)
+        view = await service.get_for(principal, tenant, approval_id)
+    return ApprovalOut.of(view)
 
 
 @router.post("/approvals/{approval_id}/approve")
@@ -197,7 +207,8 @@ async def approve(
         decided = await service.approve(
             principal, _tenant(principal, org_id, hotel_id), approval_id, body.reason
         )
-    return ApprovalOut.of(decided)
+    # Only a principal who can decide gets here, so the card is full.
+    return ApprovalOut.of(ApprovalView.of(decided, full=True))
 
 
 @router.post("/approvals/{approval_id}/reject")
@@ -213,7 +224,8 @@ async def reject(
         decided = await service.reject(
             principal, _tenant(principal, org_id, hotel_id), approval_id, body.reason
         )
-    return ApprovalOut.of(decided)
+    # Only a principal who can decide gets here, so the card is full.
+    return ApprovalOut.of(ApprovalView.of(decided, full=True))
 
 
 @router.put("/approval-policy/approvers/{kind}")

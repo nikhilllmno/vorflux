@@ -16,7 +16,7 @@ class ApprovalPolicy(Protocol):
     async def evaluate(self, call: ProposedCall) -> Decision: ...  # verdict: allow | ask | deny
     async def request(self, call: ProposedCall, *, note: str | None = None) -> ApprovalRequest: ...
     async def check(self, approval_id: UUID, call: ProposedCall) -> ApprovalCheck: ...    # read-only
-    async def consume(self, approval_id: UUID, call: ProposedCall) -> ApprovalCheck: ...  # single use
+    async def consume(self, approval_id: UUID, call: ProposedCall) -> ApprovalCheck: ...  # one use per tool call
 ```
 
 `ProposedCall` holds the `TenantContext`, `run_id`, `tool_call_id` (the `call_id` of the
@@ -37,6 +37,13 @@ Flow for one gated tool call:
 3. On `approved`, the control plane calls `consume(approval_id, call)` at the point where it
    performs the write. Run the tool only when `ok` is True, with `args` and `idempotency_key`
    from the result. On any other outcome, do not run the tool.
+   - `consume` is idempotent per tool call. If the caller was cancelled after the store write
+     (for example, a timeout), a retry of `consume` for the same approval and the same tool call
+     returns the same `args` and `idempotency_key`, with `replayed=True`. The executor must
+     dedupe the write on `idempotency_key`, so a replay never writes twice.
+   - A replay passes every other check again: the run, the requester, the tool call id, the
+     current policy, the proposal hash, and `use_by`. After `use_by`, a replay is refused.
+   - `consume` for another tool call, and `check`, refuse a used approval.
 
 **Where `consume` runs.** `consume` runs in the control plane (the harness MCP server or the
 operation executor), at the point of the write, never in the sandboxed adapter. The adapter runs
@@ -55,35 +62,67 @@ Fail closed (deny by default):
 
 ## The tool registry
 
-`ToolCatalog` maps each `(toolset, tool)` to a `ToolSpec` with its `kind` and `risk`
-(`catalog.py`). It is the only source of an action's kind and risk. An unregistered tool is
+`ToolCatalog` maps each `(toolset, tool)` to a `ToolSpec` with its `kind`, `risk` and `system`
+(`catalog.py`). It is the only source of an action's kind and risk, and of the system name that
+the approval card shows ("Beds24"). A hotel operation tool without a system cannot register. An unregistered tool is
 denied, whatever its name suggests. Each harness MCP tool pack registers its tools when the
 control plane starts. The default registry is empty, so everything is denied until a pack
 registers.
 
 ## The preview the approver sees
 
-The harness renders the approval card from the args (Section 10.10 steps 1 and 2). Free text
-from the agent is never the main content.
+The harness renders the approval card (Section 10.10 steps 1 and 2). Free text from the agent is
+never the main content, and the card says which values the harness did not check.
 
 - Each kind that can ask has a strict pydantic proposal type (`preview.py`): `PmsChange`,
   `MessageSend`, `ExternalWrite`, `Delete`, `GitPush` and `CodeChange`.
   - Unknown fields are refused, and values are not coerced.
   - So every argument that the approval binds to appears in the preview.
   - Args that do not fit the proposal type give `deny`.
+- The card takes its names from trusted sources, never from the args:
+  - The system ("Beds24") comes from the tool registry (`ToolSpec.system`).
+  - The target is an id in the args (`target_id`, for example `room-type:dk`). The harness
+    shows the label from the hotel config (`HotelDirectory`, scoped by org, hotel and toolset).
+    An id that the hotel config does not know gives `deny`. With no hotel directory, every
+    targeted action is denied.
+  - Each card ends with the tool (`Tool: ops/set_rate`).
+  - A date must be an ISO date (`2026-12-24`); the card shows it as "24 Dec 2026".
+- Values that only the agent reports are marked `verified: false`, and the card labels them
+  "(agent reported, not checked)": the old value and the guests affected of a PMS change, and the
+  record count and guests affected of a delete. They are left out when the agent gives none.
+  `TODO(DEX-19)`: read the old value from the PMS and mark it checked.
+- Some values are `sensitive`: message recipients, subject and body, the changes of an external
+  write, and every argument of a read. Only a principal who can decide the request sees them
+  (see "Who sees what").
 - A `read` that a rule makes ask lists every argument.
 - `note` is optional agent text. The approver sees it as context only, and it is not bound.
-- The approval binds to `proposal_hash`, a SHA-256 over canonical JSON of these fields:
+- The approval binds to `proposal_hash` (document version 3), a SHA-256 over canonical JSON of
+  these fields:
   - org and hotel;
   - toolset and tool;
   - kind and risk;
   - args;
-  - the rendered preview.
-- A change to the args, or to what the approver saw, needs a new approval.
+  - the rendered preview, with the `verified` and `sensitive` flags.
+- A change to the args, or to what the approver saw (also a new target label in the hotel
+  config), needs a new approval.
 
-Example: args `{"system": "Beds24", "target": "Deluxe King, 24 Dec 2026", "setting": "rate",
-"old": 9000, "new": 99}` render as "Change rate of Deluxe King, 24 Dec 2026 in Beds24 / From:
-9000 / To: 99 / Guests affected: 0". An agent note that says "9,900" cannot hide the 99.
+Example: args `{"target_id": "room-type:dk", "date": "2026-12-24", "setting": "rate",
+"old": 9000, "new": 99, "guests_affected": 0}` on the registered tool `ops/set_rate` (system
+Beds24) render as "Change rate of Deluxe King, 24 Dec 2026 in Beds24 / From (agent reported, not
+checked): 9000 / To: 99 / Guests affected (agent reported, not checked): 0 / Tool: ops/set_rate".
+An agent note that says "9,900" cannot hide the 99, and the agent cannot rename the system or
+the room.
+
+### Who sees what
+
+- A principal who can decide the request (the role check of "Roles", without the self-approval
+  rule) sees the full card: every value, the args, and the note.
+- Every other principal who can see the request (for example a hotel `viewer`, or a hotel member
+  on a code request) gets a redacted card: sensitive values read
+  "(hidden: only approvers see this)", the args are empty, and the note is left out. The title,
+  the status and the fields that are not sensitive stay.
+- The API marks a redacted card with `redacted: true`.
+- A raised minimum role also hides the card from the roles below it.
 
 ## Evaluation order
 
@@ -95,7 +134,8 @@ Example: args `{"system": "Beds24", "target": "Deluxe King, 24 Dec 2026", "setti
 4. `deny` gives `deny`.
 5. `allow` gives `allow` only for a read-only tool below `high` risk. A hotel operation (D19), a
    code action, or a `high` risk action asks. There is no yolo mode and no rule that skips this.
-6. Render the preview. Args that do not fit the kind give `deny`.
+6. Parse the args into the kind's proposal type, look up each target id in the hotel config, and
+   render the preview. Args that do not fit the kind, or an unknown target id, give `deny`.
 7. `ask` carries the approver roles:
    - code kinds (`git_push`, `code_change`): `code_reviewer` only;
    - hotel operations: the hotel roles at or above the hotel's minimum role for that kind
@@ -147,13 +187,14 @@ as `high`.
   to 24 h). An approval given just before `expires_at` still has the full use window.
 - `consume` checks again at the time of use:
   - the status;
-  - single use;
+  - one use: a used approval passes only for a repeat by the same tool call (a replay);
   - `use_by`;
   - the run, the requester and the tool call id;
   - the current policy and registry (a deny rule added after approval wins);
   - the proposal hash.
 - If all pass, `consume` sets `consumed_at` with a guarded compare-and-set on `version` (see
-  "Atomic transitions"). Only one caller wins.
+  "Atomic transitions"). Only one caller writes; concurrent callers for the same tool call get
+  the same grant as a replay.
 - Only the requester can cancel a pending request.
 - Audit events:
   - State changes: `approval.requested`, `approval.approved`, `approval.rejected`,
@@ -161,6 +202,7 @@ as `high`.
     The policy event includes the previous value.
   - Denials and refusals: `policy.denied` (from `evaluate` and `request`) and
     `approval.use_refused` (from `consume`, with the reason).
+  - A replay: `approval.use_replayed` (from `consume`, with the approval id).
   - Each event has an actor type: `user`, `run` (with the run id) or `system`.
   - The details hold kind, risk, status, run id, tool call id, requester, proposal hash and
     reason. They never hold the args.
@@ -172,6 +214,10 @@ as `high`.
 - A decision calls `RunResumer.resume(ApprovalResolution)`. A resumer error is logged and does
   not undo the decision. The orchestrator recovers the outcome with
   `ApprovalService.resolution(tenant, approval_id)`, scoped to the requester's run.
+  - If the decision call is cancelled while it resumes the run (for example, the HTTP client
+    goes away), the decision is already stored and audited, but `resume` may not run. So the
+    orchestrator must not rely on `resume` alone. `TODO(DEX-16)`: poll `resolution()` for each
+    paused run (on start and on a timer) and resume the run from it.
 - Staff operations take the caller's `Principal` (role checks) and an explicit `TenantContext`
   (storage scope). The API builds the `TenantContext` from the path once, at the edge.
 - A policy update reads the stored policy once and writes it with a compare-and-set on
@@ -268,11 +314,12 @@ This SQL is a proposal for review. It is not in `supabase/migrations/`.
 - It depends on the PR #5 tenancy schema (https://github.com/nikhilllmno/vorflux/pull/5):
   - the tables `public.orgs` and `public.hotels`, with the `hotels (org_id, id)` unique key;
   - the enum `public.hotel_role`;
-  - the functions `private.can_read_hotel` and `private.has_hotel_role`.
+  - the table `public.memberships`;
+  - the function `private.can_read_hotel`.
 - It follows the PR #5 style:
   - RLS is on and forced in the same migration that creates the table;
   - deny by default;
-  - `anon` gets nothing, and `authenticated` gets SELECT through one policy;
+  - `anon` gets nothing, and `authenticated` gets SELECT through one policy per table;
   - there are no write policies.
 
 ```sql
@@ -291,10 +338,11 @@ create table public.approval_requests (
   kind text not null check (kind in ('read', 'git_push', 'code_change', 'message_send',
                                      'pms_change', 'external_write', 'delete')),
   risk text not null check (risk in ('low', 'medium', 'high')),
-  args jsonb not null check (jsonb_typeof(args) = 'object'),
-  preview jsonb not null,           -- {title, fields: [{label, value}]}, rendered by the harness
+  -- The redacted card that every hotel member may read: {title, fields: [{label, value,
+  -- verified, sensitive}]}, sensitive values hidden. The args, the full card and the note are
+  -- in approval_request_payloads.
+  preview jsonb not null,
   proposal_hash text not null check (proposal_hash like 'sha256:%'),
-  note text check (char_length(note) <= 2000),
   approver_roles text[] not null check (cardinality(approver_roles) > 0),
   status public.approval_status not null default 'pending',
   created_at timestamptz not null default now(),
@@ -309,6 +357,8 @@ create table public.approval_requests (
     foreign key (org_id, hotel_id) references public.hotels (org_id, id) on delete cascade,
   -- One approval per tool call.
   constraint approval_requests_tool_call_key unique (org_id, hotel_id, run_id, tool_call_id),
+  -- Target of the payload foreign key, so a payload cannot point at another tenant's request.
+  constraint approval_requests_tenant_key unique (id, org_id, hotel_id),
   constraint approval_requests_decided check
     ((status = 'pending') = (decided_at is null)),
   constraint approval_requests_decider check
@@ -321,6 +371,19 @@ create table public.approval_requests (
 
 create index approval_requests_inbox
   on public.approval_requests (org_id, hotel_id, status, created_at);
+
+-- What only a principal who can decide sees: the bound args, the full card, and the agent note.
+create table public.approval_request_payloads (
+  approval_id uuid primary key,
+  org_id uuid not null,
+  hotel_id uuid not null,
+  args jsonb not null check (jsonb_typeof(args) = 'object'),
+  preview jsonb not null,           -- the full card, rendered by the harness
+  note text check (char_length(note) <= 2000),
+  constraint approval_request_payloads_request_fk
+    foreign key (approval_id, org_id, hotel_id)
+    references public.approval_requests (id, org_id, hotel_id) on delete cascade
+);
 
 create table public.approval_policies (
   org_id uuid not null references public.orgs (id) on delete cascade,
@@ -340,12 +403,51 @@ create table public.approval_policies (
 
 -- Row level security on and forced, no client privileges (deny by default).
 alter table public.approval_requests enable row level security;
+alter table public.approval_request_payloads enable row level security;
 alter table public.approval_policies enable row level security;
 alter table public.approval_requests force row level security;
+alter table public.approval_request_payloads force row level security;
 alter table public.approval_policies force row level security;
 
-revoke all on table public.approval_requests, public.approval_policies from anon, authenticated;
-grant select on table public.approval_requests, public.approval_policies to authenticated;
+revoke all on table
+  public.approval_requests, public.approval_request_payloads, public.approval_policies
+  from anon, authenticated;
+grant select on table
+  public.approval_requests, public.approval_request_payloads, public.approval_policies
+  to authenticated;
+
+-- True when the caller holds a hotel role that may decide this request: the role is in the
+-- request's approver snapshot and at or above the hotel's current minimum role for the kind
+-- (default operator). Enum order is owner < admin < operator < viewer, so "at or above" is <=.
+-- Code requests snapshot only 'code_reviewer', which no hotel role matches.
+create function private.can_see_approval_payload(target_approval_id uuid)
+returns boolean
+language sql
+stable
+security definer
+set search_path = ''
+as $$
+  select exists (
+    select 1
+    from public.approval_requests r
+    join public.memberships m
+      on m.org_id = r.org_id
+     and (m.hotel_id is null or m.hotel_id = r.hotel_id)
+    left join public.approval_policies p
+      on p.org_id = r.org_id
+     and p.hotel_id = r.hotel_id
+    where r.id = target_approval_id
+      and m.user_id = (select auth.uid())
+      and m.role::text = any (r.approver_roles)
+      and m.role <= coalesce(
+        (p.approver_min_roles ->> r.kind)::public.hotel_role,
+        'operator'::public.hotel_role
+      )
+  );
+$$;
+
+revoke all on function private.can_see_approval_payload(uuid) from public;
+grant execute on function private.can_see_approval_payload(uuid) to authenticated, service_role;
 
 -- Members of the hotel (org-wide or this hotel) read its approval requests, code requests
 -- included. Team roles grant no tenant data access here (PR #5); code reviewers read code
@@ -354,12 +456,17 @@ create policy approval_requests_select_hotel_members on public.approval_requests
   for select to authenticated
   using (private.can_read_hotel(org_id, hotel_id));
 
+-- Only a member who can decide the request reads its args, full card and note.
+create policy approval_request_payloads_select_deciders on public.approval_request_payloads
+  for select to authenticated
+  using (private.can_see_approval_payload(approval_id));
+
 -- Members of the hotel read its approval policy.
 create policy approval_policies_select_hotel_members on public.approval_policies
   for select to authenticated
   using (private.can_read_hotel(org_id, hotel_id));
 
--- No INSERT, UPDATE or DELETE policy on either table.
+-- No INSERT, UPDATE or DELETE policy on any of these tables.
 ```
 
 RLS notes:
@@ -372,5 +479,9 @@ RLS notes:
   - the binding checks;
   - the guarded compare-and-set (see "Atomic transitions").
 - The store writes each audit event in the same transaction as the state change.
-- A hotel member can read the args of a request in their hotel. That is the same data that the
-  preview shows.
+- A hotel member reads the redacted card of every request in their hotel
+  (`approval_requests.preview`). Only a member who can decide the request reads its args, full
+  card and note (`approval_request_payloads`), the same rule as "Who sees what".
+- The control plane writes the request row and its payload row in one transaction.
+- `private.can_see_approval_payload` repeats only the role check. It does not apply the
+  self-approval rule, because a requester may always reject and so may see the card.

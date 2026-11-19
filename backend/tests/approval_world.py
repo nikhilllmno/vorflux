@@ -18,9 +18,11 @@ from harness.approvals import (
     HotelRole,
     InMemoryApprovalStore,
     InMemoryAuditLog,
+    InMemoryHotelDirectory,
     InMemoryPolicyStore,
     Membership,
     PolicyEngine,
+    PreviewContext,
     Principal,
     PrincipalKind,
     ProposedCall,
@@ -38,8 +40,8 @@ TOOLSETS = ("ops", "reports")
 DEFAULT_ARGS: Mapping[ActionKind, Mapping[str, Any]] = {
     ActionKind.READ: {"report": "occupancy", "date": "2026-12-24"},
     ActionKind.PMS_CHANGE: {
-        "system": "Beds24",
-        "target": "Deluxe King, 24 Dec 2026",
+        "target_id": "room-type:dk",
+        "date": "2026-12-24",
         "setting": "rate",
         "old": 9000,
         "new": 9900,
@@ -51,12 +53,8 @@ DEFAULT_ARGS: Mapping[ActionKind, Mapping[str, Any]] = {
         "subject": "Your stay",
         "body": "Welcome!",
     },
-    ActionKind.EXTERNAL_WRITE: {
-        "system": "Channel manager",
-        "target": "Deluxe King",
-        "changes": {"min_stay": 2},
-    },
-    ActionKind.DELETE: {"system": "Beds24", "target": "Test bookings", "count": 2},
+    ActionKind.EXTERNAL_WRITE: {"target_id": "room-type:dk", "changes": {"min_stay": 2}},
+    ActionKind.DELETE: {"target_id": "bookings:test", "count": 2},
     ActionKind.GIT_PUSH: {
         "repository": "dextr/hotel-a1",
         "branch": "harness/fix-rates",
@@ -71,16 +69,36 @@ DEFAULT_ARGS: Mapping[ActionKind, Mapping[str, Any]] = {
 }
 
 
+# The system each toolset writes to (registry data, never from the arguments).
+SYSTEMS: Mapping[str, str] = {"ops": "Beds24", "reports": "Channel manager"}
+
+# Hotel config: target ids and the labels that the approver sees, per toolset.
+TARGET_LABELS: Mapping[str, str] = {
+    "room-type:dk": "Deluxe King",
+    "room-type:suite": "Suite",
+    "bookings:test": "Test bookings",
+}
+
+
 def tool_name(kind: ActionKind, risk: RiskLevel) -> str:
     return f"{kind}_{risk}"
 
 
 def default_catalog() -> ToolCatalog:
     return ToolCatalog(
-        ToolSpec(toolset, tool_name(kind, risk), kind, risk)
+        ToolSpec(toolset, tool_name(kind, risk), kind, risk, system=SYSTEMS[toolset])
         for toolset in TOOLSETS
         for kind in ActionKind
         for risk in RiskLevel
+    )
+
+
+def preview_context(
+    kind: ActionKind, risk: RiskLevel = RiskLevel.MEDIUM, toolset: str = "ops"
+) -> PreviewContext:
+    """The context that the engine builds for a registered tool in hotel A1 of the test world."""
+    return PreviewContext(
+        toolset=toolset, tool=tool_name(kind, risk), system=SYSTEMS[toolset], targets=TARGET_LABELS
     )
 
 
@@ -122,14 +140,25 @@ class World:
     catalog: ToolCatalog = field(default_factory=default_catalog)
     resumer: RecordingResumer = field(default_factory=RecordingResumer)
     platform_rules: Sequence[Rule] = ()
+    directory: InMemoryHotelDirectory = field(default_factory=InMemoryHotelDirectory)
 
     def __post_init__(self) -> None:
+        for org_id, hotel_id in (
+            (self.org_a, self.hotel_a1),
+            (self.org_a, self.hotel_a2),
+            (self.org_b, self.hotel_b1),
+        ):
+            for toolset in TOOLSETS:
+                for target_id, label in TARGET_LABELS.items():
+                    self.directory.set_label(org_id, hotel_id, toolset, target_id, label)
         if self.policies is None:
             self.policies = InMemoryPolicyStore(self.audit)
         if self.approvals is None:
             # Shares the policy store's lock and the fake clock (guarded writes).
             self.approvals = InMemoryApprovalStore(self.policies, self.audit, self.clock)
-        self.engine = PolicyEngine(self.policies, self.catalog, self.platform_rules)
+        self.engine = PolicyEngine(
+            self.policies, self.catalog, self.platform_rules, directory=self.directory
+        )
         self.service = ApprovalService(
             self.engine, self.approvals, self.policies, self.audit, self.resumer, self.clock
         )

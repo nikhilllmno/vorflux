@@ -13,7 +13,7 @@ import json
 import logging
 import math
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from enum import StrEnum
 from types import MappingProxyType
@@ -265,10 +265,24 @@ class ProposedCall:
         return self.tenant.actor_id
 
 
+UNVERIFIED_NOTE = "agent reported, not checked"
+REDACTED_VALUE = "(hidden: only approvers see this)"
+
+
 @dataclass(frozen=True, slots=True)
 class PreviewField:
+    """One line of the approval card.
+
+    - `verified` is False for a value that only the agent reports (for example the old value
+      of a setting). The harness does not check it, and the card says so.
+    - `sensitive` marks guest data and written content. Only a principal who can decide the
+      request sees it; everyone else sees `REDACTED_VALUE`.
+    """
+
     label: str
     value: str
+    verified: bool = True
+    sensitive: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -281,18 +295,47 @@ class Preview:
     def as_json(self) -> dict[str, Any]:
         return {
             "title": self.title,
-            "fields": [{"label": f.label, "value": f.value} for f in self.fields],
+            "fields": [
+                {
+                    "label": f.label,
+                    "value": f.value,
+                    "verified": f.verified,
+                    "sensitive": f.sensitive,
+                }
+                for f in self.fields
+            ],
         }
 
     @classmethod
     def from_json(cls, value: Mapping[str, Any]) -> "Preview":
+        # Fail safe: only an explicit `true` counts as verified, and only an explicit `false`
+        # counts as not sensitive.
         return cls(
             title=str(value["title"]),
-            fields=tuple(PreviewField(str(f["label"]), str(f["value"])) for f in value["fields"]),
+            fields=tuple(
+                PreviewField(
+                    str(f["label"]),
+                    str(f["value"]),
+                    verified=f.get("verified", True) is True,
+                    sensitive=f.get("sensitive", False) is not False,
+                )
+                for f in value["fields"]
+            ),
+        )
+
+    def redacted(self) -> "Preview":
+        """The card for a principal who cannot decide: sensitive values are hidden."""
+        return Preview(
+            self.title,
+            tuple(replace(f, value=REDACTED_VALUE) if f.sensitive else f for f in self.fields),
         )
 
     def text(self) -> str:
-        return "\n".join([self.title, *(f"{f.label}: {f.value}" for f in self.fields)])
+        lines = [self.title]
+        for f in self.fields:
+            label = f.label if f.verified else f"{f.label} ({UNVERIFIED_NOTE})"
+            lines.append(f"{label}: {f.value}")
+        return "\n".join(lines)
 
 
 def proposal_hash(call: ProposedCall, kind: ActionKind, risk: RiskLevel, preview: Preview) -> str:
@@ -302,7 +345,7 @@ def proposal_hash(call: ProposedCall, kind: ActionKind, risk: RiskLevel, preview
     needs a new approval.
     """
     document = {
-        "v": 2,
+        "v": 3,
         "org_id": str(call.org_id),
         "hotel_id": str(call.hotel_id),
         "toolset": call.toolset,
@@ -373,7 +416,7 @@ class ApprovalRequest:
     decided_at: datetime | None = None
     use_by: datetime | None = None  # deadline to use an approved request
     reason: str | None = None
-    consumed_at: datetime | None = None  # set once; an approval is single use
+    consumed_at: datetime | None = None  # set once; a replay by the same tool call reuses it
     version: int = 0  # optimistic concurrency for store updates
 
     def __post_init__(self) -> None:
@@ -403,6 +446,33 @@ class ApprovalCheck:
     status: ApprovalStatus | None = None
     args: JsonObject | None = None
     idempotency_key: str | None = None
+    # True when this tool call already used the approval: the same grant again. The executor
+    # dedupes on `idempotency_key`, so it must not run the write twice.
+    replayed: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class ApprovalView:
+    """What one principal may see of a request.
+
+    `full` is True when the principal holds a role that can decide the request (the request's
+    snapshot and the current policy). Otherwise `request` is a copy with the sensitive preview
+    values hidden, no arguments, and no note.
+    """
+
+    request: ApprovalRequest
+    full: bool
+
+    @property
+    def id(self) -> UUID:
+        return self.request.id
+
+    @classmethod
+    def of(cls, request: ApprovalRequest, *, full: bool) -> "ApprovalView":
+        if full:
+            return cls(request, True)
+        hidden = replace(request, args={}, preview=request.preview.redacted(), note=None)
+        return cls(hidden, False)
 
 
 @dataclass(frozen=True, slots=True)

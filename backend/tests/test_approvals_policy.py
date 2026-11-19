@@ -6,7 +6,7 @@ from typing import Any
 from uuid import uuid4
 
 import pytest
-from approval_world import DEFAULT_ARGS, World, tool_name
+from approval_world import DEFAULT_ARGS, World, preview_context, tool_name
 
 from harness.approvals import (
     ActionKind,
@@ -15,6 +15,7 @@ from harness.approvals import (
     HotelPolicy,
     HotelRole,
     InMemoryPolicyStore,
+    PolicyEngine,
     ProposedCall,
     RiskLevel,
     Rule,
@@ -120,7 +121,9 @@ async def test_read_can_be_made_to_ask_and_its_preview_lists_every_argument() ->
     _, request = await world.request(world.call(ActionKind.READ))
 
     assert request.approver_roles == HOTEL_ROLES_FROM_OPERATOR
-    assert request.preview.text() == "Read data\ndate: 2026-12-24\nreport: occupancy"
+    assert request.preview.text() == (
+        "Read data\ndate: 2026-12-24\nreport: occupancy\nTool: ops/read_medium"
+    )
 
 
 # --- No yolo -----------------------------------------------------------------------------------
@@ -184,7 +187,9 @@ async def test_registered_tool_in_another_toolset_is_denied() -> None:
 
 async def test_the_registry_sets_kind_and_risk_not_the_caller() -> None:
     # The tool's name says "read" but the registry says it changes the PMS at high risk.
-    catalog = ToolCatalog([ToolSpec("ops", "read_rates", ActionKind.PMS_CHANGE, RiskLevel.HIGH)])
+    catalog = ToolCatalog(
+        [ToolSpec("ops", "read_rates", ActionKind.PMS_CHANGE, RiskLevel.HIGH, system="Beds24")]
+    )
     world = World(catalog=catalog)
 
     _, request = await world.request(world.call(toolset="ops", tool="read_rates"))
@@ -206,17 +211,21 @@ def test_registry_refuses_a_duplicate_or_an_unknown_kind_or_risk() -> None:
 
 
 def test_pms_change_preview_is_rendered_from_the_arguments() -> None:
-    preview = render_preview(ActionKind.PMS_CHANGE, DEFAULT_ARGS[ActionKind.PMS_CHANGE])
+    context = preview_context(ActionKind.PMS_CHANGE)
+    preview = render_preview(ActionKind.PMS_CHANGE, DEFAULT_ARGS[ActionKind.PMS_CHANGE], context)
 
     assert preview.text() == (
         "Change rate of Deluxe King, 24 Dec 2026 in Beds24\n"
-        "From: 9000\nTo: 9900\nGuests affected: 0"
+        "From (agent reported, not checked): 9000\n"
+        "To: 9900\n"
+        "Guests affected (agent reported, not checked): 0\n"
+        "Tool: ops/pms_change_medium"
     )
 
 
 @pytest.mark.parametrize("kind", [*HOTEL_OPERATIONS, *CODE_KINDS])
 def test_every_kind_that_can_ask_has_a_typed_preview(kind: ActionKind) -> None:
-    preview = render_preview(kind, DEFAULT_ARGS[kind])
+    preview = render_preview(kind, DEFAULT_ARGS[kind], preview_context(kind))
 
     assert preview.title
     assert preview.fields
@@ -229,6 +238,10 @@ def test_every_kind_that_can_ask_has_a_typed_preview(kind: ActionKind) -> None:
         ({"guests_affected": "3"}, "a string is not coerced to a number"),
         ({"guests_affected": -1}, "negative count"),
         ({"setting": ""}, "empty text"),
+        ({"system": "Sandbox (test copy, no guests)"}, "the system comes from the registry"),
+        ({"target": "Deluxe King"}, "free-text targets are not accepted"),
+        ({"date": "2026-13-40"}, "not a real date"),
+        ({"date": "24 Dec 2026"}, "not an ISO date"),
     ],
 )
 async def test_arguments_that_do_not_fit_the_kind_are_denied(
@@ -241,6 +254,115 @@ async def test_arguments_that_do_not_fit_the_kind_are_denied(
 
     assert decision.verdict == Verdict.DENY, why
     assert decision.reason == "arguments do not match the pms_change proposal"
+
+
+# Review 2 (N2): the system and the target come from the registry and the hotel config, never
+# from the agent. Values that only the agent knows are marked as not checked.
+
+
+async def test_the_system_in_the_preview_comes_from_the_registry() -> None:
+    world = World()
+
+    _, ops = await world.request()
+    _, reports = await world.request(world.call(toolset="reports", tool_call_id="call-2"))
+
+    assert ops.preview.title == "Change rate of Deluxe King, 24 Dec 2026 in Beds24"
+    assert reports.preview.title == "Change rate of Deluxe King, 24 Dec 2026 in Channel manager"
+
+
+async def test_the_target_label_comes_from_the_hotel_config() -> None:
+    world = World()
+    world.directory.set_label(
+        world.org_a, world.hotel_a1, "ops", "room-type:dk", "Deluxe King (sea view)"
+    )
+
+    _, request = await world.request()
+
+    assert request.preview.title == "Change rate of Deluxe King (sea view), 24 Dec 2026 in Beds24"
+
+
+@pytest.mark.parametrize(
+    "kind", [ActionKind.PMS_CHANGE, ActionKind.EXTERNAL_WRITE, ActionKind.DELETE]
+)
+async def test_a_target_that_the_hotel_config_does_not_know_is_denied(kind: ActionKind) -> None:
+    world = World()
+    args = {**DEFAULT_ARGS[kind], "target_id": "room-type:penthouse"}
+
+    decision = await _evaluate(world, world.call(kind, args=args))
+
+    assert decision.verdict == Verdict.DENY
+    assert decision.reason == "target room-type:penthouse is not in the hotel config for ops"
+
+
+async def test_target_labels_are_scoped_to_the_hotel() -> None:
+    world = World()
+    world.directory.set_label(world.org_a, world.hotel_a2, "ops", "room-type:villa", "Villa")
+    args = {**DEFAULT_ARGS[ActionKind.PMS_CHANGE], "target_id": "room-type:villa"}
+
+    here = await _evaluate(world, world.call(args=args))
+    there = await _evaluate(
+        world, world.call(args=args, tenant=world.tenant(world.org_a, world.hotel_a2))
+    )
+
+    assert here.verdict == Verdict.DENY
+    assert there.verdict == Verdict.ASK
+
+
+async def test_values_that_only_the_agent_reports_are_marked_as_not_checked() -> None:
+    world = World()
+
+    _, request = await world.request()
+
+    checked = {f.label: f.verified for f in request.preview.fields}
+    assert checked == {"From": False, "To": True, "Guests affected": False, "Tool": True}
+    assert request.preview.as_json()["fields"][0] == {
+        "label": "From",
+        "value": "9000",
+        "verified": False,
+        "sensitive": False,
+    }
+
+
+async def test_agent_reported_fields_are_left_out_when_the_agent_gives_none() -> None:
+    world = World()
+    args = {"target_id": "room-type:dk", "setting": "rate", "new": 9900}
+
+    _, request = await world.request(world.call(args=args))
+
+    assert request.preview.text() == (
+        "Change rate of Deluxe King in Beds24\nTo: 9900\nTool: ops/pms_change_medium"
+    )
+
+
+async def test_a_delete_count_is_marked_as_not_checked() -> None:
+    world = World()
+
+    _, request = await world.request(world.call(ActionKind.DELETE))
+
+    assert request.preview.text() == (
+        "Delete records: Test bookings in Beds24\n"
+        "Records (agent reported, not checked): 2\n"
+        "Tool: ops/delete_medium"
+    )
+
+
+def test_a_hotel_operation_tool_needs_a_system_in_the_registry() -> None:
+    for kind in HOTEL_OPERATIONS:
+        with pytest.raises(ValueError, match="system"):
+            ToolSpec("ops", "t", kind, RiskLevel.LOW)
+        with pytest.raises(ValueError, match="system"):
+            ToolSpec("ops", "t", kind, RiskLevel.LOW, system="")
+    assert ToolSpec("ops", "t", ActionKind.READ, RiskLevel.LOW).system is None
+
+
+async def test_without_a_hotel_directory_every_targeted_action_is_denied() -> None:
+    world = World()
+    engine = PolicyEngine(world.policies, world.catalog)
+
+    decision = await engine.evaluate(world.call())
+
+    assert decision.verdict == Verdict.DENY
+    assert decision.reason == "target room-type:dk is not in the hotel config for ops"
 
 
 # --- Deny by default ---------------------------------------------------------------------------
@@ -385,14 +507,15 @@ def test_proposal_hash_ignores_key_order_but_binds_args_and_preview() -> None:
     args = DEFAULT_ARGS[ActionKind.PMS_CHANGE]
     call = world.call(args=args)
     reordered = world.call(args=dict(reversed(list(args.items()))))
-    preview = render_preview(ActionKind.PMS_CHANGE, args)
+    context = preview_context(ActionKind.PMS_CHANGE)
+    preview = render_preview(ActionKind.PMS_CHANGE, args, context)
     kind, risk = ActionKind.PMS_CHANGE, RiskLevel.MEDIUM
     base = proposal_hash(call, kind, risk, preview)
 
     assert proposal_hash(reordered, kind, risk, preview) == base
     assert proposal_hash(world.call(args={**args, "new": 99}), kind, risk, preview) != base
     assert proposal_hash(call, kind, RiskLevel.HIGH, preview) != base
-    other_preview = render_preview(ActionKind.PMS_CHANGE, {**args, "new": 99})
+    other_preview = render_preview(ActionKind.PMS_CHANGE, {**args, "new": 99}, context)
     assert proposal_hash(call, kind, risk, other_preview) != base
     other_hotel = world.call(args=args, tenant=world.tenant(world.org_a, world.hotel_a2))
     assert proposal_hash(other_hotel, kind, risk, preview) != base

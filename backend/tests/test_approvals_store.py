@@ -322,9 +322,11 @@ async def test_service_flow_works_on_every_store(world: World) -> None:
     await world.approve(request, world.operator)
 
     result = await world.service.consume(request.id, call)
+    again = await world.service.consume(request.id, call)
 
-    assert result.ok is True
-    assert (await world.service.consume(request.id, call)).ok is False
+    assert (result.ok, result.replayed) == (True, False)
+    assert (again.ok, again.replayed, again.idempotency_key) == (True, True, str(request.id))
+    assert (await world.service.check(request.id, call)).ok is False
 
 
 async def test_stored_string_rules_and_roles_keep_their_meaning(world: World) -> None:

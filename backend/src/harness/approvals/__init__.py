@@ -1,7 +1,8 @@
 """Approval policy engine and approval service (DEX-20, Hermes parity HP-21).
 
 - `model`: tool calls, roles, decisions, approval requests, previews (immutable values).
-- `catalog`: the tool registry; the only source of an action's kind and risk.
+- `catalog`: the tool registry; the only source of an action's kind, risk, and system.
+- `directory`: hotel config lookups; the only source of a target's label on the card.
 - `preview`: typed proposals per action kind and the preview the harness renders from them.
 - `policy`: `PolicyEngine` -> allow, ask, or deny. Fails closed.
 - `interface`: `ApprovalPolicy`, the small async interface that runtime adapters call.
@@ -14,6 +15,7 @@ Design: docs/approvals.md and docs/architecture.md (D19, Sections 4.2, 5.2, 7.1,
 
 from harness.approvals.audit import ActorType, AuditEvent, AuditSink, InMemoryAuditLog
 from harness.approvals.catalog import ToolCatalog, ToolSpec
+from harness.approvals.directory import HotelDirectory, InMemoryHotelDirectory
 from harness.approvals.interface import ApprovalPolicy
 from harness.approvals.model import (
     ActionClass,
@@ -22,6 +24,7 @@ from harness.approvals.model import (
     ApprovalRequest,
     ApprovalResolution,
     ApprovalStatus,
+    ApprovalView,
     ApproverRole,
     Decision,
     HotelRole,
@@ -44,7 +47,12 @@ from harness.approvals.policy import (
     PolicyEngine,
     Rule,
 )
-from harness.approvals.preview import PROPOSAL_TYPES, render_preview
+from harness.approvals.preview import (
+    PROPOSAL_TYPES,
+    PreviewContext,
+    UnknownTargetError,
+    render_preview,
+)
 from harness.approvals.service import (
     ActionDeniedError,
     ApprovalError,
@@ -82,6 +90,7 @@ __all__ = [
     "ApprovalService",
     "ApprovalStatus",
     "ApprovalStore",
+    "ApprovalView",
     "ApproverRole",
     "AuditEvent",
     "AuditSink",
@@ -90,10 +99,12 @@ __all__ = [
     "DuplicateToolCallError",
     "Effect",
     "ForbiddenError",
+    "HotelDirectory",
     "HotelPolicy",
     "HotelRole",
     "InMemoryApprovalStore",
     "InMemoryAuditLog",
+    "InMemoryHotelDirectory",
     "InMemoryPolicyStore",
     "InvalidPolicyError",
     "Membership",
@@ -101,6 +112,7 @@ __all__ = [
     "PolicyEngine",
     "PolicyStore",
     "Preview",
+    "PreviewContext",
     "PreviewField",
     "Principal",
     "PrincipalKind",
@@ -112,6 +124,7 @@ __all__ = [
     "ToolCatalog",
     "ToolSpec",
     "TransitionGuard",
+    "UnknownTargetError",
     "Verdict",
     "WriteResult",
     "canonical_json",

@@ -9,8 +9,9 @@ Rules (docs/approvals.md, "Evaluation order"):
 4. With no matching rule, the default applies: `read` is allowed, every other kind asks.
 5. No "yolo": only a read-only action below `high` risk can be allowed. A hotel operation (D19),
    a code action, or a `high` risk action asks, whatever the rules say.
-6. Asking needs a preview that the harness renders from the arguments. Arguments that do not
-   fit the kind's proposal: deny.
+6. Asking needs a preview that the harness renders from the arguments, the tool registry, and
+   the hotel config. Arguments that do not fit the kind's proposal, or a target id that the
+   hotel config does not know: deny.
 7. Code actions are approved only by our team's `code_reviewer`; hotel roles never.
    Other actions are approved by hotel roles at or above the hotel's minimum role for that kind
    (default `operator`, Section 7.1).
@@ -41,10 +42,16 @@ from harness.approvals.model import (
     Verdict,
     proposal_hash,
 )
-from harness.approvals.preview import render_preview
+from harness.approvals.preview import (
+    PreviewContext,
+    UnknownTargetError,
+    parse_proposal,
+    render_preview,
+)
 from harness.tenancy import TenantContext
 
 if TYPE_CHECKING:
+    from harness.approvals.directory import HotelDirectory
     from harness.approvals.store import PolicyStore
 
 logger = logging.getLogger(__name__)
@@ -187,10 +194,14 @@ class PolicyEngine:
         policies: "PolicyStore",
         catalog: ToolCatalog,
         platform_rules: Sequence[Rule] = (),
+        *,
+        directory: "HotelDirectory | None" = None,
     ) -> None:
         self._policies = policies
         self._catalog = catalog
         self._platform_rules = tuple(platform_rules)
+        # Without a directory no target id is known, so every targeted action is denied.
+        self._directory = directory
 
     async def hotel_policy(self, org_id: UUID, hotel_id: UUID) -> HotelPolicy:
         return (await self.load_policy(org_id, hotel_id))[0]
@@ -240,9 +251,22 @@ class PolicyEngine:
         )
 
         try:
-            preview = render_preview(spec.kind, call.args)
+            proposal = parse_proposal(spec.kind, call.args)
         except ValueError:
             return _deny(call, f"arguments do not match the {spec.kind} proposal")
+        targets: dict[str, str] = {}
+        for target_id in proposal.target_ids() if proposal is not None else ():
+            label = await self._target_label(call, target_id)
+            if label is None:
+                return _deny(
+                    call, f"target {target_id} is not in the hotel config for {call.toolset}"
+                )
+            targets[target_id] = label
+        context = PreviewContext(call.toolset, call.tool, spec.system, targets)
+        try:
+            preview = render_preview(spec.kind, call.args, context)
+        except UnknownTargetError as error:
+            return _deny(call, str(error))
         bound = proposal_hash(call, spec.kind, spec.risk, preview)
 
         if allowed:
@@ -258,3 +282,10 @@ class PolicyEngine:
                 call.tool_call_id, Verdict.ASK, f"{spec.kind} needs approval by {needs}", roles
             )
         return Assessment(decision, spec, preview, bound, policy_version)
+
+    async def _target_label(self, call: ProposedCall, target_id: str) -> str | None:
+        if self._directory is None:
+            return None
+        return await self._directory.target_label(
+            call.org_id, call.hotel_id, call.toolset, target_id
+        )

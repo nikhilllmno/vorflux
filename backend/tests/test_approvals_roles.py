@@ -11,6 +11,7 @@ from harness.approvals import (
     ActionKind,
     ApprovalStatus,
     ConflictError,
+    Effect,
     ForbiddenError,
     HotelPolicy,
     HotelRole,
@@ -19,6 +20,7 @@ from harness.approvals import (
     NotFoundError,
     Principal,
     RiskLevel,
+    Rule,
 )
 
 pytestmark = pytest.mark.anyio
@@ -345,3 +347,86 @@ async def test_first_policy_writes_from_two_admins_never_lose_a_setting() -> Non
     assert stored.min_role_for(ActionKind.PMS_CHANGE) == HotelRole.OWNER
     assert stored.min_role_for(ActionKind.MESSAGE_SEND) == HotelRole.OPERATOR
     assert world.audit_actions() == ["approval_policy.updated"]
+
+
+# --- Who sees the sensitive parts of a request (review 2, N4) -----------------------------------
+
+HIDDEN = "(hidden: only approvers see this)"
+
+
+async def test_a_member_who_cannot_decide_sees_a_redacted_card() -> None:
+    world = World()
+    _, request = await world.request(world.call(ActionKind.MESSAGE_SEND), note="VIP guest")
+
+    view = await world.service.get_for(world.viewer, world.tenant(actor=world.viewer), request.id)
+    listed = await world.service.list_for(world.viewer, world.tenant(actor=world.viewer))
+
+    assert view.full is False
+    assert listed == [view]
+    assert view.request.preview.text() == (
+        "Send a email message to 1 recipient via Beds24\n"
+        f"Recipients: {HIDDEN}\nSubject: {HIDDEN}\nMessage: {HIDDEN}\n"
+        "Tool: ops/message_send_medium"
+    )
+    assert view.request.note is None
+    assert dict(view.request.args) == {}
+    assert "guest@example.com" not in repr(view)
+    assert "VIP guest" not in repr(view)
+    # Not sensitive: the card still says what happens, where, and its state.
+    assert (view.id, view.request.status, view.request.kind) == (
+        request.id,
+        ApprovalStatus.PENDING,
+        ActionKind.MESSAGE_SEND,
+    )
+
+
+async def test_a_principal_who_can_decide_sees_the_full_card() -> None:
+    world = World()
+    _, request = await world.request(world.call(ActionKind.MESSAGE_SEND), note="VIP guest")
+
+    view = await world.service.get_for(
+        world.operator, world.tenant(actor=world.operator), request.id
+    )
+
+    assert view.full is True
+    assert view.request == request
+
+
+@pytest.mark.parametrize("kind", [ActionKind.EXTERNAL_WRITE, ActionKind.READ])
+async def test_written_values_and_read_arguments_are_sensitive(kind: ActionKind) -> None:
+    world = World()
+    if kind == ActionKind.READ:
+        await world.set_policy(rules=(Rule(ActionKind.READ, Effect.ASK),))
+    _, request = await world.request(world.call(kind))
+
+    view = await world.service.get_for(world.viewer, world.tenant(actor=world.viewer), request.id)
+
+    hidden = {f.label for f in view.request.preview.fields if f.value == HIDDEN}
+    assert hidden == {f.label for f in request.preview.fields if f.sensitive}
+    assert hidden and "Tool" not in hidden
+
+
+async def test_a_raised_minimum_role_also_hides_the_card_from_operators() -> None:
+    world = World()
+    _, request = await world.request(world.call(ActionKind.MESSAGE_SEND))
+    await world.set_policy(approver_min_roles={ActionKind.MESSAGE_SEND: HotelRole.ADMIN})
+
+    operator = await world.service.get_for(
+        world.operator, world.tenant(actor=world.operator), request.id
+    )
+    admin = await world.service.get_for(world.admin, world.tenant(actor=world.admin), request.id)
+
+    assert (operator.full, admin.full) == (False, True)
+
+
+async def test_only_a_code_reviewer_sees_the_full_card_of_a_code_request() -> None:
+    world = World()
+    _, request = await world.request(world.call(ActionKind.GIT_PUSH), note="fix rates")
+
+    owner = await world.service.get_for(world.owner, world.tenant(actor=world.owner), request.id)
+    reviewer = await world.service.get_for(
+        world.code_reviewer, world.tenant(actor=world.code_reviewer), request.id
+    )
+
+    assert (owner.full, owner.request.note) == (False, None)
+    assert (reviewer.full, reviewer.request.note) == (True, "fix rates")

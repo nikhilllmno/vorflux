@@ -7,6 +7,9 @@ API.
 - A decision and a use pass a `TransitionGuard` to the store: the write fails if the hotel
   policy changed after the service read it, or if the deadline passed while the service waited
   for I/O. The service then reads again and re-checks (at most `MAX_TRANSITION_ATTEMPTS` times).
+- `consume` is idempotent per tool call: a repeat for the same approval and the same tool call
+  returns the same arguments and idempotency key (`replayed=True`), so a caller that was
+  cancelled after the store write can retry. The executor dedupes on the idempotency key.
 - A denied tool call and a refused use write an audit event too (best effort; the denial or
   refusal stands if the audit write fails).
 - Every exit from `pending` notifies the `RunResumer`, so the paused run continues
@@ -15,6 +18,8 @@ API.
 - Staff-facing operations take the caller's `Principal` (for role checks) and an explicit
   `TenantContext` (for storage scope). The context's `actor_id` must be the principal.
   Only a human principal can approve or reject.
+- `list_for` and `get_for` return an `ApprovalView`. Only a principal who can decide the request
+  sees its sensitive preview values, its arguments, and the agent's note.
 """
 
 import logging
@@ -31,6 +36,7 @@ from harness.approvals.model import (
     ApprovalRequest,
     ApprovalResolution,
     ApprovalStatus,
+    ApprovalView,
     ApproverRole,
     Decision,
     HotelRole,
@@ -197,13 +203,26 @@ class ApprovalService:
             request: ApprovalRequest | None = None
             reason = "approval changed while it was being used; try again"
             for _ in range(MAX_TRANSITION_ATTEMPTS):
-                request, failure, assessment = await self._verify(approval_id, call, self._clock())
+                request, failure, assessment = await self._verify(
+                    approval_id, call, self._clock(), allow_used=True
+                )
                 if failure is not None or request is None:
                     reason = failure or "approval not found"
                     break
                 if assessment is None or assessment.policy_version is None:
                     reason = "policy evaluation failed"
                     break
+                if request.consumed_at is not None:
+                    # This tool call already used the approval (for example, the first call
+                    # was cancelled after the store write). Return the same grant; nothing is
+                    # written, so the executor's idempotency key prevents a second write.
+                    await self._record_tool_call_event(
+                        call,
+                        "approval.use_replayed",
+                        "the same tool call used this approval before",
+                        approval_id=approval_id,
+                    )
+                    return _grant(request, "approval already used by this tool call", True)
                 # The store checks the policy version and `use_by` again, atomically with the
                 # write, so a change while this call awaited I/O cannot slip through.
                 now = self._clock()
@@ -212,17 +231,12 @@ class ApprovalService:
                 guard = TransitionGuard(assessment.policy_version, deadline=request.use_by)
                 result = await self._approvals.replace(request, used, event, guard)
                 if result == WriteResult.APPLIED:
-                    return ApprovalCheck(
-                        True,
-                        "approval used",
-                        used.status,
-                        args=used.args,
-                        idempotency_key=str(used.id),
-                    )
+                    return _grant(used, "approval used", False)
                 if result == WriteResult.DEADLINE_PASSED:
                     reason = "approval expired"
                     break
                 # STALE or POLICY_CHANGED: verify again against the current row and policy.
+                # If another call for this tool call won, the next pass returns its grant.
             await self._record_tool_call_event(
                 call, "approval.use_refused", reason, approval_id=approval_id
             )
@@ -241,22 +255,29 @@ class ApprovalService:
         principal: Principal,
         tenant: TenantContext,
         status: ApprovalStatus | None = None,
-    ) -> list[ApprovalRequest]:
+    ) -> list[ApprovalView]:
         _check_actor(principal, tenant)
         if not self._can_view_hotel(principal, tenant.org_id, tenant.hotel_id):
             raise NotFoundError("hotel not found")
         await self.expire_due(tenant.org_id, tenant.hotel_id)
         rows = await self._approvals.list(tenant.org_id, tenant.hotel_id, status=status)
-        return [row for row in rows if self._can_view(principal, row)]
+        policy = await self._engine.hotel_policy(tenant.org_id, tenant.hotel_id)
+        return [
+            ApprovalView.of(row, full=self._can_decide(principal, row, policy))
+            for row in rows
+            if self._can_view(principal, row)
+        ]
 
     async def get_for(
         self, principal: Principal, tenant: TenantContext, approval_id: UUID
-    ) -> ApprovalRequest:
+    ) -> ApprovalView:
         _check_actor(principal, tenant)
         request = await self._approvals.get(tenant.org_id, tenant.hotel_id, approval_id)
         if request is None or not self._can_view(principal, request):
             raise NotFoundError("approval not found")
-        return await self._expire_if_due(request, self._clock())
+        request = await self._expire_if_due(request, self._clock())
+        policy = await self._engine.hotel_policy(request.org_id, request.hotel_id)
+        return ApprovalView.of(request, full=self._can_decide(principal, request, policy))
 
     async def approve(
         self,
@@ -450,10 +471,15 @@ class ApprovalService:
         raise ConflictError("approval changed; reload it")
 
     async def _verify(
-        self, approval_id: UUID, call: ProposedCall, now: datetime
+        self, approval_id: UUID, call: ProposedCall, now: datetime, *, allow_used: bool = False
     ) -> tuple[ApprovalRequest | None, str | None, Assessment | None]:
         """The request, why it cannot authorise this exact tool call now (None if it can), and
-        the current policy assessment that the answer used."""
+        the current policy assessment that the answer used.
+
+        With `allow_used`, a used approval passes if every other check passes: the same run,
+        requester, and tool call, the same proposal, the current policy, and `use_by`. Only
+        `consume` sets it, to return the same grant again; `check` refuses a used approval.
+        """
         if not isinstance(call, ProposedCall) or not isinstance(call.tenant, TenantContext):
             return None, "tool call has no tenant context", None
         request = await self._approvals.get(call.org_id, call.hotel_id, approval_id)
@@ -463,7 +489,7 @@ class ApprovalService:
             if _is_due(request, now):
                 return request, "approval expired", None
             return request, f"approval is {request.status}", None
-        if request.consumed_at is not None:
+        if request.consumed_at is not None and not allow_used:
             return request, "approval was already used", None
         if request.use_by is None or now >= request.use_by:
             return request, "approval expired", None
@@ -599,6 +625,18 @@ def _clean_text(text: str | None, limit: int, name: str) -> str | None:
 def _check_actor(principal: Principal, tenant: TenantContext) -> None:
     if tenant.actor_id != principal.user_id:
         raise ValueError("tenant.actor_id must be the principal's user id")
+
+
+def _grant(request: ApprovalRequest, reason: str, replayed: bool) -> ApprovalCheck:
+    """A successful use: the approved arguments and the idempotency key for the write."""
+    return ApprovalCheck(
+        True,
+        reason,
+        request.status,
+        args=request.args,
+        idempotency_key=str(request.id),
+        replayed=replayed,
+    )
 
 
 def _resolution(request: ApprovalRequest) -> ApprovalResolution:

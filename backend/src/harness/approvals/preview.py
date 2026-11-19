@@ -1,8 +1,8 @@
 """Typed proposals per action kind, and the preview that the harness renders from them.
 
-Section 10.10: the agent prepares a structured proposal (system, object, old value, new value,
-guests affected), and the harness shows the plain-language preview. The approver sees only what
-the harness renders here, never free text from the agent as the main content.
+Section 10.10: the agent prepares a structured proposal, and the harness shows the
+plain-language preview. The approver sees only what the harness renders here, never free text
+from the agent as the main content.
 
 Rules:
 
@@ -10,13 +10,23 @@ Rules:
   (`extra="forbid"`) and values are not coerced (`strict=True`), so every argument that the
   approval binds to appears in the preview.
 - Arguments that do not fit the model of their kind give `Deny`.
-- `read` has no model: if a rule makes a read ask, the preview lists every argument.
+- Facts on the card come from the harness, not the agent (`PreviewContext`):
+  - the system name and the tool come from the tool registry;
+  - a target is an id in the arguments, and its label comes from the hotel config. An unknown
+    id gives `Deny`.
+- A value that only the agent knows (an old value, a count of guests or records) is shown as
+  "agent reported, not checked" (`PreviewField.verified` is False), or left out if absent.
+- Guest data and written content are `sensitive`: only a principal who can decide sees them.
+- `read` has no model: if a rule makes a read ask, the preview lists every argument (sensitive).
 """
 
 from collections.abc import Mapping
+from dataclasses import dataclass, field
+from datetime import date
+from types import MappingProxyType
 from typing import Annotated, Any
 
-from pydantic import BaseModel, ConfigDict, Field, StringConstraints
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints, field_validator
 
 from harness.approvals.model import (
     ActionKind,
@@ -29,8 +39,41 @@ from harness.approvals.model import (
 
 Text = Annotated[str, StringConstraints(min_length=1, max_length=200)]
 LongText = Annotated[str, StringConstraints(min_length=1, max_length=5000)]
+TargetId = Annotated[str, StringConstraints(min_length=1, max_length=200, pattern=r"^\S+$")]
+IsoDate = Annotated[str, StringConstraints(pattern=r"^\d{4}-\d{2}-\d{2}$")]
 Scalar = str | int | float | bool | None
 CommitSha = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{7,40}$")]
+
+
+class UnknownTargetError(ValueError):
+    """The arguments name a target id that the hotel config does not know."""
+
+
+@dataclass(frozen=True, slots=True)
+class PreviewContext:
+    """Facts from the harness, not the agent: the registry's system and tool names, and the
+    hotel config's labels for the target ids in the arguments."""
+
+    toolset: str
+    tool: str
+    system: str | None = None
+    targets: Mapping[str, str] = field(default_factory=lambda: MappingProxyType({}))
+
+    def tool_field(self) -> PreviewField:
+        return PreviewField("Tool", f"{self.toolset}/{self.tool}")
+
+    def system_name(self) -> str:
+        if not self.system:
+            raise ValueError(f"tool {self.toolset}/{self.tool} has no system in the registry")
+        return self.system
+
+    def target_label(self, target_id: str) -> str:
+        label = self.targets.get(target_id)
+        if label is None:
+            raise UnknownTargetError(
+                f"target {target_id} is not in the hotel config for {self.toolset}"
+            )
+        return label
 
 
 def show(value: Any) -> str:
@@ -42,32 +85,56 @@ def _plural(count: int, word: str) -> str:
     return f"{count} {word}" if count == 1 else f"{count} {word}s"
 
 
+def _reported(label: str, value: Any) -> PreviewField:
+    """A value that only the agent reports. The harness does not check it."""
+    return PreviewField(label, show(value), verified=False)
+
+
 class Proposal(BaseModel):
     model_config = ConfigDict(strict=True, extra="forbid", frozen=True)
 
-    def preview(self) -> Preview:
+    def target_ids(self) -> tuple[str, ...]:
+        """Target ids whose labels come from the hotel config."""
+        return ()
+
+    def preview(self, context: PreviewContext) -> Preview:
         raise NotImplementedError
 
 
 class PmsChange(Proposal):
     """A rate, inventory, restriction, or booking change in a PMS."""
 
-    system: Text  # for example "Beds24"
-    target: Text  # for example "Deluxe King, 24 Dec 2026"
+    target_id: TargetId  # for example a room type id; the label comes from the hotel config
     setting: Text  # for example "rate"
-    old: Scalar = None
     new: Scalar
-    guests_affected: int = Field(default=0, ge=0)
+    date: IsoDate | None = None  # the day the change applies to, if any
+    old: Scalar = None  # agent reported
+    guests_affected: int | None = Field(default=None, ge=0)  # agent reported
 
-    def preview(self) -> Preview:
-        return Preview(
-            f"Change {self.setting} of {self.target} in {self.system}",
-            (
-                PreviewField("From", "(not set)" if self.old is None else show(self.old)),
-                PreviewField("To", show(self.new)),
-                PreviewField("Guests affected", str(self.guests_affected)),
-            ),
-        )
+    @field_validator("date")
+    @classmethod
+    def _real_date(cls, value: str | None) -> str | None:
+        if value is not None:
+            date.fromisoformat(value)
+        return value
+
+    def target_ids(self) -> tuple[str, ...]:
+        return (self.target_id,)
+
+    def preview(self, context: PreviewContext) -> Preview:
+        target = context.target_label(self.target_id)
+        if self.date is not None:
+            day = date.fromisoformat(self.date)
+            target = f"{target}, {day.day} {day:%b %Y}"
+        fields = []
+        if "old" in self.model_fields_set:
+            fields.append(_reported("From", "(not set)" if self.old is None else self.old))
+        fields.append(PreviewField("To", show(self.new)))
+        if self.guests_affected is not None:
+            fields.append(_reported("Guests affected", self.guests_affected))
+        fields.append(context.tool_field())
+        title = f"Change {self.setting} of {target} in {context.system_name()}"
+        return Preview(title, tuple(fields))
 
 
 class MessageSend(Proposal):
@@ -78,40 +145,53 @@ class MessageSend(Proposal):
     subject: Text | None = None
     body: LongText
 
-    def preview(self) -> Preview:
-        fields = [PreviewField("Recipients", ", ".join(self.recipients))]
+    def preview(self, context: PreviewContext) -> Preview:
+        fields = [PreviewField("Recipients", ", ".join(self.recipients), sensitive=True)]
         if self.subject is not None:
-            fields.append(PreviewField("Subject", self.subject))
-        fields.append(PreviewField("Message", self.body))
-        title = f"Send a {self.channel} message to {_plural(len(self.recipients), 'recipient')}"
+            fields.append(PreviewField("Subject", self.subject, sensitive=True))
+        fields.append(PreviewField("Message", self.body, sensitive=True))
+        fields.append(context.tool_field())
+        recipients = _plural(len(self.recipients), "recipient")
+        title = f"Send a {self.channel} message to {recipients} via {context.system_name()}"
         return Preview(title, tuple(fields))
 
 
 class ExternalWrite(Proposal):
     """Any other write to a system outside the harness."""
 
-    system: Text
-    target: Text
+    target_id: TargetId
     changes: dict[Text, Scalar] = Field(min_length=1, max_length=50)
 
-    def preview(self) -> Preview:
-        fields = tuple(PreviewField(key, show(self.changes[key])) for key in sorted(self.changes))
-        return Preview(f"Write to {self.target} in {self.system}", fields)
+    def target_ids(self) -> tuple[str, ...]:
+        return (self.target_id,)
+
+    def preview(self, context: PreviewContext) -> Preview:
+        fields = [
+            PreviewField(key, show(self.changes[key]), sensitive=True)
+            for key in sorted(self.changes)
+        ]
+        fields.append(context.tool_field())
+        title = f"Write to {context.target_label(self.target_id)} in {context.system_name()}"
+        return Preview(title, tuple(fields))
 
 
 class Delete(Proposal):
     """Delete data in a hotel or external system."""
 
-    system: Text
-    target: Text
-    count: int = Field(ge=1)
-    guests_affected: int = Field(default=0, ge=0)
+    target_id: TargetId
+    count: int = Field(ge=1)  # agent reported
+    guests_affected: int | None = Field(default=None, ge=0)  # agent reported
 
-    def preview(self) -> Preview:
-        return Preview(
-            f"Delete {_plural(self.count, 'record')}: {self.target} in {self.system}",
-            (PreviewField("Guests affected", str(self.guests_affected)),),
-        )
+    def target_ids(self) -> tuple[str, ...]:
+        return (self.target_id,)
+
+    def preview(self, context: PreviewContext) -> Preview:
+        fields = [_reported("Records", self.count)]
+        if self.guests_affected is not None:
+            fields.append(_reported("Guests affected", self.guests_affected))
+        fields.append(context.tool_field())
+        target = context.target_label(self.target_id)
+        return Preview(f"Delete records: {target} in {context.system_name()}", tuple(fields))
 
 
 class GitPush(Proposal):
@@ -119,9 +199,10 @@ class GitPush(Proposal):
     branch: Text
     commit: CommitSha
 
-    def preview(self) -> Preview:
+    def preview(self, context: PreviewContext) -> Preview:
         return Preview(
-            f"Push {self.branch} to {self.repository}", (PreviewField("Commit", self.commit),)
+            f"Push {self.branch} to {self.repository}",
+            (PreviewField("Commit", self.commit), context.tool_field()),
         )
 
 
@@ -131,13 +212,14 @@ class CodeChange(Proposal):
     paths: list[Text] = Field(min_length=1, max_length=200)
     description: LongText
 
-    def preview(self) -> Preview:
+    def preview(self, context: PreviewContext) -> Preview:
         return Preview(
             f"Change {_plural(len(self.paths), 'file')} in {self.repository}",
             (
                 PreviewField("Branch", self.branch),
                 PreviewField("Files", ", ".join(self.paths)),
                 PreviewField("Description", self.description),
+                context.tool_field(),
             ),
         )
 
@@ -152,13 +234,26 @@ PROPOSAL_TYPES: Mapping[ActionKind, type[Proposal]] = {
 }
 
 
-def _read_preview(args: JsonObject) -> Preview:
-    return Preview("Read data", tuple(PreviewField(key, show(args[key])) for key in sorted(args)))
+def _read_preview(args: JsonObject, context: PreviewContext) -> Preview:
+    fields = [PreviewField(key, show(args[key]), sensitive=True) for key in sorted(args)]
+    return Preview("Read data", (*fields, context.tool_field()))
 
 
-def render_preview(kind: ActionKind, args: JsonObject) -> Preview:
-    """The approver's preview for these arguments. Raises ValueError if they do not fit `kind`."""
+def parse_proposal(kind: ActionKind, args: JsonObject) -> Proposal | None:
+    """The typed proposal (None for `read`). Raises ValueError if the arguments do not fit."""
     if kind == ActionKind.READ:
-        return _read_preview(args)
+        return None
     proposal_type = PROPOSAL_TYPES[ActionKind(kind)]
-    return proposal_type.model_validate(thaw_json(args)).preview()
+    return proposal_type.model_validate(thaw_json(args))
+
+
+def render_preview(kind: ActionKind, args: JsonObject, context: PreviewContext) -> Preview:
+    """The approver's preview for these arguments.
+
+    Raises ValueError if they do not fit `kind`, and UnknownTargetError (a ValueError) if a
+    target id is not in `context.targets`.
+    """
+    proposal = parse_proposal(kind, args)
+    if proposal is None:
+        return _read_preview(args, context)
+    return proposal.preview(context)

@@ -73,12 +73,19 @@ def test_list_and_get_show_the_card_without_the_raw_payload(api: Api, world: Wor
     assert one["preview"] == {
         "title": "Change rate of Deluxe King, 24 Dec 2026 in Beds24",
         "fields": [
-            {"label": "From", "value": "9000"},
-            {"label": "To", "value": "9900"},
-            {"label": "Guests affected", "value": "0"},
+            {"label": "From", "value": "9000", "verified": False, "sensitive": False},
+            {"label": "To", "value": "9900", "verified": True, "sensitive": False},
+            {"label": "Guests affected", "value": "0", "verified": False, "sensitive": False},
+            {
+                "label": "Tool",
+                "value": "ops/pms_change_medium",
+                "verified": True,
+                "sensitive": False,
+            },
         ],
     }
     assert one["note"] == "Christmas demand is high"
+    assert one["redacted"] is False
     assert one["tool_call_id"] == "call-1"
     assert one["status"] == "pending"
     assert one["approver_roles"] == ["admin", "operator", "owner"]
@@ -215,3 +222,36 @@ def test_a_run_principal_gets_403_on_its_own_request(api: Api, world: World) -> 
     reject = api.client.post(f"{api.base()}/approvals/{request.id}/reject", json={})
 
     assert (approve.status_code, reject.status_code) == (403, 403)
+
+
+def test_a_viewer_gets_a_redacted_card(api: Api, world: World) -> None:
+    request = _pending(world, kind=ActionKind.MESSAGE_SEND)
+    api.as_user(world.viewer)
+
+    one = api.client.get(f"{api.base()}/approvals/{request.id}")
+    listed = api.client.get(f"{api.base()}/approvals")
+
+    assert one.status_code == 200
+    card = one.json()
+    assert card["redacted"] is True
+    assert card["note"] is None
+    assert {f["label"]: f["value"] for f in card["preview"]["fields"]} == {
+        "Recipients": "(hidden: only approvers see this)",
+        "Subject": "(hidden: only approvers see this)",
+        "Message": "(hidden: only approvers see this)",
+        "Tool": "ops/message_send_medium",
+    }
+    assert listed.json()["approvals"] == [card]
+    for body in (one.text, listed.text):
+        assert "guest@example.com" not in body
+        assert "Christmas demand" not in body
+
+
+def test_an_approver_gets_the_full_card_after_deciding(api: Api, world: World) -> None:
+    request = _pending(world, kind=ActionKind.MESSAGE_SEND)
+
+    decided = api.client.post(f"{api.base()}/approvals/{request.id}/approve", json={}).json()
+
+    assert decided["redacted"] is False
+    assert decided["note"] == "Christmas demand is high"
+    assert "guest@example.com" in str(decided["preview"])

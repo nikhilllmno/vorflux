@@ -15,6 +15,9 @@ Flow for one gated tool call:
      it performs the write, and runs the tool only if `ok` is True, with `args` from the result
      and its `idempotency_key`.
    - any other outcome: do not run the tool.
+   - If the caller is cancelled after `consume` (for example, a timeout), it may call `consume`
+     again for the same approval and the same tool call. The retry returns the same `args` and
+     `idempotency_key` with `replayed=True`, until `use_by`. The executor dedupes on the key.
 
 `consume` must run in the control plane (the MCP server or the operation executor), never in
 the sandboxed adapter: a check in the sandbox enforces nothing (D4, Section 10.10 step 4).
@@ -50,5 +53,9 @@ class ApprovalPolicy(Protocol):
         ...
 
     async def consume(self, approval_id: UUID, call: ProposedCall) -> ApprovalCheck:
-        """Use the approval once, in the control plane, right before the write. Never raises."""
+        """Use the approval, in the control plane, right before the write. Never raises.
+
+        Idempotent per tool call: a repeat by the same tool call returns the same grant
+        (`replayed=True`) and writes nothing. Another tool call is refused.
+        """
         ...
