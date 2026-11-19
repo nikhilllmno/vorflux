@@ -48,10 +48,35 @@ def check_local_database_url(url: str, environ: Mapping[str, str]) -> str:
     return url
 
 
-def as_database_user(url: str, user: str) -> str:
-    """Return `url` with another login role, for catalog probes that need that role.
+# Login roles that the catalog probes connect as. For each role: the environment variable that
+# holds its password, and the password that a local `supabase start` stack uses for it.
+ROLE_PASSWORDS: Mapping[str, tuple[str, str]] = {
+    "postgres": ("HARNESS_TEST_POSTGRES_PASSWORD", "postgres"),
+    "supabase_admin": ("HARNESS_TEST_SUPABASE_ADMIN_PASSWORD", "postgres"),
+}
 
-    The local Supabase stack uses one password for its built-in roles. The result goes through
-    the local-only guard again before any connection.
+
+class MissingRoleSettingsError(LookupError):
+    """A probe asked for a role that has no explicit connection settings."""
+
+
+def as_database_user(url: str, user: str, environ: Mapping[str, str]) -> str:
+    """Return `url` with the login role and password of `user`, for catalog probes.
+
+    The password comes from the role's variable in ROLE_PASSWORDS, or the local stack default
+    when that variable is unset. The result goes through the local-only guard again before any
+    connection.
     """
-    return make_conninfo(url, user=user)
+    if user not in ROLE_PASSWORDS:
+        raise MissingRoleSettingsError(
+            f"No connection settings for role {user!r}. Add it to ROLE_PASSWORDS in"
+            " backend/tests/rls/local_db.py with a password variable and its local default."
+        )
+    variable, default = ROLE_PASSWORDS[user]
+    password = environ.get(variable, default)
+    if not password:
+        raise MissingRoleSettingsError(
+            f"{variable} is set but empty. Set it to the password of {user!r} on the local"
+            f" database, or unset it to use the local stack default."
+        )
+    return make_conninfo(url, user=user, password=password)

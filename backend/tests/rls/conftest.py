@@ -19,7 +19,12 @@ from typing import Any
 import psycopg
 import pytest
 
-from .local_db import NonLocalDatabaseError, as_database_user, check_local_database_url
+from .local_db import (
+    MissingRoleSettingsError,
+    NonLocalDatabaseError,
+    as_database_user,
+    check_local_database_url,
+)
 from .world import World, seed
 
 
@@ -40,10 +45,10 @@ def connect_as() -> Callable[[str], psycopg.Connection[Any]]:
     """Open a separate connection to the same local database as another built-in role."""
 
     def connect(user: str) -> psycopg.Connection[Any]:
-        url = as_database_user(_database_url(), user)
         try:
+            url = as_database_user(_database_url(), user, os.environ)
             check_local_database_url(url, os.environ)
-        except NonLocalDatabaseError as exc:
+        except (MissingRoleSettingsError, NonLocalDatabaseError) as exc:
             pytest.fail(f"Refusing to connect as {user}: {exc}")
         return psycopg.connect(url)
 

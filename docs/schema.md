@@ -151,6 +151,12 @@ any host other than a local one (`127.0.0.1`, `localhost`, `::1`, or a local con
 They check the parameters libpq will use, so `?host=`, `?hostaddr=`, a service, several hosts,
 or `PGHOSTADDR` and `PGSERVICE` in the environment are refused too.
 
+A few catalog probes log in as another built-in role (`postgres`, `supabase_admin`). Each role
+has a password variable in `ROLE_PASSWORDS` (`backend/tests/rls/local_db.py`):
+`HARNESS_TEST_POSTGRES_PASSWORD` and `HARNESS_TEST_SUPABASE_ADMIN_PASSWORD`. When a variable is
+unset, the local `supabase start` default applies. An empty variable, or a probe for a role that
+is not in `ROLE_PASSWORDS`, fails with a message that names what is missing.
+
 ## Hosted projects
 
 Applying migrations to staging or production is a human step with owner approval

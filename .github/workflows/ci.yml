@@ -102,6 +102,9 @@ jobs:
         working-directory: backend
         env:
           HARNESS_TEST_REQUIRE_DB: "1"
+          # Local stack defaults (supabase start). Not secrets; never a hosted project.
+          HARNESS_TEST_POSTGRES_PASSWORD: postgres
+          HARNESS_TEST_SUPABASE_ADMIN_PASSWORD: postgres
         run: |
           uv sync --locked
           HARNESS_TEST_DATABASE_URL="$(supabase status -o env | sed -n 's/^DB_URL="\(.*\)"$/\1/p')"

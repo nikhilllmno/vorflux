@@ -6,8 +6,14 @@ These tests need no database, so they run in the backend job as well as the data
 from __future__ import annotations
 
 import pytest
+from psycopg.conninfo import conninfo_to_dict
 
-from .local_db import NonLocalDatabaseError, check_local_database_url
+from .local_db import (
+    MissingRoleSettingsError,
+    NonLocalDatabaseError,
+    as_database_user,
+    check_local_database_url,
+)
 
 LOCAL_URL = "postgresql://postgres:postgres@127.0.0.1:54322/postgres"
 
@@ -66,3 +72,28 @@ def test_db_fixture_checks_before_it_connects(monkeypatch: pytest.MonkeyPatch) -
     monkeypatch.setenv("HARNESS_TEST_DATABASE_URL", LOCAL_URL + "?host=remote.example")
     with pytest.raises(pytest.fail.Exception, match="Refusing"):
         conftest._database_url()
+
+
+def test_role_url_uses_the_local_default_password() -> None:
+    params = conninfo_to_dict(as_database_user(LOCAL_URL, "supabase_admin", {}))
+    assert (params["user"], params["password"], params["host"]) == (
+        "supabase_admin",
+        "postgres",
+        "127.0.0.1",
+    )
+
+
+def test_role_url_takes_the_password_from_the_role_variable() -> None:
+    environ = {"HARNESS_TEST_SUPABASE_ADMIN_PASSWORD": "not-the-default"}
+    params = conninfo_to_dict(as_database_user(LOCAL_URL, "supabase_admin", environ))
+    assert params["password"] == environ["HARNESS_TEST_SUPABASE_ADMIN_PASSWORD"]
+
+
+def test_role_url_refuses_a_role_without_settings() -> None:
+    with pytest.raises(MissingRoleSettingsError, match=r"'service_role'.*ROLE_PASSWORDS"):
+        as_database_user(LOCAL_URL, "service_role", {})
+
+
+def test_role_url_refuses_an_empty_password_variable() -> None:
+    with pytest.raises(MissingRoleSettingsError, match="HARNESS_TEST_POSTGRES_PASSWORD"):
+        as_database_user(LOCAL_URL, "postgres", {"HARNESS_TEST_POSTGRES_PASSWORD": ""})
