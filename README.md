@@ -15,7 +15,9 @@ and learns from its work. The feature set follows
 |---|---|
 | `backend/` | Python 3.12 + uv + FastAPI control-plane API (skeleton, runtime-adapter contract, tests); `Dockerfile` and `fly*.toml` (validated in CI, not deployed) |
 | `web/` | Next.js control-plane UI (skeleton) |
+| `supabase/` | Postgres migrations (tenancy schema and RLS) and local CLI config; see [`docs/schema.md`](docs/schema.md) |
 | `docs/architecture.md` | Architecture and design, milestones, open questions |
+| `docs/schema.md` | Database tables, RLS policies, isolation tests, how to add a table |
 | `docs/infra-map.md` | One-page map: services, environments, regions, secrets by name, owners |
 | `docs/runbook-deploy.md` | First-time setup, routine deploy, rollback, health checks, secret rotation |
 | `docs/backlog.md` | Milestones with Linear links, Hermes feature-parity checklist |
@@ -26,6 +28,7 @@ and learns from its work. The feature set follows
 
 - [uv](https://docs.astral.sh/uv/) (Python 3.12 is installed by uv if missing)
 - Node.js 24 (see `web/.nvmrc`) and npm
+- Optional: Docker and the [Supabase CLI](https://supabase.com/docs/guides/cli) 3.2.x for the database tests
 - Optional: [gitleaks](https://github.com/gitleaks/gitleaks) for local secret scans
 
 ## Run locally
@@ -49,6 +52,12 @@ npm run dev
 ```bash
 # backend
 cd backend && uv run ruff check . && uv run ruff format --check . && uv run mypy && uv run pytest
+
+# database (local Supabase stack, Docker; see docs/schema.md)
+supabase db start && supabase db reset
+supabase db lint --schema public,private --level warning --fail-on warning
+cd backend && HARNESS_TEST_DATABASE_URL="$(supabase status -o env | sed -n 's/^DB_URL="\(.*\)"$/\1/p')" \
+  HARNESS_TEST_REQUIRE_DB=1 uv run pytest tests/rls
 
 # web
 cd web && npm run lint && npm run typecheck && npm run build

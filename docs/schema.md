@@ -1,0 +1,165 @@
+# Database schema and row level security
+
+This page describes the Supabase Postgres schema in `supabase/migrations/` and the rules that
+every new table must follow. The design authority is
+[`architecture.md` §7](architecture.md#7-multi-tenancy-and-isolation-b2b) (tenant model,
+isolation, and tests). Linear: [DEX-10](https://linear.app/dextr-ai/issue/DEX-10/m1-supabase-schema-migrations-for-orgs-hotels-memberships-and-roles)
+(schema) and [DEX-11](https://linear.app/dextr-ai/issue/DEX-11/m1-rls-policies-and-two-org-isolation-tests-in-ci)
+(RLS and isolation tests).
+
+| | |
+|---|---|
+| Migrations | `supabase/migrations/<UTC timestamp>_<name>.sql`, forward-only, reviewed by PR |
+| Applied by | A human, with owner approval, per [`runbook-deploy.md` §3.1](runbook-deploy.md). Never from CI and never by an agent. |
+| Tested by | The CI job **Database (Supabase migrations, RLS isolation)** on a local Supabase stack |
+| Schemas | `public` (tables, exposed to the Data API), `private` (RLS helper functions, not exposed) |
+
+## Access model
+
+- **Deny by default.** RLS is on and forced (`FORCE ROW LEVEL SECURITY`) for every table in
+  `public`. A table with RLS on and no policy returns no rows to a client. Forced RLS also applies
+  to the table owner when the owner role does not have `BYPASSRLS`.
+- **Few roles bypass RLS.** On the local stack these roles have `BYPASSRLS`: `postgres` (owns the
+  tables), `service_role` (the control plane), and Supabase's own `supabase_admin`,
+  `supabase_etl_admin`, and `supabase_read_only_user`. A catalog test pins this exact set and
+  fails when it changes.
+- **Clients read, the control plane writes.** The `anon` role has no privileges. The
+  `authenticated` role has `SELECT` only, filtered by the policies below. There are no `INSERT`,
+  `UPDATE`, or `DELETE` policies. Every write goes through the control-plane API, which uses the
+  service role (it bypasses RLS) and checks the caller's role in code (§4.1, §7.2).
+- **Access comes from membership.** The caller is the JWT `sub` claim (`auth.uid()`). Policies
+  look up the caller's rows in `memberships` at query time, so a removed membership takes effect
+  on the next query. Policies do not read custom JWT claims.
+- **Our team's roles grant no data access through RLS.** `code_reviewer` and `platform` rows in
+  `team_roles` only let the user see their own role. Break-glass access goes through the control
+  plane with an audit event (DEX-24), never through a hidden RLS bypass.
+- **New objects start closed, for `postgres`.** Only `postgres` and `supabase_admin` can create
+  objects in `public`. The first migration revokes the default grants that Supabase gives `anon`
+  and `authenticated` on new tables, sequences, and functions that `postgres` creates, and
+  `supabase/config.toml` sets `auto_expose_new_tables = false`. Migrations run as `postgres`.
+  Each table grants what it needs explicitly.
+- **Objects from `supabase_admin` are detected, not prevented.** `supabase_admin` also has
+  default grants to `anon` and `authenticated` (all table privileges) in `public`. A migration
+  cannot remove them: `postgres` is not a superuser and gets "permission denied to change default
+  privileges", and Supabase skips a `postgres`-owned event trigger for superuser DDL. So
+  `supabase/checks/public_exposure.sql` lists every object in `public` that has RLS off or not
+  forced, a table without a policy, any `anon` privilege, an `authenticated` write privilege, or
+  client access to a sequence or function. It must return zero rows. CI runs it (catalog tests),
+  and the runbook runs it on a hosted project after every push. A test proves that it reports a
+  table that `supabase_admin` creates.
+
+## Tables
+
+All ids are `uuid` (`gen_random_uuid()`). Every table has `created_at` and `updated_at`
+(`timestamptz not null`; a trigger sets `updated_at` on every update). Deletes are hard deletes
+(§7.3); there is no `deleted_at`.
+
+| Table | Scope | Columns (besides id and timestamps) | Key rules |
+|---|---|---|---|
+| `plans` | Global | `code` (unique), `name`, `max_hotels`, `max_concurrent_runs`, `monthly_budget_usd`, `allowed_runtimes text[]`, `allowed_models text[]` | Limits are positive. `allowed_runtimes` is non-empty, has no duplicates, and holds only `claude_agent_sdk` and `openai_agents_sdk` (the plan-allowed values of `RuntimeKind`; a test keeps the two in step). `allowed_models` has no null, blank, or duplicate element; an empty list allows no model. The database does not check that a model belongs to an allowed runtime; the control plane does (see the PR decisions). |
+| `orgs` | Tenant root (`id` is the org id) | `slug` (unique), `name`, `plan_id` | `plan_id` is required. A plan in use cannot be deleted. |
+| `hotels` | Org | `org_id`, `slug` (globally unique), `name` | `slug` is unique across orgs because the repo is `hotel-<slug>` in one GitHub org (D24). `unique (org_id, id)` is the target of composite foreign keys. `org_id` and `slug` cannot change (the repo name depends on the slug). |
+| `memberships` | Org, optionally one hotel | `org_id`, `hotel_id` (null = org-wide), `user_id` (`auth.users`), `role` (`owner`, `admin`, `operator`, `viewer`) | `(org_id, hotel_id)` references `hotels (org_id, id)`, so the hotel must belong to the org. One row per `(org_id, user_id, hotel_id)`, nulls not distinct. `owner` is org-wide only. `org_id` and `hotel_id` cannot change. |
+| `team_roles` | Global (our team) | `user_id` (`auth.users`), `role` (`code_reviewer`, `platform`), `reason`, `expires_at` | One row per user and role. `platform` needs `expires_at` and `reason` (time-boxed break-glass, §7.1). |
+
+Deleting an org deletes its hotels and memberships. Deleting a hotel deletes its hotel-scoped
+memberships. Deleting a user in `auth.users` deletes their memberships and team roles.
+
+Indexes: every index on an org-scoped table that has more than one column starts with `org_id`
+(§7.2). `memberships (org_id, hotel_id)` serves the policy lookups and `memberships (user_id)`
+serves "my memberships".
+
+## Policies
+
+All policies are `FOR SELECT TO authenticated`. The helpers live in `private`, run as
+`SECURITY DEFINER` with `search_path = ''`, and answer questions about the caller only.
+
+| Table | Policy | A row is visible when the caller |
+|---|---|---|
+| `plans` | `plans_select_org_admins` | is an org-wide `owner` or `admin` of an org on the plan (`private.can_read_plan`) |
+| `orgs` | `orgs_select_members` | has any membership in the org, including a hotel-scoped one (`private.is_org_member`) |
+| `hotels` | `hotels_select_members` | has an org-wide membership in the org, or a membership for this hotel (`private.can_read_hotel`) |
+| `memberships` | `memberships_select_own_or_admin` | is the member, or is an `owner` or `admin` whose scope covers the row: org-wide sees the org, a hotel admin sees that hotel's rows (`private.has_hotel_role`) |
+| `team_roles` | `team_roles_select_own` | is the user of the row |
+
+Result by role, inside the caller's own org:
+
+| Role (scope) | `plans` | `orgs` | `hotels` | `memberships` | `team_roles` |
+|---|---|---|---|---|---|
+| `owner` (org-wide) | own org's plan | own org | all hotels | all in the org | own only |
+| `admin` (org-wide) | own org's plan | own org | all hotels | all in the org | own only |
+| `operator`, `viewer` (org-wide) | none | own org | all hotels | own only | own only |
+| `admin` (one hotel) | none | own org | that hotel | that hotel's rows and own | own only |
+| `operator`, `viewer` (one hotel) | none | own org | that hotel | own only | own only |
+| no membership, `code_reviewer`, `platform` | none | none | none | none | own only |
+| `anon` | permission denied | permission denied | permission denied | permission denied | permission denied |
+
+Nobody sees any row of another org.
+
+## Adding a table
+
+1. Put it in `public` with `org_id uuid not null references public.orgs (id) on delete cascade`.
+   For a hotel-scoped table add `hotel_id uuid not null` and
+   `foreign key (org_id, hotel_id) references public.hotels (org_id, id) on delete cascade`.
+2. Start every composite index with `org_id`. Add an index that starts with `org_id` if none does.
+3. Add `created_at`, `updated_at`, and the triggers `private.set_updated_at()` and
+   `private.prevent_tenant_key_change()`.
+4. In the same migration: `enable row level security`, `force row level security`, `revoke all ... from public, anon,
+   authenticated`, `grant all ... to service_role`, `grant select ... to authenticated`, and a
+   `for select to authenticated` policy. For a hotel-scoped table the usual policy is
+   `using (private.can_read_hotel(org_id, hotel_id))`.
+5. Add the table to `TABLES` in `backend/tests/rls/world.py` and its rule to
+   `World.expected_visible`, with seed rows for both orgs.
+
+The tests fail until each step is done: the catalog tests compare the set of tables in `public`
+with `TABLES`, and check RLS (enabled and forced), policies, grants, `org_id`, indexes, foreign
+keys, triggers, and the exposure check.
+A write policy for clients, or a policy for `anon`, also fails them; that needs a design change.
+
+## Tests
+
+| File | What it proves |
+|---|---|
+| `backend/tests/rls/test_rls_isolation.py` | Two orgs (A and B), each with two hotels, every hotel role org-wide and hotel-scoped, plus two users that mix roles and scopes (admin of one hotel and viewer of another; org-wide admin of A and viewer of a hotel in B), and users with no membership and with each team role. For every user and table, the visible rows equal the expected set. No user of org A reads, inserts, updates, or deletes a row of org B, and no client role can write its own org either (by privilege, and by RLS alone if privileges were granted by mistake). A hotel-scoped member sees only their hotel, and admin rights never carry into a scope where the user is only a viewer. Also: no `sub` claim reads nothing, `anon` is denied, a removed membership takes effect at once, self-promotion fails. |
+| `backend/tests/rls/test_rls_catalog.py` | Schema-wide rules from the catalog: every `public` table is covered, RLS is on and forced with a policy, the `BYPASSRLS` roles and the roles that can create in `public` are pinned, `supabase/checks/public_exposure.sql` returns no rows and reports a table that `supabase_admin` creates, policies are select-only for `authenticated`, grants, default privileges for new objects, tenant columns, foreign keys, `org_id`-first indexes, triggers, `SECURITY DEFINER` functions pin `search_path`. |
+| `backend/tests/rls/test_tenancy_constraints.py` | Data rules that hold for the service role too: cross-org hotel in a membership, hotel-scoped owner, duplicate membership, tenant key changes, time-boxed `platform`, the runtime list matches `RuntimeKind`, bad runtime and model lists, global and fixed hotel slugs, cascade on org delete, plan in use. |
+| `backend/tests/rls/test_local_db_guard.py` | Offline: the local-only guard rejects URLs that libpq could send to another server (`?host=`, `?hostaddr=`, services, several hosts, no host, `PGHOSTADDR` and `PGSERVICE`). |
+| `backend/tests/test_supabase_migrations.py` | Offline (runs in the backend job): migration file names, RLS enabled in the same file as each `create table`, no client write grants, `supabase/config.toml` keeps `private` unexposed and seeds off, `web/` never names the service role. |
+
+All rows are synthetic (`@example.test`) and every test runs in a transaction that is rolled back.
+
+## Run locally
+
+Needs Docker and the Supabase CLI 3.2.x (same as CI). These commands target the **local** stack
+only. Never add `--remote`, `--linked`, or `--db-url` with a hosted URL.
+
+```bash
+# from the repo root
+supabase db start                 # local Postgres on 127.0.0.1:54322
+supabase db reset                 # re-apply every migration from scratch
+supabase db lint --schema public,private --level warning --fail-on warning
+
+cd backend
+export HARNESS_TEST_DATABASE_URL="$(supabase status -o env | sed -n 's/^DB_URL="\(.*\)"$/\1/p')"
+HARNESS_TEST_REQUIRE_DB=1 uv run pytest tests/rls
+
+supabase stop --no-backup         # from the repo root, when done
+```
+
+Without `HARNESS_TEST_DATABASE_URL`, `uv run pytest` skips the database tests. The tests refuse
+any host other than a local one (`127.0.0.1`, `localhost`, `::1`, or a local container name).
+They check the parameters libpq will use, so `?host=`, `?hostaddr=`, a service, several hosts,
+or `PGHOSTADDR` and `PGSERVICE` in the environment are refused too.
+
+A few catalog probes log in as another built-in role (`postgres`, `supabase_admin`). Each role
+has a password variable in `ROLE_PASSWORDS` (`backend/tests/rls/local_db.py`):
+`HARNESS_TEST_POSTGRES_PASSWORD` and `HARNESS_TEST_SUPABASE_ADMIN_PASSWORD`. When a variable is
+unset, the local `supabase start` default applies. An empty variable, or a probe for a role that
+is not in `ROLE_PASSWORDS`, fails with a message that names what is missing.
+
+## Hosted projects
+
+Applying migrations to staging or production is a human step with owner approval
+([`runbook-deploy.md`](runbook-deploy.md) S5 and §3.1). Before the first push, match the local
+API setting in the hosted project: Project settings → Data API → turn off automatic exposure of
+new tables (the hosted match for `auto_expose_new_tables = false`), and keep `private` out of the exposed schemas.

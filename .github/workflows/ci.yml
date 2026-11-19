@@ -15,6 +15,8 @@ concurrency:
 env:
   GITLEAKS_VERSION: "8.30.1"
   GITLEAKS_SHA256: "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb"
+  SUPABASE_CLI_VERSION: "3.2.0"
+  SUPABASE_CLI_SHA256: "fb88b175a817563505be02c60872060bcb8d5c869a1aa5656eaeb085d4a2f1e4"
 
 jobs:
   secrets:
@@ -64,6 +66,53 @@ jobs:
       - run: uv run ruff format --check .
       - run: uv run mypy
       - run: uv run pytest
+
+  database:
+    name: Database (Supabase migrations, RLS isolation)
+    # Local stack only (docs/schema.md). No access token or project ref is set, so the CLI
+    # cannot reach a hosted project. Never add --remote, --linked or --db-url here.
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Supabase CLI (pinned, checksum verified)
+        run: |
+          curl -sSfL -o supabase.tgz \
+            "https://github.com/supabase/cli/releases/download/v${SUPABASE_CLI_VERSION}/supabase_${SUPABASE_CLI_VERSION}_linux_amd64.tar.gz"
+          echo "${SUPABASE_CLI_SHA256}  supabase.tgz" | sha256sum --check --strict
+          mkdir -p "${RUNNER_TEMP}/supabase-cli"
+          tar -xzf supabase.tgz -C "${RUNNER_TEMP}/supabase-cli" supabase
+          rm supabase.tgz
+          echo "${RUNNER_TEMP}/supabase-cli" >> "${GITHUB_PATH}"
+      - name: Start the local database
+        run: supabase db start
+      - name: Apply every migration from scratch
+        run: supabase db reset
+      - name: Lint the schema (plpgsql_check)
+        run: supabase db lint --schema public,private --level warning --fail-on warning
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: "0.13.8"
+          python-version: "3.12"
+          enable-cache: true
+          cache-dependency-glob: backend/uv.lock
+      - name: RLS isolation tests (two orgs, every table, every role)
+        working-directory: backend
+        env:
+          HARNESS_TEST_REQUIRE_DB: "1"
+          # Local stack defaults (supabase start). Not secrets; never a hosted project.
+          HARNESS_TEST_POSTGRES_PASSWORD: postgres
+          HARNESS_TEST_SUPABASE_ADMIN_PASSWORD: postgres
+        run: |
+          uv sync --locked
+          HARNESS_TEST_DATABASE_URL="$(supabase status -o env | sed -n 's/^DB_URL="\(.*\)"$/\1/p')"
+          export HARNESS_TEST_DATABASE_URL
+          uv run pytest tests/rls
+      - name: Stop the local database
+        if: always()
+        run: supabase stop --no-backup || true
 
   web:
     name: Web (Next.js lint, typecheck, build)
