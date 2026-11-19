@@ -20,6 +20,14 @@
 -- Deny by default for objects created later in `public`.
 -- Supabase grants every new table, sequence, and function in `public` to `anon` and
 -- `authenticated`. The harness grants each object explicitly instead.
+--
+-- Only two roles can create objects in `public`: `postgres` (migrations, SQL editor) and
+-- `supabase_admin` (Supabase's own superuser, used for extension installs and platform work).
+-- The defaults of `postgres` are revoked below. The defaults of `supabase_admin` cannot be
+-- changed from a migration: `postgres` is not a member of `supabase_admin`, so Postgres refuses
+-- ("permission denied to change default privileges"), and Supabase skips event triggers that
+-- `postgres` owns when `supabase_admin` runs DDL. supabase/checks/public_exposure.sql detects
+-- such objects instead; CI runs it and docs/runbook-deploy.md runs it after every push.
 -- ---------------------------------------------------------------------------------------------
 alter default privileges for role postgres in schema public
   revoke all on tables from anon, authenticated;
@@ -86,8 +94,44 @@ begin
 end;
 $$;
 
+-- A hotel's slug names its repo `hotel-<slug>` (D24) and its GitHub App allowlist entry, so
+-- it never changes after insert. A rename is a new hotel row or a reviewed migration.
+create function private.prevent_slug_change()
+returns trigger
+language plpgsql
+set search_path = ''
+as $$
+begin
+  if new.slug is distinct from old.slug then
+    raise exception 'slug is immutable on %.%', tg_table_schema, tg_table_name
+      using errcode = 'check_violation';
+  end if;
+  return new;
+end;
+$$;
+
 revoke all on function private.set_updated_at() from public;
 revoke all on function private.prevent_tenant_key_change() from public;
+revoke all on function private.prevent_slug_change() from public;
+
+-- True when every element is a non-blank string and no element repeats. Plan limit arrays use
+-- it, so a NULL, empty, or duplicate id cannot reach the run orchestrator.
+create function private.is_clean_id_list(ids text[])
+returns boolean
+language sql
+immutable
+set search_path = ''
+as $$
+  select ids is not null
+    and array_position(ids, null) is null
+    and not exists (select 1 from unnest(ids) as v (id) where btrim(v.id) = '')
+    and cardinality(ids) = (select count(distinct v.id) from unnest(ids) as v (id));
+$$;
+
+revoke all on function private.is_clean_id_list(text[]) from public;
+-- The check constraints on `plans` call it as the writing role.
+grant usage on schema private to service_role;
+grant execute on function private.is_clean_id_list(text[]) to service_role;
 
 -- ---------------------------------------------------------------------------------------------
 -- plans: global catalog of limits per org (section 7.1, "Plans"). Not tenant-owned.
@@ -104,15 +148,23 @@ create table public.plans (
     check (max_concurrent_runs > 0),
   monthly_budget_usd numeric(12, 2) not null
     check (monthly_budget_usd >= 0),
-  -- Runtime ids from backend/src/harness/runtimes/base.py (RuntimeName).
+  -- Runtime ids of `RuntimeKind` in backend/src/harness/runtimes/base.py, without `fake`:
+  -- the two runtimes of D2 (docs/architecture.md v0.6). No duplicates.
+  -- TODO(https://github.com/nikhilllmno/vorflux/pull/4): until that PR is on main, `RuntimeKind`
+  -- still lists `deep_agents` and `opencode`. backend/tests/rls/test_tenancy_constraints.py
+  -- pins this list against `RuntimeKind`.
   allowed_runtimes text[] not null default array['claude_agent_sdk']
     check (
       cardinality(allowed_runtimes) > 0
-      and allowed_runtimes <@ array['claude_agent_sdk', 'openai_agents_sdk', 'deep_agents', 'opencode']
+      and allowed_runtimes <@ array['claude_agent_sdk', 'openai_agents_sdk']
+      and private.is_clean_id_list(allowed_runtimes)
     ),
   -- Model ids the plan allows. A model that is not in the list is refused; an empty list
-  -- allows no model. The per-hotel model policy (DEX-23) narrows this further.
-  allowed_models text[] not null default '{}',
+  -- allows no model. The per-hotel model policy (DEX-23) narrows this further. No NULL, blank,
+  -- or duplicate ids. The database does not check that a model belongs to an allowed runtime
+  -- (see docs/schema.md, "Plans").
+  allowed_models text[] not null default '{}'
+    check (private.is_clean_id_list(allowed_models)),
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now()
 );
@@ -227,16 +279,26 @@ create trigger hotels_prevent_tenant_key_change before update on public.hotels
   for each row execute function private.prevent_tenant_key_change();
 create trigger memberships_prevent_tenant_key_change before update on public.memberships
   for each row execute function private.prevent_tenant_key_change();
+create trigger hotels_prevent_slug_change before update on public.hotels
+  for each row execute function private.prevent_slug_change();
 
 -- ---------------------------------------------------------------------------------------------
--- Row level security on, no client privileges (deny by default).
--- `service_role` (control plane only) bypasses RLS and keeps its privileges.
+-- Row level security on and forced, no client privileges (deny by default).
+-- FORCE applies RLS to the table owner too, unless the owner has BYPASSRLS. Today the owner is
+-- `postgres`, which bypasses RLS, so FORCE guards a later owner role without BYPASSRLS.
+-- `service_role` (control plane only) bypasses RLS and keeps its privileges. The set of roles
+-- with BYPASSRLS is pinned in backend/tests/rls/test_rls_catalog.py.
 -- ---------------------------------------------------------------------------------------------
 alter table public.plans enable row level security;
 alter table public.orgs enable row level security;
 alter table public.hotels enable row level security;
 alter table public.memberships enable row level security;
 alter table public.team_roles enable row level security;
+alter table public.plans force row level security;
+alter table public.orgs force row level security;
+alter table public.hotels force row level security;
+alter table public.memberships force row level security;
+alter table public.team_roles force row level security;
 
 revoke all on table public.plans, public.orgs, public.hotels, public.memberships, public.team_roles
   from public, anon, authenticated;
