@@ -1,3 +1,4 @@
+import pytest
 from fastapi.testclient import TestClient
 
 from harness import __version__
@@ -12,14 +13,15 @@ def test_healthz_reports_ok_and_version(client: TestClient) -> None:
     assert response.json() == {"status": "ok", "version": __version__, "environment": "test"}
 
 
-def test_runtimes_lists_fake_runtime_in_test_env(client: TestClient) -> None:
+def test_runtimes_lists_injected_runtimes(client: TestClient) -> None:
     body = client.get("/v1/runtimes").json()
 
     assert [r["kind"] for r in body["runtimes"]] == ["fake"]
     assert body["runtimes"][0]["capabilities"]["streaming"] is True
 
 
-def test_production_does_not_register_fake_runtime() -> None:
-    client = TestClient(create_app(Settings(environment="production")))
+@pytest.mark.parametrize("environment", ["local", "test", "production"])
+def test_app_registers_no_test_double_in_any_environment(environment: str) -> None:
+    client = TestClient(create_app(Settings(environment=environment)))
 
     assert client.get("/v1/runtimes").json() == {"runtimes": []}

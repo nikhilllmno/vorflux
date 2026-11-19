@@ -1,9 +1,9 @@
 # Hotel Agent Harness
 
 One harness for every hotel customer. It runs an operations-and-coding agent per hotel that
-builds and changes the hotel's voice, text, and email agents (on Claude Agent SDK, OpenAI Agents
-SDK, LangChain Deep Agents, or opencode), does tasks with skills and tools, runs on a schedule,
-and learns from its work. The feature set follows
+builds and changes the hotel's voice, text, and email agents, does tasks with skills and tools,
+runs on a schedule, and learns from its work. The harness agent runs on the Claude Agent SDK or
+the OpenAI Agents SDK. The feature set follows
 [Hermes Agent](https://github.com/NousResearch/hermes-agent) (MIT); see
 [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
 

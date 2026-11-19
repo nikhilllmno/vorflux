@@ -1,4 +1,4 @@
-"""Deterministic in-process runtime for tests and local development. Calls no model."""
+"""Test doubles. They live outside the `harness` package, so production code cannot use them."""
 
 from collections.abc import AsyncIterator
 
@@ -7,15 +7,19 @@ from harness.runtimes.base import (
     RunCompleted,
     RunEvent,
     RunRequest,
-    RuntimeKind,
     TextDelta,
 )
 
+FAKE_KIND = "fake"
+"""Registry id of the fake runtime. It is not a `RuntimeKind`."""
+
 
 class FakeRuntime:
+    """Deterministic in-process runtime. Calls no model."""
+
     @property
-    def kind(self) -> RuntimeKind:
-        return RuntimeKind.FAKE
+    def kind(self) -> str:
+        return FAKE_KIND
 
     def capabilities(self) -> Capabilities:
         return Capabilities(

@@ -1,7 +1,7 @@
 """The runtime-adapter contract every agent framework plugs into.
 
-One adapter per framework (Claude Agent SDK, OpenAI Agents SDK, LangChain Deep Agents, opencode)
-translates this contract to the framework's own API. Harness features (tenancy, approvals,
+One adapter per runtime (Claude Agent SDK, OpenAI Agents SDK) translates this contract to the
+runtime's own API. A later runtime needs only a new adapter. Harness features (tenancy, approvals,
 memory, skills, audit) live above this seam, so they work the same for every framework.
 See docs/architecture.md, section "Agent-runtime adapter layer".
 """
@@ -15,11 +15,15 @@ from harness.tenancy import TenantContext
 
 
 class RuntimeKind(StrEnum):
+    """The production runtimes that a plan, a hotel policy, or a run config may name.
+
+    This enum is the one source of truth for the runtime ids. The `plans.allowed_runtimes`
+    database constraint must hold the same ids. Test doubles are not members: they live under
+    `tests/` and register under their own id, so production config cannot select them.
+    """
+
     CLAUDE_AGENT_SDK = "claude_agent_sdk"
     OPENAI_AGENTS_SDK = "openai_agents_sdk"
-    DEEP_AGENTS = "deep_agents"
-    OPENCODE = "opencode"
-    FAKE = "fake"
 
 
 @dataclass(frozen=True, slots=True)
@@ -81,7 +85,9 @@ RunEvent = TextDelta | ToolCall | ApprovalRequired | RunCompleted | RunFailed
 @runtime_checkable
 class AgentRuntime(Protocol):
     @property
-    def kind(self) -> RuntimeKind: ...
+    def kind(self) -> str:
+        """A `RuntimeKind` for production adapters. Test doubles use their own id."""
+        ...
 
     def capabilities(self) -> Capabilities: ...
 
@@ -100,18 +106,18 @@ class RuntimeRegistry:
     """Name -> adapter table. Adapters register at startup; lookups never import lazily."""
 
     def __init__(self) -> None:
-        self._adapters: dict[RuntimeKind, AgentRuntime] = {}
+        self._adapters: dict[str, AgentRuntime] = {}
 
     def register(self, runtime: AgentRuntime) -> None:
         if runtime.kind in self._adapters:
             raise ValueError(f"runtime already registered: {runtime.kind}")
         self._adapters[runtime.kind] = runtime
 
-    def get(self, kind: RuntimeKind) -> AgentRuntime:
+    def get(self, kind: str) -> AgentRuntime:
         try:
             return self._adapters[kind]
         except KeyError:
             raise UnknownRuntimeError(kind) from None
 
-    def kinds(self) -> list[RuntimeKind]:
+    def kinds(self) -> list[str]:
         return sorted(self._adapters)
