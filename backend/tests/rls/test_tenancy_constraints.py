@@ -110,10 +110,11 @@ def test_platform_team_role_is_time_boxed_with_a_reason(conn: Conn) -> None:
     )
 
 
-# The runtimes a plan may allow: `RuntimeKind` without the test-only `fake` runtime.
-# TODO(https://github.com/nikhilllmno/vorflux/pull/4): when that PR is on main, `RuntimeKind`
-# lists only these two runtimes. Then replace this constant with
-# `frozenset(kind.value for kind in RuntimeKind if kind is not RuntimeKind.FAKE)`.
+# The runtimes a plan may allow. On main, `RuntimeKind` also has `deep_agents`, `opencode`, and
+# the test-only `fake`; the database refuses all three.
+# TODO(https://github.com/nikhilllmno/vorflux/pull/4): that PR leaves only these two runtimes in
+# `RuntimeKind` and removes `FAKE`. When it is on main, replace this constant with
+# `frozenset(kind.value for kind in RuntimeKind)`.
 PLAN_RUNTIMES = frozenset({"claude_agent_sdk", "openai_agents_sdk"})
 
 
