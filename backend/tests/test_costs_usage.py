@@ -287,3 +287,13 @@ def test_the_mapped_value_is_a_valid_report_field() -> None:
         _payload(cache_write_tokens=1000, cache_write_1h_tokens=one_hour)
     )
     assert report.cache_write_1h_tokens == 750
+
+
+@pytest.mark.parametrize(
+    ("total", "five_minute"),
+    [(10.0, 4), (10, 4.0), (True, False), (10, True), ("10", 4), (Decimal(10), 4)],
+)
+def test_the_split_helper_refuses_a_non_int_count(total: Any, five_minute: Any) -> None:
+    # Strict like UsageReport: a float or bool is a bug in the adapter, not a token count.
+    with pytest.raises(TypeError):
+        cache_write_1h_from_model_usage(total, five_minute)

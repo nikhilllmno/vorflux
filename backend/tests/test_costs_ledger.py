@@ -604,7 +604,8 @@ def test_pre_run_check_refuses_an_unpriced_model_until_the_table_covers_it(
 # Hermes_Like_Bot check of hermes_like_agent PR#3 at 19196c3, item 9 ----------------------------
 # Only a model-pricing gap refuses the model for the hotel; every other reason stops one run.
 
-REFUSED_TEXT = "model refused for this hotel until priced"
+# The price table is global, so check_run_models refuses the model for every hotel (C11).
+REFUSED_TEXT = "run stopped; model refused until priced"
 RUN_ONLY_TEXT = "only this run stopped"
 
 
@@ -646,6 +647,7 @@ def test_unpriced_alert_text_depends_on_the_reason(
     if refuses_model:
         assert REFUSED_TEXT in alert.summary
         assert RUN_ONLY_TEXT not in alert.summary
+        assert "this hotel" not in alert.summary
     else:
         assert RUN_ONLY_TEXT in alert.summary
         assert "refused" not in alert.summary

@@ -289,3 +289,27 @@ def test_doc_maps_a_missing_claude_provider_to_other() -> None:
         "absent or anything else → `other` (fail closed)"
     ) in doc
     assert "absent or `firstParty` → `first_party`" not in doc
+
+
+# Follow-ups after the round-4 verification (C11 wording, serving in the key) ------------------
+
+
+def test_doc_c11_says_the_model_is_refused_for_every_hotel() -> None:
+    [c11] = [line for line in _costs_doc().splitlines() if line.startswith("| C11 |")]
+    assert (
+        "refuse that exact model id for every hotel until it is priced, because the price "
+        "table is global" in _one_line(c11)
+    )
+    doc = _one_line(_costs_doc())
+    assert '"run stopped; model refused until priced"' in doc
+    assert "refused for this hotel" not in doc
+
+
+def test_doc_idempotency_says_a_changed_serving_is_a_new_key() -> None:
+    doc = _one_line(_costs_doc())
+    assert (
+        "A resend of a segment with a changed `serving` is a new key, so it adds a row and no "
+        "conflict warning"
+    ) in doc
+    assert "USD totals and caps stay correct" in doc
+    assert "token totals of that run count those tokens again" in doc
