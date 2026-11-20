@@ -48,9 +48,10 @@ fit a Postgres `bigint`, unknown fields are rejected, and the report is immutabl
 `sdk_reported_cost_usd` normalisation. A cross-check field never rejects the report, because
 the tokens are already spent:
 
-- Accepted: a `Decimal`, an `int` (not a `bool`) or a decimal string, finite, ≥ 0 and below
-  10^11. It is rounded half up to 9 places, the scale of `numeric(20, 9)`, so Postgres never
-  rounds it again.
+- Accepted: a `Decimal`, an `int` (not a `bool`) or a decimal string, finite and ≥ 0. It is
+  rounded half up to 9 places, the scale of `numeric(20, 9)`, so Postgres never rounds it
+  again. The range check (below 10^11) runs after the rounding, so a value that rounds up to
+  10^11 becomes null instead of failing the insert.
 - Anything else becomes null and logs a warning on `harness.costs` with run_id and
   segment_id: a float (convert with `Decimal(str(x))` in the adapter), a negative value
   (including a float delta such as `-5.5e-17`), NaN, infinity, an unparsable string or an
@@ -144,7 +145,9 @@ table)` uses it for a report. Use `price_usage` for a running estimate inside a 
 Usage is always recorded. When a report cannot be priced, its row gets
 `pricing_status = 'unpriced'`, `cost_usd = null` and an `unpriced_reason`, and a warning with
 the reason code is logged on `harness.costs`. The run must stop, and the caps fail closed
-(decision C11). Reason codes (each is the `reason` of an `UnpricedUsageError` subclass):
+(decision C11). Reason codes (each is the `reason` of an `UnpricedUsageError` subclass;
+`UNPRICED_REASONS` in `prices.py` lists them, a subclass with another code fails at import, the
+base class cannot be raised, and a test checks that the SQL `unpriced_reason` list matches):
 
 | `unpriced_reason` | Cause |
 |---|---|
@@ -234,7 +237,20 @@ denies whenever `spend.unpriced_rows > 0` (reason contains "unpriced", remaining
   the final report.
 
 Unpriced usage fails closed (decision C11): the run that has it stops, and the hotel daily
-cap denies for the rest of that UTC day.
+cap denies for the rest of that UTC day. What the built default does, exactly:
+
+- The run that has the unpriced row stops at that report, and its run cap denies from then on,
+  also on later days.
+- Only when the caller checks a hotel daily cap (`SpendCaps.hotel_daily_usd` or
+  `check_hotel_daily_cap`): every other run of that hotel stops at its next report or segment
+  check, including runs already in flight, and new runs are refused. With a run cap only,
+  other runs continue.
+- The hotel block lasts until 00:00 UTC (05:30 IST). A row at 00:01 UTC blocks for almost 24
+  hours.
+- Nothing clears it early. Rows are immutable, and a price added later does not reprice the
+  row. Other hotels of the org are not affected.
+
+The scope of this block is an open owner decision (C11 options).
 
 Worst-case overshoot (decision C14):
 
@@ -391,7 +407,7 @@ belongs to another hotel is rejected.
 | C8 | Pricing modes | Standard first-party only: no batch, flex, priority, fast or regional uplift; web search (C12) and Bedrock, Vertex AI or gateway prices (C13) are not modelled | Add a pricing-mode field in contract v3 |
 | C9 | Explicit `pydantic` dependency | Not added now: it comes through FastAPI and pydantic-settings, and PR#5 edits `pyproject.toml`/`uv.lock` | Add `pydantic>=2.14,<3` after PR#5 merges |
 | C10 | `docs/backlog.md` | Not edited (PR#4 edits it) | Link this PR from the DEX-24 row after PR#4 merges |
-| C11 | Usage that cannot be priced | Record the tokens with `pricing_status = 'unpriced'` and no cost; fail closed: the run stops and the hotel daily cap denies for the rest of that UTC day | Price unknown models at the most expensive known price (fail open, wrong bills) |
+| C11 | Usage that cannot be priced | Record the tokens with `pricing_status = 'unpriced'` and no cost; fail closed: the run stops and, where a hotel daily cap is checked, the hotel is blocked until 00:00 UTC (see "Spend caps"). Open owner decision | 1: keep the hotel block until the UTC day ends (built); 2: stop only the run, alert, and refuse that model for the hotel; 3: block the hotel until an owner or admin clears it (needs an acknowledgement record, because cost rows are immutable); rejected: price unknown models at the most expensive known price (fail open, wrong bills) |
 | C12 | Web search requests | Recorded unpriced, so a run that uses web search stops (C11) | Price them at the published rate (about 10 USD per 1,000 searches) in a later table |
 | C13 | Non-first-party and fine-tuned ids (Bedrock, Vertex AI, gateway prefixes, `ft:`) | Refused (`NonFirstPartyModelError`), recorded unpriced if they still run | Add provider-specific tables when a hotel needs them |
 | C14 | Concurrency of the hotel daily cap | Record, sum and check in one atomic step (a lock in memory; a per-hotel `pg_advisory_xact_lock` in Postgres) and check after each report. Worst case: the segments in flight when the cap is crossed | Reserve an estimated budget before each segment (stricter, more complex) |

@@ -14,6 +14,7 @@ from decimal import Decimal
 from enum import StrEnum
 from itertools import pairwise
 from types import MappingProxyType
+from typing import ClassVar
 
 
 class Provider(StrEnum):
@@ -23,13 +24,35 @@ class Provider(StrEnum):
     OPENAI = "openai"
 
 
+# Every value of run_costs.unpriced_reason (the CHECK list in docs/costs.md must match).
+UNPRICED_REASONS = (
+    "unknown_model",
+    "tiered_pricing",
+    "non_first_party",
+    "web_search",
+    "cost_out_of_range",
+    "no_price_table",
+)
+
+
 class UnpricedUsageError(ValueError):
     """Usage that cannot be priced. Never price it as zero: record it unpriced and stop the run.
 
-    `reason` is the code stored in run_costs.unpriced_reason.
+    Raise a subclass. Each subclass has a `reason` from UNPRICED_REASONS, which is stored in
+    run_costs.unpriced_reason; a code that the SQL CHECK rejects would lose the tokens.
     """
 
-    reason = "unpriced"
+    reason: ClassVar[str]
+
+    def __init_subclass__(cls, **kwargs: object) -> None:
+        super().__init_subclass__(**kwargs)
+        if getattr(cls, "reason", None) not in UNPRICED_REASONS:
+            raise TypeError(f"{cls.__name__}.reason must be one of {UNPRICED_REASONS}")
+
+    def __init__(self, *args: object) -> None:
+        if type(self) is UnpricedUsageError:
+            raise TypeError("raise a subclass of UnpricedUsageError, which has a reason code")
+        super().__init__(*args)
 
 
 class UnknownModelError(UnpricedUsageError):
@@ -324,6 +347,7 @@ PRICE_BOOK = PriceBook([PRICE_TABLE])
 __all__ = [
     "PRICE_BOOK",
     "PRICE_TABLE",
+    "UNPRICED_REASONS",
     "ModelPrice",
     "NoPriceTableError",
     "NonFirstPartyModelError",

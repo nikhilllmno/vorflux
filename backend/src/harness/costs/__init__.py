@@ -24,6 +24,7 @@ from harness.costs.ledger import (
 from harness.costs.prices import (
     PRICE_BOOK,
     PRICE_TABLE,
+    UNPRICED_REASONS,
     ModelPrice,
     NonFirstPartyModelError,
     NoPriceTableError,
@@ -58,6 +59,7 @@ __all__ = [
     "MAX_TOKENS",
     "PRICE_BOOK",
     "PRICE_TABLE",
+    "UNPRICED_REASONS",
     "CapDecision",
     "CostLedger",
     "CostOutOfRangeError",

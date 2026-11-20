@@ -59,9 +59,11 @@ def _parse_sdk_cost(value: object) -> tuple[Decimal | None, str | None]:
         return None, "is not finite"
     if amount < 0:
         return None, "is negative"
+    # Round first: a value just under 10^11 can round up to 10^11, which does not fit.
+    amount = quantize_usd(amount)
     if amount >= MAX_USD:
         return None, "is out of range"
-    return quantize_usd(amount), None
+    return amount, None
 
 
 class UsageReport(BaseModel):
