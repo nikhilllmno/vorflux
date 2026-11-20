@@ -14,10 +14,14 @@ from harness.costs import (
     PriceTable,
     Provider,
     SdkCostCheck,
+    TieredPricingError,
     TokenPrices,
+    UnknownModelError,
     UsageReport,
+    check_priced,
     check_sdk_cost,
     cost_usd,
+    price_usage,
 )
 
 RUN_ID = UUID("00000000-0000-4000-8000-000000000002")
@@ -120,6 +124,51 @@ def test_large_usage_keeps_full_precision() -> None:
     report = _report(input_tokens=987_654_321, output_tokens=123_456_789)
     # 987654321*3 + 123456789*15 = 2962962963 + 1851851835 = 4814814798 -> / 1e6
     assert cost_usd(report) == Decimal("4814.814798")
+
+
+def test_cost_of_an_unpriced_model_raises_instead_of_zero() -> None:
+    with pytest.raises(UnknownModelError, match="claude-imaginary-9"):
+        cost_usd(_report(model="claude-imaginary-9", input_tokens=1))
+
+
+# Pricing during a segment and before a run ---------------------------------------------------
+
+
+def test_price_usage_prices_raw_counts_like_a_report() -> None:
+    # The orchestrator prices running usage inside a segment to stop a run early (review F4).
+    counts = {
+        "input_tokens": 1_000,
+        "output_tokens": 2_000,
+        "cache_read_tokens": 3_000,
+        "cache_write_tokens": 4_000,
+    }
+    priced = price_usage(Provider.ANTHROPIC, "claude-sonnet-4-6", **counts)
+    assert priced == cost_usd(_report(**counts)) == Decimal("0.0489")
+
+
+@pytest.mark.parametrize(
+    ("bad", "error"), [(-1, ValueError), (1.5, TypeError), (True, TypeError), (2**63, ValueError)]
+)
+def test_price_usage_refuses_bad_counts(bad: object, error: type[Exception]) -> None:
+    with pytest.raises(error):
+        price_usage(
+            Provider.OPENAI,
+            "gpt-5",
+            input_tokens=bad,  # type: ignore[arg-type]
+            output_tokens=0,
+            cache_read_tokens=0,
+            cache_write_tokens=0,
+        )
+
+
+def test_check_priced_lets_the_orchestrator_refuse_a_model_before_the_run() -> None:
+    assert check_priced(Provider.ANTHROPIC, "claude-haiku-4-5-20251001").model == (
+        "claude-haiku-4-5"
+    )
+    with pytest.raises(UnknownModelError, match="haiku"):
+        check_priced(Provider.ANTHROPIC, "haiku")
+    with pytest.raises(TieredPricingError):
+        check_priced(Provider.OPENAI, "gpt-5.5")
 
 
 # SDK cost cross-check -------------------------------------------------------------------------

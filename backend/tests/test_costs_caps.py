@@ -10,12 +10,14 @@ import pytest
 from harness.costs import (
     CapDecision,
     InMemoryCostLedger,
+    Provider,
     RunTenant,
     UnknownRunError,
     UsageReport,
     check_hotel_daily_cap,
     check_run_cap,
     check_spend_cap,
+    price_usage,
 )
 from harness.tenancy import TenantContext
 
@@ -160,3 +162,67 @@ def test_daily_cap_needs_an_aware_time() -> None:
     ledger = InMemoryCostLedger(Runs(), clock=Clock())
     with pytest.raises(ValueError, match="timezone"):
         check_hotel_daily_cap(ledger, _tenant(), Decimal("1"), now=datetime(2026, 11, 20))
+
+
+def _unpriced(run_id: UUID) -> UsageReport:
+    payload: dict[str, Any] = {
+        "run_id": run_id,
+        "segment_id": "seg-x",
+        "provider": "anthropic",
+        "model": "haiku",  # a CLI alias, not a priced id
+        "input_tokens": 10,
+        "output_tokens": 0,
+        "cache_read_tokens": 0,
+        "cache_write_tokens": 0,
+    }
+    return UsageReport.model_validate(payload)
+
+
+def test_unpriced_usage_counts_as_over_every_cap() -> None:
+    # Review F2: spend that cannot be priced is unknown, so the caps fail closed.
+    runs, clock = Runs(), Clock()
+    ledger = InMemoryCostLedger(runs, clock=clock)
+    run = runs.add()
+    ledger.record(_unpriced(run))
+    t = _tenant()
+    run_cap = check_run_cap(ledger, t, run, Decimal("1000"))
+    daily_cap = check_hotel_daily_cap(ledger, t, Decimal("1000"), now=clock())
+    for decision in (run_cap, daily_cap):
+        assert not decision.allowed
+        assert decision.unpriced_rows == 1
+        assert "unpriced" in decision.reason
+    # The next UTC day starts clean for new runs; the run itself stays stopped.
+    clock.now += timedelta(days=1)
+    assert check_hotel_daily_cap(ledger, t, Decimal("1000"), now=clock()).allowed
+    assert not check_run_cap(ledger, t, run, Decimal("1000")).allowed
+
+
+def test_running_estimate_inside_a_segment_counts_toward_the_run_cap() -> None:
+    # Review F4: the orchestrator prices usage seen so far in the open segment with
+    # price_usage and passes it as pending_usd, so it can stop before the final report.
+    runs, clock = Runs(), Clock()
+    ledger = InMemoryCostLedger(runs, clock=clock)
+    run = runs.add()
+    ledger.record(_usage(run, "seg-1", 3))
+    t = _tenant()
+    in_flight = price_usage(
+        Provider.OPENAI,
+        "gpt-5",
+        input_tokens=0,
+        output_tokens=200_000,  # 2 USD
+        cache_read_tokens=0,
+        cache_write_tokens=0,
+    )
+    assert check_run_cap(ledger, t, run, Decimal("6"), pending_usd=in_flight).allowed
+    decision = check_run_cap(ledger, t, run, Decimal("5"), pending_usd=in_flight)
+    assert not decision.allowed
+    assert decision.spent_usd == Decimal("5")
+    assert not check_hotel_daily_cap(
+        ledger, t, Decimal("5"), now=clock(), pending_usd=in_flight
+    ).allowed
+
+
+def test_pending_spend_must_be_a_non_negative_decimal() -> None:
+    ledger = InMemoryCostLedger(Runs(), clock=Clock())
+    with pytest.raises(ValueError, match="negative"):
+        check_run_cap(ledger, _tenant(), uuid4(), Decimal("1"), pending_usd=Decimal("-1"))

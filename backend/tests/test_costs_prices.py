@@ -8,6 +8,7 @@ import pytest
 from harness.costs import (
     PRICE_TABLE,
     ModelPrice,
+    NonFirstPartyModelError,
     PriceTable,
     Provider,
     TieredPricingError,
@@ -96,6 +97,24 @@ def test_models_with_prompt_length_tiers_are_refused(provider: Provider, model: 
     # does not carry (docs/costs.md, decision C2).
     with pytest.raises(TieredPricingError, match="prompt-length"):
         PRICE_TABLE.get(provider, model)
+
+
+@pytest.mark.parametrize(
+    ("provider", "model"),
+    [
+        (Provider.ANTHROPIC, "anthropic.claude-sonnet-4-5-20250929-v1:0"),  # Bedrock
+        (Provider.ANTHROPIC, "us.anthropic.claude-haiku-4-5-20251001-v1:0"),  # Bedrock region
+        (Provider.ANTHROPIC, "global.anthropic.claude-opus-4-5-20251101-v1:0"),
+        (Provider.ANTHROPIC, "claude-sonnet-4-5@20250929"),  # Vertex AI
+        (Provider.OPENAI, "openai/gpt-5"),  # a gateway route
+        (Provider.OPENAI, "ft:gpt-4o-mini:acme::abc123"),  # fine-tuned
+    ],
+)
+def test_non_first_party_ids_are_refused_explicitly(provider: Provider, model: str) -> None:
+    # Review F5: the table holds first-party API prices only.
+    with pytest.raises(NonFirstPartyModelError, match="first-party"):
+        PRICE_TABLE.get(provider, model)
+    assert issubclass(NonFirstPartyModelError, UnknownModelError)
 
 
 def test_tiered_pricing_error_is_an_unknown_model_error() -> None:

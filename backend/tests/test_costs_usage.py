@@ -1,5 +1,6 @@
 """UsageReport (runtime contract v2): validation at the edge and the idempotency key."""
 
+import logging
 from decimal import Decimal
 from typing import Any
 from uuid import UUID, uuid4
@@ -63,20 +64,48 @@ def test_segment_id_must_not_be_blank() -> None:
         UsageReport.model_validate(_payload(segment_id=" "))
 
 
-def test_model_must_belong_to_the_reported_provider() -> None:
-    with pytest.raises(ValidationError, match="gpt-5"):
-        UsageReport.model_validate(_payload(provider="anthropic", model="gpt-5"))
+def test_unpriced_model_still_parses_so_its_tokens_are_kept() -> None:
+    # Pricing happens in the ledger, which stores the tokens with no cost and makes the caps
+    # deny. Rejecting the report here would drop tokens that were already spent (review F2).
+    for provider, model in [("anthropic", "claude-imaginary-9"), ("anthropic", "gpt-5")]:
+        report = UsageReport.model_validate(_payload(provider=provider, model=model))
+        assert report.model == model
 
 
-def test_unknown_model_is_rejected_at_the_edge() -> None:
-    with pytest.raises(ValidationError, match="unknown model"):
-        UsageReport.model_validate(_payload(model="claude-imaginary-9"))
-
-
-@pytest.mark.parametrize("bad", ["-0.01", "NaN", "Infinity"])
-def test_sdk_cost_must_be_a_finite_non_negative_number(bad: str) -> None:
+def test_token_counts_fit_a_postgres_bigint() -> None:
+    UsageReport.model_validate(_payload(output_tokens=2**63 - 1))
     with pytest.raises(ValidationError):
-        UsageReport.model_validate(_payload(sdk_reported_cost_usd=bad))
+        UsageReport.model_validate(_payload(output_tokens=2**63))
+
+
+@pytest.mark.parametrize("bad", ["-0.01", "-5.5E-17", "NaN", "Infinity", "abc", 0.3, -1, True, [1]])
+def test_bad_sdk_cost_becomes_null_and_keeps_the_tokens(
+    bad: object, caplog: pytest.LogCaptureFixture
+) -> None:
+    # The SDK cost is a cross-check only: a bad value must never reject the token counts.
+    # Floats are refused too, so binary noise (0.30000000000000004) never reaches the ledger.
+    with caplog.at_level(logging.WARNING, logger="harness.costs"):
+        report = UsageReport.model_validate(_payload(sdk_reported_cost_usd=bad))
+    assert report.sdk_reported_cost_usd is None
+    assert report.input_tokens == 1000
+    [record] = caplog.records
+    assert str(RUN_ID) in record.getMessage()
+    assert "seg-1" in record.getMessage()
+
+
+@pytest.mark.parametrize(
+    ("given", "stored"),
+    [
+        ("0.123456789123", "0.123456789"),  # numeric(20, 9) keeps nine places
+        ("0.0000000005", "0.000000001"),  # half up
+        (Decimal("1.5"), "1.500000000"),
+        (2, "2.000000000"),
+    ],
+)
+def test_sdk_cost_is_quantized_to_nine_places(given: object, stored: str) -> None:
+    report = UsageReport.model_validate(_payload(sdk_reported_cost_usd=given))
+    assert report.sdk_reported_cost_usd == Decimal(stored)
+    assert report.sdk_reported_cost_usd.as_tuple().exponent == -9
 
 
 def test_unexpected_fields_are_rejected() -> None:
@@ -114,11 +143,11 @@ def test_key_differs_by_model_segment_and_run() -> None:
     assert all(idempotency_key(UsageReport.model_validate(p)) != base for p in others)
 
 
-def test_snapshot_id_and_alias_share_one_key() -> None:
-    # A resend that spells the same model as its dated snapshot must stay a no-op, so the key
-    # uses the table's canonical model id.
-    alias = UsageReport.model_validate(_payload(model="claude-sonnet-4-5"))
-    snapshot = UsageReport.model_validate(_payload(model="claude-sonnet-4-5-20250929"))
-    assert snapshot.model == "claude-sonnet-4-5-20250929"
-    assert idempotency_key(snapshot) == idempotency_key(alias)
-    assert idempotency_key(snapshot).model == "claude-sonnet-4-5"
+def test_key_uses_the_exact_model_id_that_was_sent() -> None:
+    # One segment can report a model under two ids (the Claude CLI keys model_usage by raw id,
+    # for example claude-haiku-4-5 and claude-haiku-4-5-20251001). Both are real usage, so they
+    # must be two keys (review F1). A true resend repeats the same raw id.
+    short = UsageReport.model_validate(_payload(model="claude-haiku-4-5"))
+    dated = UsageReport.model_validate(_payload(model="claude-haiku-4-5-20251001"))
+    assert idempotency_key(dated).model == "claude-haiku-4-5-20251001"
+    assert idempotency_key(dated) != idempotency_key(short)
