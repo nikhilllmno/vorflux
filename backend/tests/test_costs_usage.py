@@ -246,40 +246,43 @@ def test_cache_write_1h_tokens_is_a_subset_of_cache_write_tokens() -> None:
         UsageReport.model_validate(_payload(cache_write_tokens=100, cache_write_1h_tokens=101))
 
 
-# Claude model_usage cache-write split (Hermes_Like_Bot round 4, item 1) ------------------------
+# Claude model_usage cache-write split (Hermes_Like_Bot round 4, items 1 and 7) ------------------
 # Claude CLI 2.1.327 reports cacheCreationEphemeral5mInputTokens and
-# cacheCreationEphemeral1hInputTokens per model. Both are already inside
-# cacheCreationInputTokens, and a write whose TTL the API did not report is in neither.
+# cacheCreationEphemeral1hInputTokens per model. Both are inside cacheCreationInputTokens, and a
+# write with no reported lifetime is in the total but in neither field. The rule (item 7): when
+# the 5m count is present, cache_write_1h_tokens = total - 5m; when it is absent, null (every
+# write at the 1-hour rate). The 1h count is never used: mapping it directly would price writes
+# with no lifetime at the 5-minute rate.
 
 
-def test_a_complete_split_maps_the_1h_count() -> None:
-    assert cache_write_1h_from_model_usage(1_000_000, 600_000, 400_000) == 400_000
-    assert cache_write_1h_from_model_usage(10, 10, 0) == 0
-    assert cache_write_1h_from_model_usage(10, 0, 10) == 10
-    assert cache_write_1h_from_model_usage(0, 0, 0) == 0
+def test_the_1h_count_is_the_total_minus_the_5m_count() -> None:
+    assert cache_write_1h_from_model_usage(1_000_000, 600_000) == 400_000
+    assert cache_write_1h_from_model_usage(10, 10) == 0
+    assert cache_write_1h_from_model_usage(10, 0) == 10
+    assert cache_write_1h_from_model_usage(0, 0) == 0
 
 
-def test_writes_with_no_reported_ttl_count_as_1h() -> None:
-    # 200k writes are in neither field: price them at the 1-hour rate (safe side, C1).
-    assert cache_write_1h_from_model_usage(1_000_000, 500_000, 300_000) == 500_000
+def test_writes_with_no_reported_lifetime_count_as_1h() -> None:
+    # 1M writes: 500k at 5 minutes, 300k at 1 hour, 200k with no lifetime (in neither field).
+    # The 300k 1h count is not used; the 200k go to the 1-hour rate with the 300k.
+    assert cache_write_1h_from_model_usage(1_000_000, 500_000) == 500_000
+    # Every write with no lifetime and no 1h count: all of them at the 1-hour rate.
+    assert cache_write_1h_from_model_usage(1_000_000, 0) == 1_000_000
 
 
-@pytest.mark.parametrize(("five_minute", "one_hour"), [(None, 0), (0, None), (None, None)])
-def test_a_missing_split_field_gives_null(five_minute: int | None, one_hour: int | None) -> None:
-    assert cache_write_1h_from_model_usage(1000, five_minute, one_hour) is None
+def test_an_absent_5m_count_gives_null() -> None:
+    # Null prices every cache write at the 1-hour rate (C1), whatever the 1h count says.
+    assert cache_write_1h_from_model_usage(1000, None) is None
 
 
-@pytest.mark.parametrize(
-    ("total", "five_minute", "one_hour"),
-    [(1000, 600, 401), (1000, -1, 0), (1000, 0, -1), (-1, 0, 0), (1000, 1001, 0)],
-)
-def test_an_inconsistent_split_gives_null(total: int, five_minute: int, one_hour: int) -> None:
+@pytest.mark.parametrize(("total", "five_minute"), [(1000, -1), (-1, 0), (1000, 1001)])
+def test_a_5m_count_that_does_not_fit_the_total_gives_null(total: int, five_minute: int) -> None:
     # The adapter computes segment deltas; a delta that does not fit the total is not trusted.
-    assert cache_write_1h_from_model_usage(total, five_minute, one_hour) is None
+    assert cache_write_1h_from_model_usage(total, five_minute) is None
 
 
 def test_the_mapped_value_is_a_valid_report_field() -> None:
-    one_hour = cache_write_1h_from_model_usage(1000, 250, 750)
+    one_hour = cache_write_1h_from_model_usage(1000, 250)
     report = UsageReport.model_validate(
         _payload(cache_write_tokens=1000, cache_write_1h_tokens=one_hour)
     )

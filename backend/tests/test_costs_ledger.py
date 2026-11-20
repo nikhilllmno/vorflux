@@ -599,3 +599,53 @@ def test_pre_run_check_refuses_an_unpriced_model_until_the_table_covers_it(
     assert check_run_models(
         ledger, t, [new, known], now=datetime(2026, 12, 1, tzinfo=UTC), prices=book
     ).allowed
+
+
+# Hermes_Like_Bot check of hermes_like_agent PR#3 at 19196c3, item 9 ----------------------------
+# Only a model-pricing gap refuses the model for the hotel; every other reason stops one run.
+
+REFUSED_TEXT = "model refused for this hotel until priced"
+RUN_ONLY_TEXT = "only this run stopped"
+
+
+@pytest.mark.parametrize(
+    ("overrides", "reason", "refuses_model"),
+    [
+        ({"model": "claude-imaginary-9"}, "unknown_model", True),
+        ({"model": "claude-haiku-5-5"}, "tiered_pricing", True),
+        ({"web_search_requests": 3}, "web_search", False),
+        ({"serving": "bedrock"}, "non_first_party", False),
+        ({"model": "claude-fable-5-1", "output_tokens": 10**16}, "cost_out_of_range", False),
+        ({"no_price_table": True}, "no_price_table", False),
+    ],
+)
+def test_unpriced_alert_text_depends_on_the_reason(
+    runs: StaticRuns,
+    report: ReportFactory,
+    clock: Clock,
+    caplog: pytest.LogCaptureFixture,
+    overrides: dict[str, Any],
+    reason: str,
+    refuses_model: bool,
+) -> None:
+    overrides = dict(overrides)
+    if overrides.pop("no_price_table", False):
+        clock.now = datetime(2026, 11, 19, 23, 0, tzinfo=UTC)  # before the first price table
+    alerts: list[UnpricedUsageAlert] = []
+    ledger = InMemoryCostLedger(runs, clock=clock, on_unpriced=alerts.append)
+    with caplog.at_level(logging.WARNING, logger="harness.costs"):
+        result = ledger.record(report(runs.add(ORG_A, HOTEL_A1), **overrides))
+    assert result.row.unpriced_reason == reason
+    assert result.stop_run
+    [alert] = alerts
+    assert alert.refuses_model is refuses_model
+    [event] = [r for r in caplog.records if "unpriced_usage_alert" in r.getMessage()]
+    message = event.getMessage()
+    assert f"reason={reason}" in message
+    assert alert.summary in message
+    if refuses_model:
+        assert REFUSED_TEXT in alert.summary
+        assert RUN_ONLY_TEXT not in alert.summary
+    else:
+        assert RUN_ONLY_TEXT in alert.summary
+        assert "refused" not in alert.summary

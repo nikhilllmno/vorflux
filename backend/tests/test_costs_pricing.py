@@ -409,7 +409,7 @@ def test_check_priced_and_price_usage_default_to_the_table_in_effect_now() -> No
     assert price_usage(Provider.OPENAI, "gpt-5", **counts) == Decimal("1.25")
 
 
-# Claude model_usage split (Hermes_Like_Bot round 4, item 1) -----------------------------------
+# Claude model_usage split (Hermes_Like_Bot round 4, items 1 and 7) --------------------------
 
 
 def _from_model_usage(entry: dict[str, Any], model: str) -> UsageReport:
@@ -421,9 +421,7 @@ def _from_model_usage(entry: dict[str, Any], model: str) -> UsageReport:
         cache_read_tokens=entry["cacheReadInputTokens"],
         cache_write_tokens=entry["cacheCreationInputTokens"],
         cache_write_1h_tokens=cache_write_1h_from_model_usage(
-            entry["cacheCreationInputTokens"],
-            entry.get("cacheCreationEphemeral5mInputTokens"),
-            entry.get("cacheCreationEphemeral1hInputTokens"),
+            entry["cacheCreationInputTokens"], entry.get("cacheCreationEphemeral5mInputTokens")
         ),
         web_search_requests=entry["webSearchRequests"],
         sdk_reported_cost_usd=Decimal(str(entry["costUSD"])),
@@ -492,3 +490,43 @@ def test_model_usage_writes_with_no_reported_ttl_are_priced_at_2x() -> None:
     report = _from_model_usage(entry, "claude-haiku-4-5")
     assert report.cache_write_1h_tokens == 600_000
     assert cost_usd(report, PRICE_TABLE) == Decimal("1.712")
+
+
+def test_model_usage_writes_with_no_lifetime_are_not_priced_at_the_5_minute_rate() -> None:
+    # Item 7: 1M writes, 600k at 5 minutes, 0 at 1 hour and 400k with no reported lifetime.
+    entry = {
+        **MODEL_USAGE_WITH_SPLIT,
+        "cacheCreationEphemeral1hInputTokens": 0,
+        "costUSD": 1.262,  # the SDK prices the 400k writes with no lifetime at 5 minutes
+    }
+    report = _from_model_usage(entry, "claude-haiku-4-5")
+    assert report.cache_write_1h_tokens == 400_000  # total - 5m, not the 1h count of 0
+    ours = cost_usd(report, PRICE_TABLE)
+    # 600k at 1.25x and 400k at 2x: the same as when the 400k report a 1-hour lifetime.
+    assert ours == Decimal("1.562")
+    # A direct 1h mapping would price the 400k at 1.25x input and under-price by 0.3 USD.
+    direct = report.model_copy(update={"cache_write_1h_tokens": 0})
+    assert cost_usd(direct, PRICE_TABLE) == Decimal("1.262")
+    assert check_sdk_cost(report, ours) is SdkCostCheck.MISMATCH
+
+
+def test_model_usage_with_a_5m_count_and_no_1h_field_uses_the_5m_count() -> None:
+    entry = {
+        k: v
+        for k, v in MODEL_USAGE_WITH_SPLIT.items()
+        if k != "cacheCreationEphemeral1hInputTokens"
+    }
+    report = _from_model_usage(entry, "claude-haiku-4-5")
+    assert report.cache_write_1h_tokens == 400_000
+    assert cost_usd(report, PRICE_TABLE) == Decimal("1.562")
+
+
+def test_model_usage_with_a_1h_count_and_no_5m_field_prices_every_write_at_2x() -> None:
+    entry = {
+        k: v
+        for k, v in MODEL_USAGE_WITH_SPLIT.items()
+        if k != "cacheCreationEphemeral5mInputTokens"
+    }
+    report = _from_model_usage(entry, "claude-haiku-4-5")
+    assert report.cache_write_1h_tokens is None
+    assert cost_usd(report, PRICE_TABLE) == Decimal("2.012")

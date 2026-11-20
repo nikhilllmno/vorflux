@@ -255,3 +255,37 @@ def test_unpriced_usage_error_needs_a_specific_reason() -> None:
 
         class _NoCode(UnpricedUsageError):
             reason = "unpriced"
+
+
+# Hermes_Like_Bot check of hermes_like_agent PR#3 at 19196c3, items 7 and 8 --------------------
+
+
+def _one_line(text: str) -> str:
+    return " ".join(text.split())
+
+
+def test_doc_maps_the_claude_split_from_the_5m_count() -> None:
+    doc = _one_line(_costs_doc())
+    mapping = (
+        "`cache_write_1h_tokens` = `cache_write_1h_from_model_usage(Δ cacheCreationInputTokens, "
+        "Δ cacheCreationEphemeral5mInputTokens)`"
+    )
+    assert mapping in doc
+    rule = (
+        "when `cacheCreationEphemeral5mInputTokens` is present, `cache_write_1h_tokens = "
+        "cacheCreationInputTokens - cacheCreationEphemeral5mInputTokens`; when it is absent, "
+        "`cache_write_1h_tokens` is absent, so every cache write uses the 1-hour rate"
+    )
+    assert rule in doc
+    [c1] = [line for line in _costs_doc().splitlines() if line.startswith("| C1 |")]
+    assert rule in _one_line(c1)
+    assert "no reported lifetime" in _one_line(c1)
+
+
+def test_doc_maps_a_missing_claude_provider_to_other() -> None:
+    doc = _one_line(_costs_doc())
+    assert (
+        "`provider`: `firstParty` → `first_party`; `bedrock` → `bedrock`; `vertex` → `vertex`; "
+        "absent or anything else → `other` (fail closed)"
+    ) in doc
+    assert "absent or `firstParty` → `first_party`" not in doc
