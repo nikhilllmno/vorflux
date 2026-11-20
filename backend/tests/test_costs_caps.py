@@ -8,10 +8,12 @@ from uuid import UUID, uuid4
 import pytest
 
 from harness.costs import (
+    UNPRICED_RUNS_HOTEL_DAILY_LIMIT,
     CapDecision,
     InMemoryCostLedger,
     Provider,
     RunTenant,
+    SpendCaps,
     UnknownRunError,
     UsageReport,
     check_hotel_daily_cap,
@@ -103,6 +105,7 @@ def _usage(run_id: UUID, segment_id: str, usd: int) -> UsageReport:
         "output_tokens": usd * 100_000,
         "cache_read_tokens": 0,
         "cache_write_tokens": 0,
+        "serving": "first_party",
     }
     return UsageReport.model_validate(payload)
 
@@ -174,6 +177,7 @@ def _unpriced(run_id: UUID) -> UsageReport:
         "output_tokens": 0,
         "cache_read_tokens": 0,
         "cache_write_tokens": 0,
+        "serving": "first_party",
     }
     return UsageReport.model_validate(payload)
 
@@ -230,3 +234,53 @@ def test_pending_spend_must_be_a_non_negative_decimal() -> None:
     ledger = InMemoryCostLedger(Runs(), clock=Clock())
     with pytest.raises(ValueError, match="negative"):
         check_run_cap(ledger, _tenant(), uuid4(), Decimal("1"), pending_usd=Decimal("-1"))
+
+
+# Decision C16: a hotel with repeated unpriced runs stops for the day --------------------------
+
+
+def test_unpriced_run_limit_is_three() -> None:
+    assert UNPRICED_RUNS_HOTEL_DAILY_LIMIT == 3
+
+
+def test_hotel_with_too_many_unpriced_runs_is_denied_new_runs_until_the_next_utc_day() -> None:
+    # Hermes_Like_Bot follow-up: an id the orchestrator did not pass to check_run_models is
+    # admitted on every new run. After the limit, the hotel stops for the rest of the UTC day.
+    runs, clock = Runs(), Clock()
+    ledger = InMemoryCostLedger(runs, clock=clock)
+    t, cap = _tenant(), Decimal("1000")
+    first = runs.add()
+    ledger.record(_unpriced(first))
+    two_rows = UsageReport.model_validate({**_unpriced(first).model_dump(), "segment_id": "seg-y"})
+    ledger.record(two_rows)  # a second unpriced row in the same run counts once
+    ledger.record(_unpriced(runs.add()))
+    assert ledger.hotel_spend(t, day=clock().date()).unpriced_runs == 2
+    assert check_hotel_daily_cap(ledger, t, cap, now=clock()).allowed
+
+    in_flight = runs.add()
+    ledger.record(_usage(in_flight, "seg-1", 1))
+    ledger.record(_unpriced(runs.add()))
+    denied = check_hotel_daily_cap(ledger, t, cap, now=clock())
+    assert not denied.allowed
+    assert "unpriced" in denied.reason
+    assert denied.unpriced_rows == 4
+    # record() keeps judging the in-flight run on USD only; the orchestrator's next
+    # pre-segment call to check_hotel_daily_cap stops it.
+    result = ledger.record(_usage(in_flight, "seg-2", 1))
+    assert result.hotel_daily_cap is None or result.hotel_daily_cap.allowed
+    # Another hotel is not affected.
+    assert check_hotel_daily_cap(ledger, _tenant(OTHER_HOTEL), cap, now=clock()).allowed
+    # The next UTC day starts clean.
+    tomorrow = clock() + timedelta(days=1)
+    assert check_hotel_daily_cap(ledger, t, cap, now=tomorrow.replace(hour=0)).allowed
+
+
+def test_record_hotel_daily_cap_ignores_the_unpriced_run_limit() -> None:
+    runs, clock = Runs(), Clock()
+    ledger = InMemoryCostLedger(runs, clock=clock)
+    for _ in range(UNPRICED_RUNS_HOTEL_DAILY_LIMIT):
+        ledger.record(_unpriced(runs.add()))
+    caps = SpendCaps(hotel_daily_usd=Decimal("1000"))
+    result = ledger.record(_usage(runs.add(), "seg-1", 1), caps=caps)
+    assert result.hotel_daily_cap is not None and result.hotel_daily_cap.allowed
+    assert not result.stop_run

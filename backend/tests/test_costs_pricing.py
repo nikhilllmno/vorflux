@@ -10,7 +10,10 @@ import pytest
 
 from harness.costs import (
     COST_QUANTUM,
+    PRICE_TABLE,
     ModelPrice,
+    NonFirstPartyModelError,
+    NonFirstPartyServingError,
     NoPriceTableError,
     PriceBook,
     PriceTable,
@@ -23,6 +26,7 @@ from harness.costs import (
     check_priced,
     check_sdk_cost,
     cost_usd,
+    non_first_party_kind,
     price_usage,
 )
 
@@ -39,18 +43,21 @@ def _report(**overrides: Any) -> UsageReport:
         "output_tokens": 0,
         "cache_read_tokens": 0,
         "cache_write_tokens": 0,
+        "serving": "first_party",
     }
     payload.update(overrides)
     return UsageReport.model_validate(payload)
 
 
 def test_each_token_bucket_uses_its_own_price() -> None:
-    # claude-sonnet-4-6: input 3, output 15, cache read 0.30, cache write 3.75 USD per MTok.
+    # claude-sonnet-4-6: input 3, output 15, cache read 0.30, cache write 3.75 (5-minute TTL)
+    # and 6 (1-hour TTL) USD per MTok.
     report = _report(
         input_tokens=1_000_000,
         output_tokens=1_000_000,
         cache_read_tokens=1_000_000,
         cache_write_tokens=1_000_000,
+        cache_write_1h_tokens=0,
     )
     assert cost_usd(report) == Decimal("22.05")
 
@@ -102,7 +109,9 @@ def _tiny_table(input_price: str) -> PriceTable:
             ModelPrice(
                 provider=Provider.ANTHROPIC,
                 model="claude-sonnet-4-6",
-                prices=TokenPrices(input=p, output=p, cache_read=p, cache_write=p),
+                prices=TokenPrices(
+                    input=p, output=p, cache_read=p, cache_write=p, cache_write_1h=p
+                ),
             )
         ],
     )
@@ -143,9 +152,11 @@ def test_price_usage_prices_raw_counts_like_a_report() -> None:
         "output_tokens": 2_000,
         "cache_read_tokens": 3_000,
         "cache_write_tokens": 4_000,
+        "cache_write_1h_tokens": 1_000,
     }
     priced = price_usage(Provider.ANTHROPIC, "claude-sonnet-4-6", **counts)
-    assert priced == cost_usd(_report(**counts)) == Decimal("0.0489")
+    # 1000*3 + 2000*15 + 3000*0.30 + 3000*3.75 + 1000*6 = 51150 USD per MTok-token
+    assert priced == cost_usd(_report(**counts)) == Decimal("0.05115")
 
 
 @pytest.mark.parametrize(
@@ -217,7 +228,7 @@ def test_sdk_cost_of_zero_against_real_usage_is_a_mismatch() -> None:
 def _book() -> PriceBook:
     def table(version: str, effective: date, price: str) -> PriceTable:
         p = Decimal(price)
-        prices = TokenPrices(input=p, output=p, cache_read=p, cache_write=p)
+        prices = TokenPrices(input=p, output=p, cache_read=p, cache_write=p, cache_write_1h=p)
         return PriceTable(
             version=version,
             effective_from=effective,
@@ -252,3 +263,146 @@ def test_price_usage_picks_the_table_by_date_like_the_ledger() -> None:
     assert check_priced(Provider.ANTHROPIC, "claude-sonnet-4-6", at=new, prices=book).model == (
         "claude-sonnet-4-6"
     )
+
+
+# 1-hour cache writes (decision C1) ------------------------------------------------------------
+
+
+def test_cache_writes_are_split_between_the_5_minute_and_1_hour_rates() -> None:
+    # claude-sonnet-4-6: 600k at 3.75 + 400k at 6 = 2.25 + 2.40 USD.
+    report = _report(cache_write_tokens=1_000_000, cache_write_1h_tokens=400_000)
+    assert cost_usd(report) == Decimal("4.65")
+
+
+def test_unknown_split_prices_every_anthropic_cache_write_at_the_1_hour_rate() -> None:
+    # The safe side: over-price rather than under-price when the TTL is not known.
+    assert cost_usd(_report(cache_write_tokens=1_000_000)) == Decimal("6")
+    assert price_usage(
+        Provider.ANTHROPIC,
+        "claude-sonnet-4-6",
+        input_tokens=0,
+        output_tokens=0,
+        cache_read_tokens=0,
+        cache_write_tokens=1_000_000,
+    ) == Decimal("6")
+
+
+def test_openai_cache_writes_cost_the_input_price_with_or_without_a_split() -> None:
+    # gpt-5: no separate cache-write charge, so both rates are the input price (1.25).
+    unknown = _report(provider="openai", model="gpt-5", cache_write_tokens=1_000_000)
+    split = _report(
+        provider="openai", model="gpt-5", cache_write_tokens=1_000_000, cache_write_1h_tokens=1
+    )
+    assert cost_usd(unknown) == cost_usd(split) == Decimal("1.25")
+
+
+def test_every_anthropic_1_hour_write_price_is_twice_the_input_price() -> None:
+    for entry in PRICE_TABLE.entries():
+        p = entry.prices
+        if entry.provider is Provider.ANTHROPIC:
+            assert p.cache_write_1h == 2 * p.input, entry.model
+            assert p.cache_write == Decimal("1.25") * p.input, entry.model
+        else:
+            assert p.cache_write == p.cache_write_1h == p.input, entry.model
+
+
+# Serving provider ------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("serving", ["bedrock", "vertex", "other"])
+def test_only_first_party_serving_is_priced(serving: str) -> None:
+    with pytest.raises(NonFirstPartyServingError) as caught:
+        cost_usd(_report(serving=serving, input_tokens=1_000))
+    assert caught.value.reason == "non_first_party"
+    assert cost_usd(_report(serving="first_party", input_tokens=1_000_000)) == Decimal("3")
+
+
+# Model id check (decision C13) ---------------------------------------------------------------
+
+# The pins of runtime contract v2 (ClaudeModelPins): the small fast and haiku models default to
+# claude-haiku-4-5; sonnet, opus and subagent models are priced ids from the plan.
+PINNED_IDS = [
+    (Provider.ANTHROPIC, "claude-haiku-4-5"),
+    (Provider.ANTHROPIC, "claude-haiku-4-5-20251001"),
+    *(
+        (e.provider, model_id)
+        for e in PRICE_TABLE.entries()
+        if e.provider is Provider.OPENAI or "sonnet" in e.model or "opus" in e.model
+        for model_id in (e.model, *e.aliases)
+    ),
+]
+PRICED_IDS = [(e.provider, i) for e in PRICE_TABLE.entries() for i in (e.model, *e.aliases)]
+
+
+@pytest.mark.parametrize(("provider", "model"), PINNED_IDS + PRICED_IDS)
+def test_every_priced_and_pinned_id_passes_the_id_check(provider: Provider, model: str) -> None:
+    assert non_first_party_kind(model) is None
+    assert ":" not in model and "/" not in model
+    assert check_priced(provider, model).provider is provider
+
+
+@pytest.mark.parametrize(
+    "model",
+    [
+        "ft:gpt-4o-mini-2024-07-18:acme::abc123",  # OpenAI fine-tune
+        "openai/gpt-5",  # gateway
+        "anthropic/claude-sonnet-4-6",  # gateway
+        "vendor:claude-haiku-4-5",  # provider prefix (contract C31)
+        "gpt-5:free",  # gateway variant suffix
+        "anthropic.claude-sonnet-4-6-v1:0",  # Amazon Bedrock
+        "claude-sonnet-4-5@20250929",  # Google Vertex AI
+    ],
+)
+def test_non_first_party_id_forms_are_refused(model: str) -> None:
+    assert non_first_party_kind(model) is not None
+    with pytest.raises(NonFirstPartyModelError):
+        check_priced(Provider.ANTHROPIC, model)
+
+
+def test_a_price_table_refuses_an_id_that_the_id_check_would_flag() -> None:
+    # If a priced id ever needs ':' or '/', the rule must change first (docs/costs.md, C13).
+    one = Decimal(1)
+    prices = TokenPrices(input=one, output=one, cache_read=one, cache_write=one, cache_write_1h=one)
+    with pytest.raises(ValueError, match="id check"):
+        PriceTable(
+            version="t",
+            effective_from=date(2026, 1, 1),
+            source_urls={},
+            entries=[ModelPrice(Provider.OPENAI, "gpt-x:1", prices)],
+        )
+
+
+# N4: the default table is the one in effect now -----------------------------------------------
+
+
+def test_check_priced_and_price_usage_default_to_the_table_in_effect_now() -> None:
+    def table(version: str, effective: date) -> PriceTable:
+        p = Decimal(1)
+        return PriceTable(
+            version=version,
+            effective_from=effective,
+            source_urls={},
+            entries=[
+                ModelPrice(
+                    Provider.OPENAI,
+                    "gpt-5",
+                    TokenPrices(input=p, output=p, cache_read=p, cache_write=p, cache_write_1h=p),
+                )
+            ],
+        )
+
+    counts = {
+        "input_tokens": 1_000_000,
+        "output_tokens": 0,
+        "cache_read_tokens": 0,
+        "cache_write_tokens": 0,
+    }
+    future = PriceBook([table("far", date(2999, 1, 1))])
+    with pytest.raises(NoPriceTableError):
+        check_priced(Provider.OPENAI, "gpt-5", prices=future)
+    with pytest.raises(NoPriceTableError):
+        price_usage(Provider.OPENAI, "gpt-5", prices=future, **counts)
+    current = PriceBook([table("old", date(2020, 1, 1)), table("far", date(2999, 1, 1))])
+    assert price_usage(Provider.OPENAI, "gpt-5", prices=current, **counts) == 1
+    # Without `prices`, the default book's table in effect now (2026-11-20 table) is used.
+    assert price_usage(Provider.OPENAI, "gpt-5", **counts) == Decimal("1.25")

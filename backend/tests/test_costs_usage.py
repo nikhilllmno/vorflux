@@ -8,7 +8,7 @@ from uuid import UUID, uuid4
 import pytest
 from pydantic import ValidationError
 
-from harness.costs import Provider, UsageKey, UsageReport, idempotency_key
+from harness.costs import Provider, Serving, UsageKey, UsageReport, idempotency_key
 
 RUN_ID = UUID("00000000-0000-4000-8000-000000000001")
 
@@ -23,6 +23,7 @@ def _payload(**overrides: Any) -> dict[str, Any]:
         "output_tokens": 200,
         "cache_read_tokens": 0,
         "cache_write_tokens": 0,
+        "serving": "first_party",
     }
     payload.update(overrides)
     return payload
@@ -172,3 +173,61 @@ def test_key_uses_the_exact_model_id_that_was_sent() -> None:
 def test_largest_sdk_cost_that_fits_numeric_20_9_is_kept() -> None:
     report = UsageReport.model_validate(_payload(sdk_reported_cost_usd="99999999999.9999999994"))
     assert report.sdk_reported_cost_usd == Decimal("99999999999.999999999")
+
+
+# Alignment with runtime contract v2 (hermes_like_agent PR #3) ----------------------------------
+
+
+def test_usage_report_has_exactly_the_contract_fields() -> None:
+    # The field set the contract copies. A change here is a contract change.
+    assert set(UsageReport.model_fields) == {
+        "run_id",
+        "segment_id",
+        "provider",
+        "serving",
+        "model",
+        "input_tokens",
+        "output_tokens",
+        "cache_read_tokens",
+        "cache_write_tokens",
+        "cache_write_1h_tokens",
+        "web_search_requests",
+        "sdk_reported_cost_usd",
+    }
+
+
+def test_serving_is_required() -> None:
+    payload = _payload()
+    del payload["serving"]
+    with pytest.raises(ValidationError, match="serving"):
+        UsageReport.model_validate(payload)
+
+
+@pytest.mark.parametrize("serving", ["first_party", "bedrock", "vertex", "other"])
+def test_serving_accepts_the_four_values(serving: str) -> None:
+    report = UsageReport.model_validate(_payload(serving=serving))
+    assert report.serving is Serving(serving)
+
+
+@pytest.mark.parametrize("serving", ["firstParty", "gateway", "", "FIRST_PARTY", None])
+def test_serving_rejects_other_values(serving: object) -> None:
+    with pytest.raises(ValidationError, match="serving"):
+        UsageReport.model_validate(_payload(serving=serving))
+
+
+def test_cache_write_1h_tokens_is_optional_and_unknown_by_default() -> None:
+    assert UsageReport.model_validate(_payload()).cache_write_1h_tokens is None
+    report = UsageReport.model_validate(_payload(cache_write_tokens=100, cache_write_1h_tokens=40))
+    assert report.cache_write_1h_tokens == 40
+
+
+@pytest.mark.parametrize("bad", [-1, 1.5, True, "10", 2**63])
+def test_cache_write_1h_tokens_must_be_a_token_count(bad: object) -> None:
+    with pytest.raises(ValidationError, match="cache_write_1h_tokens"):
+        UsageReport.model_validate(_payload(cache_write_tokens=100, cache_write_1h_tokens=bad))
+
+
+def test_cache_write_1h_tokens_is_a_subset_of_cache_write_tokens() -> None:
+    UsageReport.model_validate(_payload(cache_write_tokens=100, cache_write_1h_tokens=100))
+    with pytest.raises(ValidationError, match="cache_write_1h_tokens"):
+        UsageReport.model_validate(_payload(cache_write_tokens=100, cache_write_1h_tokens=101))

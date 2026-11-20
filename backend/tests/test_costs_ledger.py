@@ -14,7 +14,9 @@ from uuid import UUID, uuid4
 import pytest
 
 from harness.costs import (
+    CONFIG_REJECTED,
     PRICE_TABLE,
+    USAGE_UNPRICED,
     CostLedger,
     InMemoryCostLedger,
     ModelPrice,
@@ -100,6 +102,7 @@ def report() -> ReportFactory:
             "output_tokens": 0,
             "cache_read_tokens": 0,
             "cache_write_tokens": 0,
+            "serving": "first_party",
         }
         payload.update(overrides)
         return UsageReport.model_validate(payload)
@@ -160,6 +163,38 @@ def test_conflicting_resend_keeps_the_first_row_and_warns(
     assert any("conflict" in r.getMessage() for r in caplog.records)
 
 
+@pytest.mark.parametrize(
+    "change", [{"serving": "bedrock"}, {"cache_write_tokens": 10, "cache_write_1h_tokens": 5}]
+)
+def test_a_resend_that_differs_in_serving_or_1h_writes_is_a_conflict(
+    ledger: InMemoryCostLedger,
+    runs: StaticRuns,
+    report: ReportFactory,
+    caplog: pytest.LogCaptureFixture,
+    change: dict[str, Any],
+) -> None:
+    run = runs.add(ORG_A, HOTEL_A1)
+    first = {"cache_write_tokens": 10} if "cache_write_1h_tokens" in change else {}
+    ledger.record(report(run, **first))
+    with caplog.at_level(logging.WARNING, logger="harness.costs"):
+        assert ledger.record(report(run, **change)).status is RecordStatus.DUPLICATE
+    assert any("conflict" in r.getMessage() for r in caplog.records)
+
+
+def test_record_result_gives_the_contract_failure_code(
+    ledger: InMemoryCostLedger, runs: StaticRuns, report: ReportFactory
+) -> None:
+    # Runtime contract v2: a run stopped by unpriced usage fails with USAGE_UNPRICED. A cap
+    # deny is the orchestrator's BUDGET_EXHAUSTED, so record gives no code for it.
+    run = runs.add(ORG_A, HOTEL_A1)
+    assert ledger.record(report(run)).failure_code is None
+    stopped = ledger.record(report(run, segment_id="seg-2", serving="vertex"))
+    assert stopped.failure_code == USAGE_UNPRICED == "USAGE_UNPRICED"
+    over = ledger.record(report(runs.add(ORG_A, HOTEL_A1)), caps=SpendCaps(run_usd=Decimal("1")))
+    assert over.stop_run
+    assert over.failure_code is None
+
+
 def test_mixed_model_segment_records_one_row_per_model(
     ledger: InMemoryCostLedger, runs: StaticRuns, report: ReportFactory
 ) -> None:
@@ -198,6 +233,8 @@ def test_row_carries_tenant_cost_tokens_and_table_version(
     assert row.web_search_requests == 0
     assert (row.input_tokens, row.output_tokens) == (1_000_000, 10)
     assert (row.cache_read_tokens, row.cache_write_tokens) == (20, 30)
+    assert row.cache_write_1h_tokens is None  # split unknown
+    assert row.serving.value == "first_party"
     assert row.sdk_reported_cost_usd == Decimal("3.01")
     assert row.price_table_version == PRICE_TABLE.version
     assert row.recorded_at == clock.now
@@ -242,6 +279,9 @@ def test_two_ids_for_one_model_in_one_segment_are_both_billed(
         ({"model": "claude-sonnet-4-5@20250929"}, "non_first_party"),
         ({"provider": "openai", "model": "openai/gpt-5"}, "non_first_party"),
         ({"web_search_requests": 3}, "web_search"),
+        ({"serving": "bedrock"}, "non_first_party"),
+        ({"serving": "vertex"}, "non_first_party"),
+        ({"serving": "other"}, "non_first_party"),
         ({"model": "claude-fable-5-1", "output_tokens": 10**16}, "cost_out_of_range"),
     ],
 )
@@ -337,7 +377,7 @@ def _table(version: str, effective: date, input_price: str, *models: str) -> Pri
             ModelPrice(
                 Provider.ANTHROPIC,
                 model,
-                TokenPrices(input=p, output=p, cache_read=p, cache_write=p),
+                TokenPrices(input=p, output=p, cache_read=p, cache_write=p, cache_write_1h=p),
             )
             for model in models
         ],
@@ -535,6 +575,8 @@ def test_pre_run_check_refuses_an_unpriced_model_until_the_table_covers_it(
     assert not other.allowed
     assert not other.refused[0].seen_unpriced
     # v2 prices the id from 2026-12-01 UTC: the refusal clears with no manual step.
+    assert check.failure_code == CONFIG_REJECTED == "CONFIG_REJECTED"
+    assert check_run_models(ledger, t, [known], now=clock.now, prices=book).failure_code is None
     assert check_run_models(
         ledger, t, [new, known], now=datetime(2026, 12, 1, tzinfo=UTC), prices=book
     ).allowed

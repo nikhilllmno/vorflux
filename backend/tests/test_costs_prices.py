@@ -1,6 +1,7 @@
 """Price table contract: typed Decimal prices, a version, and a loud failure for unknown models."""
 
 import re
+from dataclasses import fields
 from datetime import date
 from decimal import Decimal
 from pathlib import Path
@@ -10,10 +11,13 @@ import pytest
 from harness.costs import (
     PRICE_TABLE,
     UNPRICED_REASONS,
+    CostRow,
     ModelPrice,
     NonFirstPartyModelError,
+    NonFirstPartyServingError,
     PriceTable,
     Provider,
+    Serving,
     TieredPricingError,
     TokenPrices,
     UnknownModelError,
@@ -136,7 +140,9 @@ def _entry(model: str, *, aliases: tuple[str, ...] = ()) -> ModelPrice:
     return ModelPrice(
         provider=Provider.OPENAI,
         model=model,
-        prices=TokenPrices(input=one, output=one, cache_read=one, cache_write=one),
+        prices=TokenPrices(
+            input=one, output=one, cache_read=one, cache_write=one, cache_write_1h=one
+        ),
         aliases=aliases,
     )
 
@@ -154,9 +160,11 @@ def test_table_rejects_a_duplicate_model_id() -> None:
 def test_token_prices_reject_floats_and_negatives() -> None:
     one = Decimal("1")
     with pytest.raises(TypeError):
-        TokenPrices(input=1.5, output=one, cache_read=one, cache_write=one)  # type: ignore[arg-type]
+        TokenPrices(input=1.5, output=one, cache_read=one, cache_write=one, cache_write_1h=one)  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="negative"):
-        TokenPrices(input=Decimal("-1"), output=one, cache_read=one, cache_write=one)
+        TokenPrices(
+            input=Decimal("-1"), output=one, cache_read=one, cache_write=one, cache_write_1h=one
+        )
 
 
 def _all_subclasses(cls: type[UnpricedUsageError]) -> list[type[UnpricedUsageError]]:
@@ -175,6 +183,33 @@ def test_every_unpriced_reason_is_allowed_by_the_proposed_sql() -> None:
     assert sql_codes == set(UNPRICED_REASONS)
     reasons = {sub.reason for sub in _all_subclasses(UnpricedUsageError)}
     assert reasons == set(UNPRICED_REASONS)
+
+
+def _proposed_sql() -> str:
+    doc = (Path(__file__).parents[2] / "docs" / "costs.md").read_text(encoding="utf-8")
+    match = re.search(r"### SQL\n\n```sql\n(.*?)```", doc, re.S)
+    assert match is not None
+    return match.group(1)
+
+
+def test_serving_values_and_their_reason_code_match_the_proposed_sql() -> None:
+    sql = _proposed_sql()
+    match = re.search(r"serving text not null check \(serving in \((.*?)\)\)", sql, re.S)
+    assert match is not None
+    assert set(re.findall(r"'([a-z_]+)'", match.group(1))) == {s.value for s in Serving}
+    # Only first-party serving is priced; the others are recorded with this code.
+    assert NonFirstPartyServingError.reason == "non_first_party"
+    assert NonFirstPartyServingError.reason in UNPRICED_REASONS
+    assert "serving = 'first_party' or pricing_status = 'unpriced'" in sql
+
+
+def test_every_cost_row_field_is_a_proposed_run_costs_column() -> None:
+    sql = _proposed_sql()
+    body = sql[sql.index("create table public.run_costs (") : sql.index("\n);")]
+    columns = set(
+        re.findall(r"^  ([a-z_0-9]+) (?:uuid|text|bigint|numeric|timestamptz)", body, re.M)
+    )
+    assert columns == {f.name for f in fields(CostRow)} | {"id"}
 
 
 def test_unpriced_usage_error_needs_a_specific_reason() -> None:
