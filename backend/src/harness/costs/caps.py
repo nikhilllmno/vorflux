@@ -7,14 +7,16 @@ Where the runner calls them (docs/costs.md, "Spend caps"):
   (`RecordResult.stop_run`) stops the run.
 - Before each segment: `check_run_cap` and `check_hotel_daily_cap`. Before a new run:
   `check_hotel_daily_cap`. Pass the running estimate of the open segment (from `price_usage`)
-  as `pending_usd` to check during a segment.
+  as `pending_usd` to check during a segment. For a hotel with no daily cap, pass
+  `cap_usd=None` (or call `check_hotel_unpriced_limit` directly): the C16 limit still applies.
 
 Unpriced usage (decision C11, option a): the run that has it stops (its run cap denies), an
 alert is raised, and `check_run_models` refuses that exact model id at the pre-run check until
 the price table in effect prices it. The hotel daily cap counts priced spend only, so the
 hotel's other runs and models continue, until UNPRICED_RUNS_HOTEL_DAILY_LIMIT runs of the hotel
-were stopped by unpriced usage in one UTC day (decision C16): then `check_hotel_daily_cap`
-denies new runs and new segments for the rest of that UTC day.
+were stopped by a model-pricing gap (UNPRICED_LIMIT_REASONS) in one UTC day (decision C16):
+then `check_hotel_unpriced_limit` (also inside `check_hotel_daily_cap`) denies new runs and new
+segments for the rest of that UTC day with UNPRICED_LIMIT.
 """
 
 from __future__ import annotations
@@ -26,30 +28,44 @@ from decimal import Decimal
 from typing import TYPE_CHECKING
 from uuid import UUID
 
-from harness.costs.prices import PRICE_BOOK, PriceBook, Provider, UnpricedUsageError
+from harness.costs.prices import (
+    PRICE_BOOK,
+    PriceBook,
+    Provider,
+    TieredPricingError,
+    UnknownModelError,
+    UnpricedUsageError,
+)
 from harness.tenancy import TenantContext
 
 if TYPE_CHECKING:
     from harness.costs.ledger import CostLedger
 
-# Failure codes of runtime contract v2 that cost checks give. A cap deny is BUDGET_EXHAUSTED,
-# which the orchestrator owns.
+# Failure codes of runtime contract v2 that cost checks give. A USD cap deny is
+# BUDGET_EXHAUSTED, which the orchestrator owns.
 USAGE_UNPRICED = "USAGE_UNPRICED"  # a run stopped because it has unpriced usage
 CONFIG_REJECTED = "CONFIG_REJECTED"  # the pre-run model check refused a model id
+UNPRICED_LIMIT = "UNPRICED_LIMIT"  # the hotel reached the C16 unpriced-run limit for the day
 
-# Decision C16: runs of one hotel stopped by unpriced usage in one UTC day before
-# check_hotel_daily_cap denies the hotel for the rest of that day.
+# Decision C16: runs of one hotel stopped by a model-pricing gap in one UTC day before
+# check_hotel_unpriced_limit denies the hotel for the rest of that day.
 UNPRICED_RUNS_HOTEL_DAILY_LIMIT = 3
+# The unpriced reasons that C16 counts: gaps in the price table, which the pre-run model check
+# cannot catch for an id it was not given. web_search, non_first_party, cost_out_of_range and
+# no_price_table are not counted: each one already stops its own run.
+UNPRICED_LIMIT_REASONS: frozenset[str] = frozenset(
+    {UnknownModelError.reason, TieredPricingError.reason}
+)
 
 
 @dataclass(frozen=True, slots=True)
 class Spend:
     """Spend in one scope: the priced total, the rows that have no price, and the distinct
-    runs that have such rows."""
+    runs that have a row with a reason in UNPRICED_LIMIT_REASONS (decision C16)."""
 
     priced_usd: Decimal
     unpriced_rows: int
-    unpriced_runs: int = 0
+    pricing_gap_runs: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -62,12 +78,19 @@ class SpendCaps:
 
 @dataclass(frozen=True, slots=True)
 class CapDecision:
+    """A cap check. `cap_usd` and `remaining_usd` are None only for a hotel with no daily cap.
+
+    `failure_code` is USAGE_UNPRICED (the run has unpriced usage), UNPRICED_LIMIT (decision
+    C16) or None. A deny with None is a USD cap deny: BUDGET_EXHAUSTED, from the orchestrator.
+    """
+
     allowed: bool
-    cap_usd: Decimal
+    cap_usd: Decimal | None
     spent_usd: Decimal
-    remaining_usd: Decimal
+    remaining_usd: Decimal | None
     reason: str
     unpriced_rows: int = 0
+    failure_code: str | None = None
 
 
 def _check_amount(name: str, value: Decimal) -> None:
@@ -118,6 +141,7 @@ def check_run_spend(
             f"the run stops (priced spend {decision.spent_usd} USD, cap {cap_usd} USD)"
         ),
         unpriced_rows=spend.unpriced_rows,
+        failure_code=USAGE_UNPRICED,
     )
 
 
@@ -147,35 +171,88 @@ def check_run_cap(
     return check_run_spend(cap_usd, ledger.run_spend(tenant, run_id), pending_usd=pending_usd)
 
 
+@dataclass(frozen=True, slots=True)
+class UnpricedLimitDecision:
+    """Decision C16 for one hotel and UTC day."""
+
+    allowed: bool
+    pricing_gap_runs: int
+    limit: int
+    reason: str
+
+    @property
+    def failure_code(self) -> str | None:
+        """UNPRICED_LIMIT when denied, else None."""
+        return None if self.allowed else UNPRICED_LIMIT
+
+
+def check_hotel_unpriced_limit(
+    ledger: CostLedger, tenant: TenantContext, *, now: datetime
+) -> UnpricedLimitDecision:
+    """Decision C16: deny a hotel for the rest of the UTC day that contains `now` once
+    UNPRICED_RUNS_HOTEL_DAILY_LIMIT of its runs were stopped by a model-pricing gap.
+
+    Needs no cap, so it applies to every hotel. Call it before a run and before each segment
+    (`check_hotel_daily_cap` calls it too). `record` does not apply it, so a run in flight stops
+    at its next pre-segment call.
+    """
+    runs = ledger.hotel_spend(tenant, day=utc_day(now)).pricing_gap_runs
+    limit = UNPRICED_RUNS_HOTEL_DAILY_LIMIT
+    if runs < limit:
+        return UnpricedLimitDecision(
+            allowed=True,
+            pricing_gap_runs=runs,
+            limit=limit,
+            reason=f"{runs} runs of this hotel stopped on a price gap today (C16 limit {limit})",
+        )
+    return UnpricedLimitDecision(
+        allowed=False,
+        pricing_gap_runs=runs,
+        limit=limit,
+        reason=(
+            f"{runs} runs of this hotel stopped on unpriced usage of a model with no usable "
+            f"price today (C16 limit {limit}): no new runs or segments until the next UTC day "
+            "(decision C16, UNPRICED_LIMIT)"
+        ),
+    )
+
+
 def check_hotel_daily_cap(
     ledger: CostLedger,
     tenant: TenantContext,
-    cap_usd: Decimal,
+    cap_usd: Decimal | None,
     *,
     now: datetime,
     pending_usd: Decimal = Decimal(0),
 ) -> CapDecision:
-    """Per-hotel cap for the UTC day that contains `now`, on priced spend only.
+    """Per-hotel cap for the UTC day that contains `now`, on priced spend only, plus the C16
+    limit (`check_hotel_unpriced_limit`). `cap_usd=None` (no daily cap) checks only C16.
 
-    Also denies when UNPRICED_RUNS_HOTEL_DAILY_LIMIT or more runs of the hotel have unpriced
-    usage in that UTC day (decision C16). `record` does not apply this limit, so a run in
-    flight stops at its next pre-segment call to this function.
+    When both deny, the C16 deny (UNPRICED_LIMIT) is returned.
     """
+    _check_amount("pending_usd", pending_usd)
     spend = ledger.hotel_spend(tenant, day=utc_day(now))
-    decision = check_hotel_spend(cap_usd, spend, pending_usd=pending_usd)
-    if spend.unpriced_runs < UNPRICED_RUNS_HOTEL_DAILY_LIMIT:
+    limit = check_hotel_unpriced_limit(ledger, tenant, now=now)
+    if cap_usd is None:
+        decision = CapDecision(
+            allowed=True,
+            cap_usd=None,
+            spent_usd=spend.priced_usd + pending_usd,
+            remaining_usd=None,
+            reason=f"no hotel daily cap; spent {spend.priced_usd + pending_usd} USD today",
+        )
+    else:
+        decision = check_hotel_spend(cap_usd, spend, pending_usd=pending_usd)
+    if limit.allowed:
         return decision
     return CapDecision(
         allowed=False,
         cap_usd=decision.cap_usd,
         spent_usd=decision.spent_usd,
-        remaining_usd=Decimal(0),
-        reason=(
-            f"{spend.unpriced_runs} runs of this hotel stopped on unpriced usage today (limit "
-            f"{UNPRICED_RUNS_HOTEL_DAILY_LIMIT}): no new runs until the next UTC day "
-            "(decision C16)"
-        ),
+        remaining_usd=None if cap_usd is None else Decimal(0),
+        reason=limit.reason,
         unpriced_rows=spend.unpriced_rows,
+        failure_code=UNPRICED_LIMIT,
     )
 
 

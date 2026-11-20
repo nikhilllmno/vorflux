@@ -1,4 +1,4 @@
-"""The cost ledger: one immutable row per (run, segment, provider, exact model id).
+"""The cost ledger: one immutable row per (run, segment, provider, serving, exact model id).
 
 `CostLedger` is the contract. `InMemoryCostLedger` implements it for tests and local runs. A
 Postgres store over the proposed `run_costs` table (docs/costs.md) implements it later and
@@ -23,6 +23,7 @@ from typing import Protocol, runtime_checkable
 from uuid import UUID
 
 from harness.costs.caps import (
+    UNPRICED_LIMIT_REASONS,
     USAGE_UNPRICED,
     CapDecision,
     Spend,
@@ -97,7 +98,7 @@ class CostRow:
 
     @property
     def key(self) -> UsageKey:
-        return UsageKey(self.run_id, self.segment_id, self.provider, self.model)
+        return UsageKey(self.run_id, self.segment_id, self.provider, self.serving, self.model)
 
 
 @dataclass(frozen=True, slots=True)
@@ -238,8 +239,7 @@ class CostLedger(Protocol):
 
 def _same_usage(row: CostRow, report: UsageReport) -> bool:
     return (
-        row.serving == report.serving
-        and row.cache_write_1h_tokens == report.cache_write_1h_tokens
+        row.cache_write_1h_tokens == report.cache_write_1h_tokens
         and row.input_tokens == report.input_tokens
         and row.output_tokens == report.output_tokens
         and row.cache_read_tokens == report.cache_read_tokens
@@ -252,15 +252,16 @@ def _same_usage(row: CostRow, report: UsageReport) -> bool:
 def _spend(rows: Iterable[CostRow]) -> Spend:
     priced = Decimal(0)
     unpriced = 0
-    unpriced_runs: set[UUID] = set()
+    gap_runs: set[UUID] = set()
     for row in rows:
         if row.cost_usd is None:
             unpriced += 1
-            unpriced_runs.add(row.run_id)
+            if row.unpriced_reason in UNPRICED_LIMIT_REASONS:
+                gap_runs.add(row.run_id)
         else:
             priced += row.cost_usd
     return Spend(
-        priced_usd=quantize_usd(priced), unpriced_rows=unpriced, unpriced_runs=len(unpriced_runs)
+        priced_usd=quantize_usd(priced), unpriced_rows=unpriced, pricing_gap_runs=len(gap_runs)
     )
 
 

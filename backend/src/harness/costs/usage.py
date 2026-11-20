@@ -137,13 +137,37 @@ class UsageKey(NamedTuple):
     run_id: UUID
     segment_id: str
     provider: Provider
+    serving: Serving
     model: str
 
 
 def idempotency_key(report: UsageReport) -> UsageKey:
-    """(run_id, segment_id, provider, model), with `model` exactly as the runtime sent it.
+    """(run_id, segment_id, provider, serving, model), with `model` exactly as sent.
 
     Two ids for one model in one segment (claude-haiku-4-5 and claude-haiku-4-5-20251001) are
-    two keys, because both are real usage. A true resend repeats the same id.
+    two keys, because both are real usage. So are one model id served first-party and by
+    another provider in one segment. A true resend repeats the same id and serving.
     """
-    return UsageKey(report.run_id, report.segment_id, report.provider, report.model)
+    return UsageKey(report.run_id, report.segment_id, report.provider, report.serving, report.model)
+
+
+def cache_write_1h_from_model_usage(
+    cache_creation_tokens: int, ephemeral_5m_tokens: int | None, ephemeral_1h_tokens: int | None
+) -> int | None:
+    """`cache_write_1h_tokens` for one Claude `model_usage` entry (docs/costs.md, Adapter notes).
+
+    Pass the segment deltas of `cacheCreationInputTokens`, `cacheCreationEphemeral5mInputTokens`
+    and `cacheCreationEphemeral1hInputTokens` (None when the CLI did not report a field). Both
+    TTL counts are inside the total, and a write whose TTL the API did not report is in
+    neither. The result is the total minus the 5-minute count: the 1-hour count when every
+    write reports its TTL, and writes with no reported TTL added at the 1-hour rate (safe side,
+    decision C1). None (every write at the 1-hour rate) when a field is missing or the counts
+    do not fit the total.
+    """
+    if ephemeral_5m_tokens is None or ephemeral_1h_tokens is None:
+        return None
+    if min(cache_creation_tokens, ephemeral_5m_tokens, ephemeral_1h_tokens) < 0:
+        return None
+    if ephemeral_5m_tokens + ephemeral_1h_tokens > cache_creation_tokens:
+        return None
+    return cache_creation_tokens - ephemeral_5m_tokens
