@@ -96,14 +96,15 @@ the tokens are already spent:
   cacheCreationInputTokens - cacheCreationEphemeral5mInputTokens`; when it is absent,
   `cache_write_1h_tokens` is absent, so every cache write uses the 1-hour rate. Take each
   field as a segment delta, the same as `costUSD` (end snapshot minus baseline snapshot of
-  that model). Baseline rule: a missing baseline counts as 0 only for the total cache-write
-  count (`cacheCreationInputTokens`). If the baseline snapshot of the model, or the end
-  snapshot, has no `cacheCreationEphemeral5mInputTokens`, the 5m delta is unknown: pass
-  `five_minute=None`, so `cache_write_1h_tokens` is absent and the segment prices every cache
-  write at the 1-hour rate. A missing 5m baseline never counts as 0, because that makes the
-  5m delta too large (it would add 5-minute writes from before the segment, and under-price
-  the segment). Then call `cache_write_1h_from_model_usage(total, five_minute)`. It also
-  returns null when the 5m delta does not fit the total. With every write reporting its lifetime, our cost matches
+  that model). Baseline rule (runtime contract v2): a model with no baseline entry has a
+  baseline of 0. The adapter leaves `cache_write_1h_tokens` absent (None) when the end entry
+  has no 5-minute count (also when neither lifetime count is present), when an existing
+  baseline entry has none, or when the result is outside 0 to the `cache_write_tokens` delta.
+  Then the segment prices every cache write at the 1-hour rate. An existing baseline entry
+  with no 5-minute count (an older CLI wrote it) never counts as 0, because that makes the 5m
+  delta too large and under-prices the segment. Call
+  `cache_write_1h_from_model_usage(total, five_minute)` with `five_minute=None` in those
+  cases; it also returns null when the result is outside 0 to the total. With every write reporting its lifetime, our cost matches
   `costUSD` within the C6 tolerance (tested). Writes with no reported lifetime, or an absent
   5m count, make our cost higher than `costUSD`, and `check_sdk_cost` logs a mismatch for
   that row.
