@@ -3,43 +3,101 @@
 from __future__ import annotations
 
 import logging
-from decimal import ROUND_HALF_UP, Decimal, localcontext
+from decimal import Decimal, localcontext
 from enum import StrEnum
 
-from harness.costs.prices import PRICE_TABLE, PriceTable
-from harness.costs.usage import UsageReport
+from harness.costs.prices import PRICE_TABLE, PriceTable, Provider, UnpricedUsageError
+from harness.costs.usage import MAX_TOKENS, MAX_USD, UsageReport, quantize_usd
 
 logger = logging.getLogger("harness.costs")
 
-# Costs are stored as numeric(20, 9): nine decimal places of a US dollar.
-COST_QUANTUM = Decimal("0.000000001")
 _PER_MTOK = Decimal(1_000_000)
+
+
+class WebSearchNotPricedError(UnpricedUsageError):
+    """The report has web search requests, which the table does not price (decision C12)."""
+
+    reason = "web_search"
+
+
+class CostOutOfRangeError(UnpricedUsageError):
+    """The cost does not fit numeric(20, 9). Such usage is far over any cap."""
+
+    reason = "cost_out_of_range"
+
 
 # An SDK-reported cost that differs from ours by more than the larger of these is logged.
 SDK_COST_REL_TOLERANCE = Decimal("0.01")
 SDK_COST_ABS_TOLERANCE = Decimal("0.000001")
 
 
-def quantize_usd(amount: Decimal) -> Decimal:
-    """Round a USD amount to COST_QUANTUM, half up."""
-    return amount.quantize(COST_QUANTUM, rounding=ROUND_HALF_UP)
+def _check_count(name: str, value: int) -> None:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(f"{name} must be an int, got {type(value).__name__}")
+    if not 0 <= value <= MAX_TOKENS:
+        raise ValueError(f"{name} must be between 0 and {MAX_TOKENS}, got {value}")
+
+
+def price_usage(
+    provider: Provider,
+    model: str,
+    *,
+    input_tokens: int,
+    output_tokens: int,
+    cache_read_tokens: int,
+    cache_write_tokens: int,
+    table: PriceTable = PRICE_TABLE,
+) -> Decimal:
+    """Price token counts: sum(tokens x USD per MTok) / 1e6, rounded half up to 9 places.
+
+    Use it for a running estimate inside a segment (pass the result to the caps as
+    `pending_usd`). Raises UnknownModelError, or CostOutOfRangeError at 10^11 USD or more.
+    """
+    counts = {
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "cache_read_tokens": cache_read_tokens,
+        "cache_write_tokens": cache_write_tokens,
+    }
+    for name, value in counts.items():
+        _check_count(name, value)
+    prices = table.get(provider, model).prices
+    with localcontext() as ctx:
+        ctx.prec = 60  # exact for any bigint token count and any price
+        total = quantize_usd(
+            (
+                input_tokens * prices.input
+                + output_tokens * prices.output
+                + cache_read_tokens * prices.cache_read
+                + cache_write_tokens * prices.cache_write
+            )
+            / _PER_MTOK
+        )
+    if total >= MAX_USD:
+        raise CostOutOfRangeError(f"cost {total} USD of model {model!r} does not fit the ledger")
+    return total
 
 
 def cost_usd(report: UsageReport, table: PriceTable = PRICE_TABLE) -> Decimal:
-    """The billed cost of one report: sum(tokens x USD per MTok) / 1e6, rounded half up.
+    """The billed cost of one report, priced from `table`.
 
-    Raises UnknownModelError if the table has no price for the model.
+    Raises an UnpricedUsageError subclass when the report cannot be priced: an unknown,
+    tiered or non-first-party model, web search requests, or a cost out of range.
     """
-    prices = table.get(report.provider, report.model).prices
-    with localcontext() as ctx:
-        ctx.prec = 60  # exact for any realistic token count and price
-        total = (
-            report.input_tokens * prices.input
-            + report.output_tokens * prices.output
-            + report.cache_read_tokens * prices.cache_read
-            + report.cache_write_tokens * prices.cache_write
-        ) / _PER_MTOK
-        return quantize_usd(total)
+    if report.web_search_requests:
+        raise WebSearchNotPricedError(
+            f"{report.web_search_requests} web search requests on model {report.model!r} "
+            "are not priced (docs/costs.md, decision C12)"
+        )
+    return price_usage(
+        report.provider,
+        report.model,
+        input_tokens=report.input_tokens,
+        output_tokens=report.output_tokens,
+        cache_read_tokens=report.cache_read_tokens,
+        cache_write_tokens=report.cache_write_tokens,
+        table=table,
+    )
 
 
 class SdkCostCheck(StrEnum):

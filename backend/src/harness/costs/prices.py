@@ -9,9 +9,10 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
-from datetime import date
+from datetime import UTC, date, datetime
 from decimal import Decimal
 from enum import StrEnum
+from itertools import pairwise
 from types import MappingProxyType
 
 
@@ -22,12 +23,50 @@ class Provider(StrEnum):
     OPENAI = "openai"
 
 
-class UnknownModelError(ValueError):
-    """The model has no price in the table. Callers must stop, not price it as zero."""
+class UnpricedUsageError(ValueError):
+    """Usage that cannot be priced. Never price it as zero: record it unpriced and stop the run.
+
+    `reason` is the code stored in run_costs.unpriced_reason.
+    """
+
+    reason = "unpriced"
+
+
+class UnknownModelError(UnpricedUsageError):
+    """The model has no price in the table."""
+
+    reason = "unknown_model"
 
 
 class TieredPricingError(UnknownModelError):
     """The model's price depends on each request's prompt length (docs/costs.md, decision C2)."""
+
+    reason = "tiered_pricing"
+
+
+class NonFirstPartyModelError(UnknownModelError):
+    """A Bedrock, Vertex AI, gateway or fine-tuned model id. Only first-party prices are known."""
+
+    reason = "non_first_party"
+
+
+class NoPriceTableError(UnpricedUsageError):
+    """No price table was in effect at the time of the usage."""
+
+    reason = "no_price_table"
+
+
+def _non_first_party_kind(model: str) -> str | None:
+    """Name the kind of a model id that is not a first-party API id, or return None."""
+    if model.startswith("ft:"):
+        return "fine-tuned"
+    if "anthropic." in model or model.endswith(("-v1:0", "-v2:0")):
+        return "Amazon Bedrock"
+    if "@" in model:
+        return "Google Vertex AI"
+    if "/" in model or ":" in model:
+        return "gateway or provider-prefixed"
+    return None
 
 
 @dataclass(frozen=True, slots=True)
@@ -114,6 +153,12 @@ class PriceTable:
                 "a usage report does not carry per-request prompt length, so it cannot be "
                 "priced (docs/costs.md, decision C2)"
             )
+        kind = _non_first_party_kind(model)
+        if kind is not None:
+            raise NonFirstPartyModelError(
+                f"model {model!r} ({provider}) looks like a {kind} id; the price table holds "
+                "first-party API prices only (docs/costs.md, decision C13)"
+            )
         owners = sorted(
             str(p) for (p, m) in (*self._by_id, *self._tiered) if m == model and p != provider
         )
@@ -125,6 +170,51 @@ class PriceTable:
 
     def is_priced(self, provider: Provider, model: str) -> bool:
         return (provider, model) in self._by_id
+
+
+class PriceBook:
+    """Price tables over time. The table for a moment is the latest one whose `effective_from`
+    (a UTC date) is on or before that moment's UTC date."""
+
+    def __init__(self, tables: Iterable[PriceTable]) -> None:
+        ordered = sorted(tables, key=lambda t: t.effective_from)
+        if not ordered:
+            raise ValueError("a price book needs at least one price table")
+        for earlier, later in pairwise(ordered):
+            if earlier.effective_from == later.effective_from:
+                raise ValueError(f"two price tables are effective on {later.effective_from}")
+        if len({t.version for t in ordered}) != len(ordered):
+            raise ValueError("price table versions must be unique")
+        self._tables = tuple(ordered)
+
+    def tables(self) -> tuple[PriceTable, ...]:
+        return self._tables
+
+    @property
+    def latest(self) -> PriceTable:
+        return self._tables[-1]
+
+    def table_at(self, moment: datetime) -> PriceTable:
+        """Return the table in effect at `moment` (timezone-aware), or raise NoPriceTableError."""
+        if moment.tzinfo is None or moment.utcoffset() is None:
+            raise ValueError(f"expected a timezone-aware datetime, got {moment!r}")
+        day = moment.astimezone(UTC).date()
+        for table in reversed(self._tables):
+            if table.effective_from <= day:
+                return table
+        raise NoPriceTableError(
+            f"no price table is in effect on {day}; "
+            f"the first starts {self._tables[0].effective_from}"
+        )
+
+
+def check_priced(provider: Provider, model: str, table: PriceTable | None = None) -> ModelPrice:
+    """Raise UnknownModelError (or a subclass) unless the model has a price.
+
+    The orchestrator calls this before a run for every model the runtime may call: the run's
+    model, a fallback model, the small fast model and subagent models.
+    """
+    return (table or PRICE_TABLE).get(provider, model)
 
 
 # --- Default table ---------------------------------------------------------------------------
@@ -227,12 +317,22 @@ PRICE_TABLE = PriceTable(
     tiered=_TIERED,
 )
 
+# Add a new table here (with a later effective_from) when prices change. Never edit a table
+# that rows already reference: each row stores price_table_version.
+PRICE_BOOK = PriceBook([PRICE_TABLE])
+
 __all__ = [
+    "PRICE_BOOK",
     "PRICE_TABLE",
     "ModelPrice",
+    "NoPriceTableError",
+    "NonFirstPartyModelError",
+    "PriceBook",
     "PriceTable",
     "Provider",
     "TieredPricingError",
     "TokenPrices",
     "UnknownModelError",
+    "UnpricedUsageError",
+    "check_priced",
 ]
