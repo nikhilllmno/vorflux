@@ -10,6 +10,7 @@ import pytest
 
 from harness.costs import (
     PRICE_TABLE,
+    UNPRICED_LIMIT_REASONS,
     UNPRICED_REASONS,
     CostRow,
     ModelPrice,
@@ -22,6 +23,7 @@ from harness.costs import (
     TokenPrices,
     UnknownModelError,
     UnpricedUsageError,
+    UsageKey,
 )
 
 
@@ -210,6 +212,40 @@ def test_every_cost_row_field_is_a_proposed_run_costs_column() -> None:
         re.findall(r"^  ([a-z_0-9]+) (?:uuid|text|bigint|numeric|timestamptz)", body, re.M)
     )
     assert columns == {f.name for f in fields(CostRow)} | {"id"}
+
+
+def _costs_doc() -> str:
+    return (Path(__file__).parents[2] / "docs" / "costs.md").read_text(encoding="utf-8")
+
+
+def _columns(text: str) -> list[str]:
+    return [c.strip() for c in text.split(",")]
+
+
+def test_sql_unique_key_and_postgres_conflict_target_match_the_idempotency_key() -> None:
+    sql = _proposed_sql()
+    match = re.search(r"constraint run_costs_usage_key unique \(([^)]*)\)", sql)
+    assert match is not None
+    assert _columns(match.group(1)) == list(UsageKey._fields)
+    conflict = re.search(r"on conflict \(([^)]*)\)", _costs_doc())
+    assert conflict is not None
+    assert _columns(" ".join(conflict.group(1).split())) == list(UsageKey._fields)
+
+
+def test_cache_write_1h_check_is_named() -> None:
+    assert (
+        "constraint run_costs_cache_write_1h_within_total check (\n"
+        "    cache_write_1h_tokens >= 0 and cache_write_1h_tokens <= cache_write_tokens\n  )"
+    ) in _proposed_sql()
+
+
+def test_postgres_unpriced_limit_count_uses_the_c16_reasons() -> None:
+    match = re.search(
+        r"count\(distinct run_id\) filter \(where unpriced_reason in \(([^)]*)\)\)",
+        " ".join(_costs_doc().split()),
+    )
+    assert match is not None
+    assert set(re.findall(r"'([a-z_]+)'", match.group(1))) == UNPRICED_LIMIT_REASONS
 
 
 def test_unpriced_usage_error_needs_a_specific_reason() -> None:

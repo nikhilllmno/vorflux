@@ -163,22 +163,39 @@ def test_conflicting_resend_keeps_the_first_row_and_warns(
     assert any("conflict" in r.getMessage() for r in caplog.records)
 
 
-@pytest.mark.parametrize(
-    "change", [{"serving": "bedrock"}, {"cache_write_tokens": 10, "cache_write_1h_tokens": 5}]
-)
-def test_a_resend_that_differs_in_serving_or_1h_writes_is_a_conflict(
+def test_a_resend_that_differs_in_1h_writes_is_a_conflict(
     ledger: InMemoryCostLedger,
     runs: StaticRuns,
     report: ReportFactory,
     caplog: pytest.LogCaptureFixture,
-    change: dict[str, Any],
 ) -> None:
     run = runs.add(ORG_A, HOTEL_A1)
-    first = {"cache_write_tokens": 10} if "cache_write_1h_tokens" in change else {}
-    ledger.record(report(run, **first))
+    ledger.record(report(run, cache_write_tokens=10))
     with caplog.at_level(logging.WARNING, logger="harness.costs"):
-        assert ledger.record(report(run, **change)).status is RecordStatus.DUPLICATE
+        resend = report(run, cache_write_tokens=10, cache_write_1h_tokens=5)
+        assert ledger.record(resend).status is RecordStatus.DUPLICATE
     assert any("conflict" in r.getMessage() for r in caplog.records)
+
+
+def test_serving_is_part_of_the_key(
+    ledger: InMemoryCostLedger,
+    runs: StaticRuns,
+    report: ReportFactory,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # Round 4, item 4: the key is (run_id, segment_id, provider, serving, model). The same
+    # model served first-party and by Bedrock in one segment is two rows, both kept.
+    run = runs.add(ORG_A, HOTEL_A1)
+    first = ledger.record(report(run))
+    with caplog.at_level(logging.WARNING, logger="harness.costs"):
+        bedrock = ledger.record(report(run, serving="bedrock"))
+    assert bedrock.status is RecordStatus.RECORDED
+    assert not any("conflict" in r.getMessage() for r in caplog.records)
+    rows = ledger.run_rows(tenant(ORG_A, HOTEL_A1), run)
+    assert {r.serving.value for r in rows} == {"first_party", "bedrock"}
+    assert first.row.cost_usd is not None and bedrock.row.cost_usd is None
+    again = ledger.record(report(run, serving="bedrock"))
+    assert again.status is RecordStatus.DUPLICATE
 
 
 def test_record_result_gives_the_contract_failure_code(

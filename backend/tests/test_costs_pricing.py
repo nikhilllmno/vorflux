@@ -23,6 +23,7 @@ from harness.costs import (
     TokenPrices,
     UnknownModelError,
     UsageReport,
+    cache_write_1h_from_model_usage,
     check_priced,
     check_sdk_cost,
     cost_usd,
@@ -406,3 +407,88 @@ def test_check_priced_and_price_usage_default_to_the_table_in_effect_now() -> No
     assert price_usage(Provider.OPENAI, "gpt-5", prices=current, **counts) == 1
     # Without `prices`, the default book's table in effect now (2026-11-20 table) is used.
     assert price_usage(Provider.OPENAI, "gpt-5", **counts) == Decimal("1.25")
+
+
+# Claude model_usage split (Hermes_Like_Bot round 4, item 1) -----------------------------------
+
+
+def _from_model_usage(entry: dict[str, Any], model: str) -> UsageReport:
+    """The documented Claude mapping (docs/costs.md, "Adapter notes"), one segment from zero."""
+    return _report(
+        model=model,
+        input_tokens=entry["inputTokens"],
+        output_tokens=entry["outputTokens"],
+        cache_read_tokens=entry["cacheReadInputTokens"],
+        cache_write_tokens=entry["cacheCreationInputTokens"],
+        cache_write_1h_tokens=cache_write_1h_from_model_usage(
+            entry["cacheCreationInputTokens"],
+            entry.get("cacheCreationEphemeral5mInputTokens"),
+            entry.get("cacheCreationEphemeral1hInputTokens"),
+        ),
+        web_search_requests=entry["webSearchRequests"],
+        sdk_reported_cost_usd=Decimal(str(entry["costUSD"])),
+    )
+
+
+# claude-haiku-4-5: input 1, output 5, cache read 0.10, 5-minute write 1.25, 1-hour write 2.
+# The SDK's costUSD for this entry: (1000 + 10000 + 1000 + 750000 + 800000) / 1e6 = 1.562.
+MODEL_USAGE_WITH_SPLIT: dict[str, Any] = {
+    "inputTokens": 1000,
+    "outputTokens": 2000,
+    "cacheReadInputTokens": 10_000,
+    "cacheCreationInputTokens": 1_000_000,
+    "cacheCreationEphemeral5mInputTokens": 600_000,
+    "cacheCreationEphemeral1hInputTokens": 400_000,
+    "webSearchRequests": 0,
+    "costUSD": 1.562,
+}
+
+
+def test_model_usage_split_prices_each_ttl_at_its_rate_and_matches_the_sdk_cost(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    report = _from_model_usage(MODEL_USAGE_WITH_SPLIT, "claude-haiku-4-5")
+    assert report.cache_write_1h_tokens == 400_000
+    ours = cost_usd(report, PRICE_TABLE)
+    # 600k writes at 1.25x input and 400k at 2x input, not 1M at 2x.
+    assert ours == Decimal("1.562")
+    with caplog.at_level(logging.WARNING, logger="harness.costs"):
+        assert check_sdk_cost(report, ours) is SdkCostCheck.MATCH  # within the C6 tolerance
+    assert not caplog.records
+
+
+def test_model_usage_split_matches_the_sdk_cost_on_sonnet() -> None:
+    # claude-sonnet-4-6: input 3, output 15, cache read 0.30, 5-minute write 3.75, 1-hour 6.
+    entry = {**MODEL_USAGE_WITH_SPLIT, "costUSD": 4.686}
+    report = _from_model_usage(entry, "claude-sonnet-4-6")
+    ours = cost_usd(report, PRICE_TABLE)
+    assert ours == Decimal("4.686")
+    assert check_sdk_cost(report, ours) is SdkCostCheck.MATCH
+
+
+def test_model_usage_without_a_split_prices_every_write_at_2x() -> None:
+    # An older CLI reports no split: every cache write is priced at the 1-hour rate (C1), so
+    # the SDK cost (5-minute rate) differs and the cross-check flags it.
+    entry = {
+        k: v
+        for k, v in MODEL_USAGE_WITH_SPLIT.items()
+        if not k.startswith("cacheCreationEphemeral")
+    }
+    entry["costUSD"] = 1.262
+    report = _from_model_usage(entry, "claude-haiku-4-5")
+    assert report.cache_write_1h_tokens is None
+    ours = cost_usd(report, PRICE_TABLE)
+    assert ours == Decimal("2.012")
+    assert check_sdk_cost(report, ours) is SdkCostCheck.MISMATCH
+
+
+def test_model_usage_writes_with_no_reported_ttl_are_priced_at_2x() -> None:
+    # 200k writes are in neither TTL field; the SDK prices them at 5 minutes, we at 1 hour.
+    entry = {
+        **MODEL_USAGE_WITH_SPLIT,
+        "cacheCreationEphemeral5mInputTokens": 400_000,
+        "cacheCreationEphemeral1hInputTokens": 400_000,
+    }
+    report = _from_model_usage(entry, "claude-haiku-4-5")
+    assert report.cache_write_1h_tokens == 600_000
+    assert cost_usd(report, PRICE_TABLE) == Decimal("1.712")

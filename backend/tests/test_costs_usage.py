@@ -8,7 +8,14 @@ from uuid import UUID, uuid4
 import pytest
 from pydantic import ValidationError
 
-from harness.costs import Provider, Serving, UsageKey, UsageReport, idempotency_key
+from harness.costs import (
+    Provider,
+    Serving,
+    UsageKey,
+    UsageReport,
+    cache_write_1h_from_model_usage,
+    idempotency_key,
+)
 
 RUN_ID = UUID("00000000-0000-4000-8000-000000000001")
 
@@ -137,10 +144,15 @@ def test_report_is_immutable() -> None:
         report.input_tokens = 5
 
 
-def test_idempotency_key_is_run_segment_provider_model() -> None:
+def test_idempotency_key_is_run_segment_provider_serving_model() -> None:
     report = UsageReport.model_validate(_payload())
+    assert UsageKey._fields == ("run_id", "segment_id", "provider", "serving", "model")
     assert idempotency_key(report) == UsageKey(
-        run_id=RUN_ID, segment_id="seg-1", provider=Provider.ANTHROPIC, model="claude-sonnet-4-6"
+        run_id=RUN_ID,
+        segment_id="seg-1",
+        provider=Provider.ANTHROPIC,
+        serving=Serving.FIRST_PARTY,
+        model="claude-sonnet-4-6",
     )
 
 
@@ -150,10 +162,11 @@ def test_same_segment_with_other_token_counts_has_the_same_key() -> None:
     assert idempotency_key(first) == idempotency_key(again)
 
 
-def test_key_differs_by_model_segment_and_run() -> None:
+def test_key_differs_by_model_serving_segment_and_run() -> None:
     base = idempotency_key(UsageReport.model_validate(_payload()))
     others = [
         _payload(model="claude-haiku-4-5"),
+        _payload(serving="bedrock"),
         _payload(segment_id="seg-2"),
         _payload(run_id=str(uuid4())),
     ]
@@ -231,3 +244,43 @@ def test_cache_write_1h_tokens_is_a_subset_of_cache_write_tokens() -> None:
     UsageReport.model_validate(_payload(cache_write_tokens=100, cache_write_1h_tokens=100))
     with pytest.raises(ValidationError, match="cache_write_1h_tokens"):
         UsageReport.model_validate(_payload(cache_write_tokens=100, cache_write_1h_tokens=101))
+
+
+# Claude model_usage cache-write split (Hermes_Like_Bot round 4, item 1) ------------------------
+# Claude CLI 2.1.327 reports cacheCreationEphemeral5mInputTokens and
+# cacheCreationEphemeral1hInputTokens per model. Both are already inside
+# cacheCreationInputTokens, and a write whose TTL the API did not report is in neither.
+
+
+def test_a_complete_split_maps_the_1h_count() -> None:
+    assert cache_write_1h_from_model_usage(1_000_000, 600_000, 400_000) == 400_000
+    assert cache_write_1h_from_model_usage(10, 10, 0) == 0
+    assert cache_write_1h_from_model_usage(10, 0, 10) == 10
+    assert cache_write_1h_from_model_usage(0, 0, 0) == 0
+
+
+def test_writes_with_no_reported_ttl_count_as_1h() -> None:
+    # 200k writes are in neither field: price them at the 1-hour rate (safe side, C1).
+    assert cache_write_1h_from_model_usage(1_000_000, 500_000, 300_000) == 500_000
+
+
+@pytest.mark.parametrize(("five_minute", "one_hour"), [(None, 0), (0, None), (None, None)])
+def test_a_missing_split_field_gives_null(five_minute: int | None, one_hour: int | None) -> None:
+    assert cache_write_1h_from_model_usage(1000, five_minute, one_hour) is None
+
+
+@pytest.mark.parametrize(
+    ("total", "five_minute", "one_hour"),
+    [(1000, 600, 401), (1000, -1, 0), (1000, 0, -1), (-1, 0, 0), (1000, 1001, 0)],
+)
+def test_an_inconsistent_split_gives_null(total: int, five_minute: int, one_hour: int) -> None:
+    # The adapter computes segment deltas; a delta that does not fit the total is not trusted.
+    assert cache_write_1h_from_model_usage(total, five_minute, one_hour) is None
+
+
+def test_the_mapped_value_is_a_valid_report_field() -> None:
+    one_hour = cache_write_1h_from_model_usage(1000, 250, 750)
+    report = UsageReport.model_validate(
+        _payload(cache_write_tokens=1000, cache_write_1h_tokens=one_hour)
+    )
+    assert report.cache_write_1h_tokens == 750

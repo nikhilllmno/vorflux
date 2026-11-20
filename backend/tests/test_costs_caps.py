@@ -8,15 +8,21 @@ from uuid import UUID, uuid4
 import pytest
 
 from harness.costs import (
+    UNPRICED_LIMIT,
+    UNPRICED_LIMIT_REASONS,
+    UNPRICED_REASONS,
     UNPRICED_RUNS_HOTEL_DAILY_LIMIT,
+    USAGE_UNPRICED,
     CapDecision,
     InMemoryCostLedger,
     Provider,
     RunTenant,
     SpendCaps,
     UnknownRunError,
+    UnpricedLimitDecision,
     UsageReport,
     check_hotel_daily_cap,
+    check_hotel_unpriced_limit,
     check_run_cap,
     check_spend_cap,
     price_usage,
@@ -254,7 +260,7 @@ def test_hotel_with_too_many_unpriced_runs_is_denied_new_runs_until_the_next_utc
     two_rows = UsageReport.model_validate({**_unpriced(first).model_dump(), "segment_id": "seg-y"})
     ledger.record(two_rows)  # a second unpriced row in the same run counts once
     ledger.record(_unpriced(runs.add()))
-    assert ledger.hotel_spend(t, day=clock().date()).unpriced_runs == 2
+    assert ledger.hotel_spend(t, day=clock().date()).pricing_gap_runs == 2
     assert check_hotel_daily_cap(ledger, t, cap, now=clock()).allowed
 
     in_flight = runs.add()
@@ -284,3 +290,140 @@ def test_record_hotel_daily_cap_ignores_the_unpriced_run_limit() -> None:
     result = ledger.record(_usage(runs.add(), "seg-1", 1), caps=caps)
     assert result.hotel_daily_cap is not None and result.hotel_daily_cap.allowed
     assert not result.stop_run
+
+
+# Round 4: C16 counts only model-pricing gaps, works without a daily cap, has its own code -----
+
+
+def _gap(run_id: UUID, segment_id: str = "seg-x", **overrides: Any) -> UsageReport:
+    return UsageReport.model_validate(
+        {**_unpriced(run_id).model_dump(), "segment_id": segment_id, **overrides}
+    )
+
+
+def test_c16_counts_only_unknown_model_and_tiered_pricing() -> None:
+    assert UNPRICED_LIMIT_REASONS == frozenset({"unknown_model", "tiered_pricing"})
+    assert UNPRICED_LIMIT_REASONS <= set(UNPRICED_REASONS)
+
+
+def test_unpriced_limit_code_is_exported() -> None:
+    assert UNPRICED_LIMIT == "UNPRICED_LIMIT"
+
+
+def test_unpriced_limit_check_needs_no_cap() -> None:
+    runs, clock = Runs(), Clock()
+    ledger = InMemoryCostLedger(runs, clock=clock)
+    t = _tenant()
+    allowed = check_hotel_unpriced_limit(ledger, t, now=clock())
+    assert isinstance(allowed, UnpricedLimitDecision)
+    assert allowed.allowed
+    assert allowed.failure_code is None
+    assert allowed.limit == UNPRICED_RUNS_HOTEL_DAILY_LIMIT
+    for _ in range(UNPRICED_RUNS_HOTEL_DAILY_LIMIT):
+        ledger.record(_unpriced(runs.add()))
+    denied = check_hotel_unpriced_limit(ledger, t, now=clock())
+    assert not denied.allowed
+    assert denied.pricing_gap_runs == 3
+    assert denied.failure_code == UNPRICED_LIMIT
+    assert "C16" in denied.reason and "unpriced" in denied.reason
+    tomorrow = (clock() + timedelta(days=1)).replace(hour=0)
+    assert check_hotel_unpriced_limit(ledger, t, now=tomorrow).allowed
+
+
+def test_hotel_daily_cap_of_none_applies_only_the_unpriced_limit() -> None:
+    runs, clock = Runs(), Clock()
+    ledger = InMemoryCostLedger(runs, clock=clock)
+    t = _tenant()
+    ledger.record(_usage(runs.add(), "seg-1", 50))
+    no_cap = check_hotel_daily_cap(ledger, t, None, now=clock())
+    assert no_cap.allowed
+    assert no_cap.cap_usd is None and no_cap.remaining_usd is None
+    assert no_cap.spent_usd == Decimal("50")
+    assert no_cap.failure_code is None
+    for _ in range(UNPRICED_RUNS_HOTEL_DAILY_LIMIT):
+        ledger.record(_unpriced(runs.add()))
+    denied = check_hotel_daily_cap(ledger, t, None, now=clock())
+    assert not denied.allowed
+    assert denied.failure_code == UNPRICED_LIMIT
+    assert "C16" in denied.reason
+
+
+def test_c16_deny_has_its_own_code_and_a_usd_deny_has_none() -> None:
+    runs, clock = Runs(), Clock()
+    ledger = InMemoryCostLedger(runs, clock=clock)
+    t = _tenant()
+    ledger.record(_usage(runs.add(), "seg-1", 5))
+    usd = check_hotel_daily_cap(ledger, t, Decimal("5"), now=clock())
+    assert not usd.allowed
+    assert usd.failure_code is None  # the orchestrator maps a USD deny to BUDGET_EXHAUSTED
+    for _ in range(UNPRICED_RUNS_HOTEL_DAILY_LIMIT):
+        ledger.record(_unpriced(runs.add()))
+    both = check_hotel_daily_cap(ledger, t, Decimal("5"), now=clock())
+    assert not both.allowed
+    assert both.failure_code == UNPRICED_LIMIT  # C16 is named first when both deny
+
+
+def test_run_cap_deny_for_unpriced_usage_gives_usage_unpriced() -> None:
+    runs, clock = Runs(), Clock()
+    ledger = InMemoryCostLedger(runs, clock=clock)
+    run, other = runs.add(), runs.add()
+    ledger.record(_unpriced(run))
+    ledger.record(_usage(other, "seg-1", 5))
+    assert check_run_cap(ledger, _tenant(), run, Decimal("1000")).failure_code == USAGE_UNPRICED
+    assert check_run_cap(ledger, _tenant(), other, Decimal("5")).failure_code is None
+
+
+@pytest.mark.parametrize(
+    ("overrides", "reason"),
+    [
+        ({"model": "claude-haiku-4-5", "web_search_requests": 1}, "web_search"),
+        ({"model": "claude-haiku-4-5", "serving": "bedrock"}, "non_first_party"),
+        ({"model": "claude-haiku-4-5", "serving": "vertex"}, "non_first_party"),
+    ],
+)
+def test_runs_stopped_for_other_reasons_do_not_block_the_hotel(
+    overrides: dict[str, Any], reason: str
+) -> None:
+    # Owner decision (round 4): web_search, non_first_party, cost_out_of_range and
+    # no_price_table each stop their own run already; C16 does not count them.
+    runs, clock = Runs(), Clock()
+    ledger = InMemoryCostLedger(runs, clock=clock)
+    t = _tenant()
+    stopped = [runs.add() for _ in range(UNPRICED_RUNS_HOTEL_DAILY_LIMIT)]
+    for run in stopped:
+        result = ledger.record(_gap(run, **overrides))
+        assert result.row.unpriced_reason == reason
+        assert result.stop_run
+    spend = ledger.hotel_spend(t, day=clock().date())
+    assert spend.unpriced_rows == 3
+    assert spend.pricing_gap_runs == 0
+    assert check_hotel_unpriced_limit(ledger, t, now=clock()).allowed
+    assert check_hotel_daily_cap(ledger, t, Decimal("1000"), now=clock()).allowed
+    assert check_hotel_daily_cap(ledger, t, None, now=clock()).allowed
+    assert all(not check_run_cap(ledger, t, run, Decimal("1000")).allowed for run in stopped)
+
+
+def test_three_tiered_pricing_runs_block_the_hotel() -> None:
+    runs, clock = Runs(), Clock()
+    ledger = InMemoryCostLedger(runs, clock=clock)
+    for _ in range(UNPRICED_RUNS_HOTEL_DAILY_LIMIT):
+        row = ledger.record(_gap(runs.add(), model="claude-haiku-5-5")).row
+        assert row.unpriced_reason == "tiered_pricing"
+    assert not check_hotel_unpriced_limit(ledger, _tenant(), now=clock()).allowed
+
+
+def test_only_gap_runs_count_toward_the_limit_in_a_mixed_day() -> None:
+    runs, clock = Runs(), Clock()
+    ledger = InMemoryCostLedger(runs, clock=clock)
+    t = _tenant()
+    ledger.record(_unpriced(runs.add()))
+    ledger.record(_unpriced(runs.add()))
+    ledger.record(_gap(runs.add(), model="claude-haiku-4-5", web_search_requests=2))
+    # A run that has a web search row and a gap row counts once, as a gap run.
+    mixed = runs.add()
+    ledger.record(_gap(mixed, "seg-a", model="claude-haiku-4-5", serving="other"))
+    assert check_hotel_unpriced_limit(ledger, t, now=clock()).allowed
+    ledger.record(_gap(mixed, "seg-b"))
+    decision = check_hotel_unpriced_limit(ledger, t, now=clock())
+    assert decision.pricing_gap_runs == 3
+    assert not decision.allowed
