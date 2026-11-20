@@ -146,8 +146,8 @@ segment. Wiring the caps into the orchestrator, and where the cap values live, i
 ## PROPOSED `run_costs` table
 
 Becomes a migration after PR#5 merges. Do not apply it before then. It follows PR#5's
-conventions: forced RLS, deny by default, select-only for `authenticated`, writes only through
-the service role.
+conventions: forced RLS, deny by default, select-only for `authenticated`, and inserts only through
+the service role (no update, delete or truncate grant, so the ledger stays append-only).
 
 ### Columns (for the usage dashboard)
 
@@ -156,7 +156,7 @@ the service role.
 | `id` | `uuid` | no | Primary key, `gen_random_uuid()` |
 | `org_id` | `uuid` | no | Tenant |
 | `hotel_id` | `uuid` | no | Tenant; FK `(org_id, hotel_id)` → `hotels (org_id, id)` |
-| `run_id` | `uuid` | no | FK → `runs (id)` once DEX-14 adds `runs` |
+| `run_id` | `uuid` | no | Composite FK `(org_id, hotel_id, run_id)` → `runs (org_id, hotel_id, id)` once DEX-14 adds `runs` |
 | `segment_id` | `text` | no | From the report |
 | `provider` | `text` | no | `'anthropic'` or `'openai'` |
 | `model` | `text` | no | Canonical model id from the price table |
@@ -164,8 +164,8 @@ the service role.
 | `output_tokens` | `bigint` | no | ≥ 0 |
 | `cache_read_tokens` | `bigint` | no | ≥ 0 |
 | `cache_write_tokens` | `bigint` | no | ≥ 0 |
-| `cost_usd` | `numeric(20,9)` | no | Billed cost from the price table, ≥ 0 |
-| `sdk_reported_cost_usd` | `numeric(20,9)` | yes | Cross-check only, never billed |
+| `cost_usd` | `numeric(20,9)` | no | Billed cost from the price table, ≥ 0, not NaN |
+| `sdk_reported_cost_usd` | `numeric(20,9)` | yes | Cross-check only, never billed; ≥ 0, not NaN |
 | `price_table_version` | `text` | no | For example `2026-11-20` |
 | `recorded_at` | `timestamptz` | no | Default `now()`. Day boundary for caps is UTC. |
 
@@ -181,7 +181,7 @@ create table public.run_costs (
   id uuid primary key default gen_random_uuid(),
   org_id uuid not null,
   hotel_id uuid not null,
-  run_id uuid not null,  -- references public.runs (id) on delete cascade, after DEX-14
+  run_id uuid not null,  -- composite FK to public.runs below, after DEX-14
   segment_id text not null check (length(segment_id) between 1 and 200),
   provider text not null check (provider in ('anthropic', 'openai')),
   model text not null check (length(model) between 1 and 200),
@@ -189,13 +189,19 @@ create table public.run_costs (
   output_tokens bigint not null check (output_tokens >= 0),
   cache_read_tokens bigint not null check (cache_read_tokens >= 0),
   cache_write_tokens bigint not null check (cache_write_tokens >= 0),
-  cost_usd numeric(20, 9) not null check (cost_usd >= 0),
-  sdk_reported_cost_usd numeric(20, 9) check (sdk_reported_cost_usd >= 0),
+  -- Postgres orders numeric NaN above every number, so `>= 0` alone accepts it.
+  cost_usd numeric(20, 9) not null check (cost_usd >= 0 and cost_usd <> 'NaN'::numeric),
+  sdk_reported_cost_usd numeric(20, 9)
+    check (sdk_reported_cost_usd >= 0 and sdk_reported_cost_usd <> 'NaN'::numeric),
   price_table_version text not null check (length(price_table_version) > 0),
   recorded_at timestamptz not null default now(),
   constraint run_costs_usage_key unique (run_id, segment_id, provider, model),
   constraint run_costs_hotel_fk foreign key (org_id, hotel_id)
     references public.hotels (org_id, id) on delete cascade
+  -- After DEX-14: a cost row must belong to the same tenant as its run. Needs
+  -- `unique (org_id, hotel_id, id)` on public.runs.
+  -- constraint run_costs_run_fk foreign key (org_id, hotel_id, run_id)
+  --   references public.runs (org_id, hotel_id, id) on delete cascade
 );
 
 comment on table public.run_costs is
@@ -204,7 +210,8 @@ comment on table public.run_costs is
 -- Daily hotel and org totals for caps and the usage dashboard.
 create index run_costs_hotel_day_idx on public.run_costs (org_id, hotel_id, recorded_at);
 
--- Rows are immutable. Deletes happen only through the hotel (or run) cascade.
+-- Rows are immutable. Deletes happen only through the hotel (or run) cascade. The trigger is a
+-- second guard for the table owner, which keeps its privileges.
 create function private.prevent_run_costs_update()
 returns trigger
 language plpgsql
@@ -223,8 +230,10 @@ create trigger run_costs_no_update before update on public.run_costs
 alter table public.run_costs enable row level security;
 alter table public.run_costs force row level security;
 
-revoke all on table public.run_costs from public, anon, authenticated;
-grant all on table public.run_costs to service_role;
+-- Append-only even for the control plane: no UPDATE, DELETE or TRUNCATE grant. FK cascades
+-- from hotels (and runs) still remove rows, because cascades do not check the caller's grants.
+revoke all on table public.run_costs from public, anon, authenticated, service_role;
+grant select, insert on table public.run_costs to service_role;
 grant select on table public.run_costs to authenticated;
 
 -- Cost is billing data, like plans: org-wide or hotel owners and admins only (decision C7).
@@ -237,7 +246,8 @@ create policy run_costs_select_owners_admins on public.run_costs
 ```
 
 The migration also needs the PR#5 catalog and isolation tests extended to `run_costs`: RLS
-forced, no write policy, and a two-org read test.
+forced, no write policy, a two-org read test, service role cannot update or delete, `NaN`
+costs are rejected, and a row whose run belongs to another hotel is rejected.
 
 ## Owner decisions (each with a safe default)
 
