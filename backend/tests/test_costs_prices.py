@@ -2,20 +2,20 @@
 
 import re
 from datetime import date
-from pathlib import Path
 from decimal import Decimal
+from pathlib import Path
 
 import pytest
 
 from harness.costs import (
     PRICE_TABLE,
+    UNPRICED_REASONS,
     ModelPrice,
     NonFirstPartyModelError,
     PriceTable,
     Provider,
     TieredPricingError,
     TokenPrices,
-    UNPRICED_REASONS,
     UnknownModelError,
     UnpricedUsageError,
 )
