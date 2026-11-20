@@ -231,13 +231,21 @@ class PriceBook:
         )
 
 
-def check_priced(provider: Provider, model: str, table: PriceTable | None = None) -> ModelPrice:
-    """Raise UnknownModelError (or a subclass) unless the model has a price.
+def check_priced(
+    provider: Provider,
+    model: str,
+    *,
+    at: datetime | None = None,
+    prices: PriceBook | None = None,
+) -> ModelPrice:
+    """Raise an UnpricedUsageError subclass unless the model has a price at `at` (default now).
 
-    The orchestrator calls this before a run for every model the runtime may call: the run's
+    The table is chosen by date the same way the ledger chooses it. The orchestrator calls this
+    (through `check_run_models`) before a run for every model the runtime may call: the run's
     model, a fallback model, the small fast model and subagent models.
     """
-    return (table or PRICE_TABLE).get(provider, model)
+    book = prices or PRICE_BOOK
+    return book.table_at(at or datetime.now(UTC)).get(provider, model)
 
 
 # --- Default table ---------------------------------------------------------------------------

@@ -13,8 +13,8 @@ The OpenAI Agents SDK reports `input_tokens` with cached tokens included, so the
 must send `input_tokens - cached_tokens` as input_tokens (docs/costs.md, "Adapter notes").
 
 A report never fails because its model has no price: the ledger records the tokens unpriced
-and the caps fail closed. A report also never fails because of its SDK cost, which is only a
-cross-check: a bad value becomes None and a warning is logged.
+and that run stops (decision C11). A report also never fails because of its SDK cost, which is
+only a cross-check: a bad value becomes None and a warning is logged.
 """
 
 from __future__ import annotations

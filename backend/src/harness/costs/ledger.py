@@ -5,7 +5,9 @@ Postgres store over the proposed `run_costs` table (docs/costs.md) implements it
 reuses `build_cost_row`, so both stores compute the same row.
 
 Usage is always recorded. Usage that cannot be priced gets `pricing_status = unpriced` and no
-cost, and every cap then denies (fail closed), so the run stops.
+cost. Decision C11 (option a): that run stops, an alert is raised (`on_unpriced` hook and an
+ERROR log event), and the pre-run check refuses that exact model id until a price table prices
+it. The hotel daily cap counts priced spend only, so other runs and models continue.
 """
 
 from __future__ import annotations
@@ -20,7 +22,14 @@ from enum import StrEnum
 from typing import Protocol, runtime_checkable
 from uuid import UUID
 
-from harness.costs.caps import CapDecision, Spend, SpendCaps, check_spend, utc_day
+from harness.costs.caps import (
+    CapDecision,
+    Spend,
+    SpendCaps,
+    check_hotel_spend,
+    check_run_spend,
+    utc_day,
+)
 from harness.costs.prices import PRICE_BOOK, PriceBook, Provider, UnpricedUsageError
 from harness.costs.pricing import check_sdk_cost, cost_usd
 from harness.costs.usage import UsageKey, UsageReport, idempotency_key, quantize_usd
@@ -89,6 +98,31 @@ class CostRow:
 
 
 @dataclass(frozen=True, slots=True)
+class UnpricedUsageAlert:
+    """Raised once per new unpriced row. A hook for notifications (DEX-21) and paging."""
+
+    org_id: UUID
+    hotel_id: UUID
+    run_id: UUID
+    segment_id: str
+    provider: Provider
+    model: str
+    reason: str
+    recorded_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class UnpricedModel:
+    """An exact model id that a hotel ran unpriced, for one reason."""
+
+    provider: Provider
+    model: str
+    reason: str
+    rows: int
+    last_recorded_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
 class RecordResult:
     """What `record` did, and the cap decisions taken in the same atomic step."""
 
@@ -101,7 +135,7 @@ class RecordResult:
 
     @property
     def stop_run(self) -> bool:
-        """True when the run must stop: unpriced usage, or a cap at or over its limit."""
+        """True when the run must stop: unpriced usage in this run, or a cap at its limit."""
         if self.run_spend.unpriced_rows:
             return True
         return any(d is not None and not d.allowed for d in (self.run_cap, self.hotel_daily_cap))
@@ -184,6 +218,10 @@ class CostLedger(Protocol):
 
     def run_rows(self, tenant: TenantContext, run_id: UUID) -> list[CostRow]: ...
 
+    def unpriced_models(self, tenant: TenantContext) -> list[UnpricedModel]:
+        """Exact model ids the hotel ran unpriced, by (provider, model, reason)."""
+        ...
+
 
 def _same_usage(row: CostRow, report: UsageReport) -> bool:
     return (
@@ -220,10 +258,12 @@ class InMemoryCostLedger:
         *,
         prices: PriceBook = PRICE_BOOK,
         clock: Callable[[], datetime] = utc_now,
+        on_unpriced: Callable[[UnpricedUsageAlert], None] | None = None,
     ) -> None:
         self._runs = runs
         self._prices = prices
         self._clock = clock
+        self._on_unpriced = on_unpriced
         self._rows: dict[UsageKey, CostRow] = {}
         self._lock = threading.Lock()
 
@@ -255,6 +295,8 @@ class InMemoryCostLedger:
         if status is RecordStatus.RECORDED:
             if row.cost_usd is not None:
                 check_sdk_cost(report, row.cost_usd)
+            else:
+                self._alert(row)
         elif not _same_usage(row, report):
             logger.warning(
                 "usage report conflicts with the recorded row; kept the first: key=%s "
@@ -277,13 +319,43 @@ class InMemoryCostLedger:
             row=row,
             run_spend=run_spend,
             hotel_day_spend=hotel_day_spend,
-            run_cap=None if caps.run_usd is None else check_spend(caps.run_usd, run_spend),
+            run_cap=None if caps.run_usd is None else check_run_spend(caps.run_usd, run_spend),
             hotel_daily_cap=(
                 None
                 if caps.hotel_daily_usd is None
-                else check_spend(caps.hotel_daily_usd, hotel_day_spend)
+                else check_hotel_spend(caps.hotel_daily_usd, hotel_day_spend)
             ),
         )
+
+    def _alert(self, row: CostRow) -> None:
+        alert = UnpricedUsageAlert(
+            org_id=row.org_id,
+            hotel_id=row.hotel_id,
+            run_id=row.run_id,
+            segment_id=row.segment_id,
+            provider=row.provider,
+            model=row.model,
+            reason=row.unpriced_reason or "",
+            recorded_at=row.recorded_at,
+        )
+        logger.error(
+            "unpriced_usage_alert: run stopped; model refused for this hotel until priced: "
+            "reason=%s org_id=%s hotel_id=%s run_id=%s segment_id=%s provider=%s model=%s",
+            alert.reason,
+            alert.org_id,
+            alert.hotel_id,
+            alert.run_id,
+            alert.segment_id,
+            alert.provider,
+            alert.model,
+        )
+        if self._on_unpriced is None:
+            return
+        try:
+            self._on_unpriced(alert)
+        except Exception:
+            # The row is already stored and the run already stops; never lose either.
+            logger.exception("unpriced usage alert hook failed: run_id=%s", alert.run_id)
 
     def _visible(self, tenant: TenantContext) -> list[CostRow]:
         with self._lock:
@@ -296,6 +368,22 @@ class InMemoryCostLedger:
     def run_rows(self, tenant: TenantContext, run_id: UUID) -> list[CostRow]:
         rows = [row for row in self._visible(tenant) if row.run_id == run_id]
         return sorted(rows, key=lambda r: (r.recorded_at, r.segment_id, r.provider, r.model))
+
+    def unpriced_models(self, tenant: TenantContext) -> list[UnpricedModel]:
+        found: dict[tuple[Provider, str, str], list[CostRow]] = {}
+        for row in self._visible(tenant):
+            if row.unpriced_reason is not None:
+                found.setdefault((row.provider, row.model, row.unpriced_reason), []).append(row)
+        return [
+            UnpricedModel(
+                provider=provider,
+                model=model,
+                reason=reason,
+                rows=len(rows),
+                last_recorded_at=max(r.recorded_at for r in rows),
+            )
+            for (provider, model, reason), rows in sorted(found.items())
+        ]
 
     def run_spend(self, tenant: TenantContext, run_id: UUID) -> Spend:
         return _spend(self.run_rows(tenant, run_id))

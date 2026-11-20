@@ -12,8 +12,8 @@ fields on every runtime event), 7.2 (cost isolation layer), 8.4 (tokens and cost
 ## Flow
 
 ```
-before a run:      check_priced(model) for every model the runtime may call   ─▶ refuse the run
-                   check_hotel_daily_cap                                       ─▶ block until next UTC day
+before a run:      check_run_models(every model the runtime may call)         ─▶ refuse the run
+                   check_hotel_daily_cap (priced spend only)                   ─▶ block until next UTC day
 before a segment:  check_run_cap + check_hotel_daily_cap
 during a segment:  the same checks with pending_usd = price_usage(tokens so far)
 after a segment:   runtime adapter ──UsageReport──▶ CostLedger.record(report, caps=SpendCaps(...))
@@ -22,6 +22,7 @@ after a segment:   runtime adapter ──UsageReport──▶ CostLedger.record(
                      or recorded unpriced (no cost) when it cannot be priced
                      run cap + hotel daily cap checked in the same atomic step
                      RecordResult.stop_run ─▶ stop the run
+                     unpriced row ─▶ stop only this run + alert (C11 option a)
 ```
 
 ## Runtime contract v2: `UsageReport`
@@ -102,8 +103,10 @@ or before the UTC date of the report (decision C15). Two tables with one `effect
 refused. A price change is a new table with a later date; never edit a table that rows
 reference. Each row stores `price_table_version`.
 
-`price_usage` and `check_priced` price or check against `PRICE_TABLE` by default; pass
-`table=PRICE_BOOK.table_at(now)` to use the table in effect at another moment.
+`price_usage` and `check_priced` choose the table the same way: `prices.table_at(at)`, where
+`at` defaults to now (UTC) and `prices` defaults to `PRICE_BOOK`. So a running estimate, the
+pre-run check and the final row use the same table. Before the first table they raise
+`NoPriceTableError`.
 
 Rules. A model that cannot be priced is never priced as zero. `PriceTable.get` checks, in
 order:
@@ -136,16 +139,16 @@ The math is exact Decimal. The result is rounded half up to 9 decimal places
 A cost of 10^11 USD or more does not fit and raises `CostOutOfRangeError`.
 
 `price_usage(provider, model, *, input_tokens, output_tokens, cache_read_tokens,
-cache_write_tokens, table=PRICE_TABLE)` applies the formula to raw counts. `cost_usd(report,
-table)` uses it for a report. Use `price_usage` for a running estimate inside a segment
-(see "Spend caps").
+cache_write_tokens, at=None, prices=PRICE_BOOK)` applies the formula to raw counts with the
+table in effect at `at`. `cost_usd(report, table)` applies it to a report with a given table
+(the ledger passes `table_at(recorded_at)`). Use `price_usage` for a running estimate inside a
+segment (see "Spend caps").
 
 ### Unpriced usage
 
 Usage is always recorded. When a report cannot be priced, its row gets
-`pricing_status = 'unpriced'`, `cost_usd = null` and an `unpriced_reason`, and a warning with
-the reason code is logged on `harness.costs`. The run must stop, and the caps fail closed
-(decision C11). Reason codes (each is the `reason` of an `UnpricedUsageError` subclass;
+`pricing_status = 'unpriced'`, `cost_usd = null` and an `unpriced_reason`. The built default
+is decision C11 option (a); see "Unpriced usage: what happens" under "Spend caps". Reason codes (each is the `reason` of an `UnpricedUsageError` subclass;
 `UNPRICED_REASONS` in `prices.py` lists them, a subclass with another code fails at import, the
 base class cannot be raised, and a test checks that the SQL `unpriced_reason` list matches):
 
@@ -158,9 +161,13 @@ base class cannot be raised, and a test checks that the SQL `unpriced_reason` li
 | `cost_out_of_range` | The cost is 10^11 USD or more (`CostOutOfRangeError`). |
 | `no_price_table` | No table was in effect at `recorded_at` (`NoPriceTableError`). `price_table_version` is null. |
 
-Call `check_priced(provider, model)` before a run for every model the runtime may call (the
-run model, fallback model, small fast model and subagent models), so a known-unpriced model
-is refused before any token is spent.
+Call `check_run_models(ledger, tenant, models, now=...)` before a run with every
+`(provider, model)` the runtime may call (the run model, fallback model, small fast model and
+subagent models). It returns `ModelCheck(refused=...)`; `allowed` is true when nothing is
+refused. Each `RefusedModel` has `provider`, `model`, the `reason` code and `seen_unpriced`
+(true when this hotel already has unpriced usage of that exact id, from
+`CostLedger.unpriced_models(tenant)`). A known-unpriced model is refused before any token is
+spent. `check_priced(provider, model, *, at=None, prices=PRICE_BOOK)` checks one model.
 
 ### SDK cost cross-check
 
@@ -186,8 +193,11 @@ backstop set to the same cap. It is never the authority.
   hotel_daily_usd)`. `RecordResult` has `status` (`recorded` | `duplicate`), `row` (the
   stored row; the first one for a duplicate), `run_spend`, `hotel_day_spend`, `run_cap`,
   `hotel_daily_cap` and `stop_run`. `stop_run` is true when the run has an unpriced row or a
-  checked cap denies.
+  checked cap denies. For a new unpriced row it raises the alert (C11) after the lock is
+  released.
 - `run_spend(tenant, run_id)`, `run_rows(tenant, run_id)`
+- `unpriced_models(tenant)`: one `UnpricedModel(provider, model, reason, rows,
+  last_recorded_at)` per exact id and reason that the hotel ran unpriced
 - `hotel_spend(tenant, day=None)`, `org_spend(tenant, day=None)`
 
 A `Spend` is `priced_usd` (the sum of priced rows) and `unpriced_rows` (the count of rows
@@ -222,8 +232,10 @@ default. Read-only checks (before a run or a segment) need no lock.
 
 `check_spend_cap(cap_usd, spent_usd)` allows only while `spent < cap`. At or over the cap it
 denies. A cap of 0 denies everything. A negative, non-finite or float amount is an error.
-`check_spend(cap_usd, spend, pending_usd=0)` checks `spend.priced_usd + pending_usd` and
-denies whenever `spend.unpriced_rows > 0` (reason contains "unpriced", remaining 0).
+`check_run_spend(cap_usd, spend, pending_usd=0)` checks `spend.priced_usd + pending_usd` and
+denies whenever the run has an unpriced row (reason contains "unpriced", remaining 0,
+`unpriced_rows` set). `check_hotel_spend(cap_usd, spend, pending_usd=0)` checks
+`spend.priced_usd + pending_usd` only: the hotel daily cap counts priced spend only.
 
 - After each report: `record(report, caps=SpendCaps(run_usd=..., hotel_daily_usd=...))`. If
   `stop_run` is true, the run stops. A duplicate adds nothing, so a resume cannot push a run
@@ -236,21 +248,36 @@ denies whenever `spend.unpriced_rows > 0` (reason contains "unpriced", remaining
   open segment has used so far, when the runtime streams usage. A deny stops the run before
   the final report.
 
-Unpriced usage fails closed (decision C11): the run that has it stops, and the hotel daily
-cap denies for the rest of that UTC day. What the built default does, exactly:
+### Unpriced usage: what happens
 
-- The run that has the unpriced row stops at that report, and its run cap denies from then on,
-  also on later days.
-- Only when the caller checks a hotel daily cap (`SpendCaps.hotel_daily_usd` or
-  `check_hotel_daily_cap`): every other run of that hotel stops at its next report or segment
-  check, including runs already in flight, and new runs are refused. With a run cap only,
-  other runs continue.
-- The hotel block lasts until 00:00 UTC (05:30 IST). A row at 00:01 UTC blocks for almost 24
-  hours.
-- Nothing clears it early. Rows are immutable, and a price added later does not reprice the
-  row. Other hotels of the org are not affected.
+Decision C11. Built default: option (a). When a report is recorded unpriced:
 
-The scope of this block is an open owner decision (C11 options).
+- That run stops at that report (`stop_run`), and its run cap denies from then on, also on
+  later days. The run cap need not be set for `stop_run`.
+- An alert is raised once per new row (not for a duplicate): an ERROR log event
+  `unpriced_usage_alert` on `harness.costs`, and the optional hook
+  `InMemoryCostLedger(..., on_unpriced=callback)` gets an `UnpricedUsageAlert(org_id,
+  hotel_id, run_id, segment_id, provider, model, reason, recorded_at)`. The hook is called
+  outside the lock. If it raises, the error is logged and the row and `stop_run` are kept.
+  DEX-21 notifications connect to this hook.
+- The pre-run check (`check_run_models`) refuses that exact model id, for every hotel, while
+  the price table in effect cannot price it. For the hotel that hit it, `seen_unpriced` is
+  true.
+- The hotel daily cap counts priced spend only. Other runs of the hotel, including runs in
+  flight, and other models continue. Other hotels are not affected.
+- It clears by itself: when a price table that prices the id takes effect (a new
+  `effective_from`), `check_run_models` allows it again. No manual step. The old rows stay
+  unpriced (rows are immutable).
+- Web search (C12) is the exception to the refusal: the model is priced, so it is not refused.
+  Only the run that used web search stops.
+
+Options for C11, and how each one clears:
+
+| Option | Behaviour | How it clears |
+|---|---|---|
+| (a) built default | Stop only that run, alert, refuse that exact model id at the pre-run check; the hotel daily cap counts priced spend only | By itself, when the price table in effect prices the id |
+| (b) | Stop the run and block the whole hotel (new runs and runs in flight) | Only when an owner or admin clears it with a separate append-only acknowledgement record (cost rows are immutable); needs a new table and an API |
+| (c) | Fail open: price unknown usage at an estimate (for example the most expensive known price) and continue | Nothing to clear; rejected, because it bills wrong amounts and hides the problem |
 
 Worst-case overshoot (decision C14):
 
@@ -349,7 +376,7 @@ comment on table public.run_costs is
 -- Daily hotel and org totals for caps and the usage dashboard.
 create index run_costs_hotel_day_idx on public.run_costs (org_id, hotel_id, recorded_at);
 
--- Unpriced rows deny every cap (decision C11); find them fast for the cap check and alerts.
+-- Unpriced rows stop their run and refuse the model (decision C11); find them fast.
 create index run_costs_unpriced_idx on public.run_costs (org_id, hotel_id, recorded_at)
   where pricing_status = 'unpriced';
 
@@ -407,8 +434,8 @@ belongs to another hotel is rejected.
 | C8 | Pricing modes | Standard first-party only: no batch, flex, priority, fast or regional uplift; web search (C12) and Bedrock, Vertex AI or gateway prices (C13) are not modelled | Add a pricing-mode field in contract v3 |
 | C9 | Explicit `pydantic` dependency | Not added now: it comes through FastAPI and pydantic-settings, and PR#5 edits `pyproject.toml`/`uv.lock` | Add `pydantic>=2.14,<3` after PR#5 merges |
 | C10 | `docs/backlog.md` | Not edited (PR#4 edits it) | Link this PR from the DEX-24 row after PR#4 merges |
-| C11 | Usage that cannot be priced | Record the tokens with `pricing_status = 'unpriced'` and no cost; fail closed: the run stops and, where a hotel daily cap is checked, the hotel is blocked until 00:00 UTC (see "Spend caps"). Open owner decision | 1: keep the hotel block until the UTC day ends (built); 2: stop only the run, alert, and refuse that model for the hotel; 3: block the hotel until an owner or admin clears it (needs an acknowledgement record, because cost rows are immutable); rejected: price unknown models at the most expensive known price (fail open, wrong bills) |
-| C12 | Web search requests | Recorded unpriced, so a run that uses web search stops (C11) | Price them at the published rate (about 10 USD per 1,000 searches) in a later table |
+| C11 | Usage that cannot be priced | Option (a): record the tokens with `pricing_status = 'unpriced'` and no cost; stop only that run; raise an alert (`unpriced_usage_alert` log event and the `on_unpriced` hook for DEX-21); refuse that exact model id at the pre-run check until the price table in effect prices it (clears by itself). The hotel daily cap counts priced spend only (see "Unpriced usage: what happens") | (b): block the whole hotel until an owner or admin clears it with a separate append-only acknowledgement record; (c): fail open, price at an estimate (rejected: wrong bills) |
+| C12 | Web search requests | Recorded unpriced, so only the run that uses web search stops and an alert is raised (C11); the model is not refused, because its tokens are priced | Price them at the published rate (about 10 USD per 1,000 searches) in a later table |
 | C13 | Non-first-party and fine-tuned ids (Bedrock, Vertex AI, gateway prefixes, `ft:`) | Refused (`NonFirstPartyModelError`), recorded unpriced if they still run | Add provider-specific tables when a hotel needs them |
 | C14 | Concurrency of the hotel daily cap | Record, sum and check in one atomic step (a lock in memory; a per-hotel `pg_advisory_xact_lock` in Postgres) and check after each report. Worst case: the segments in flight when the cap is crossed | Reserve an estimated budget before each segment (stricter, more complex) |
 | C15 | Price changes | One table per `effective_from` date (UTC); each report uses the table in effect at `recorded_at` and stores its version | Price by the run's start date |

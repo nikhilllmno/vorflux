@@ -3,10 +3,18 @@
 from __future__ import annotations
 
 import logging
+from datetime import UTC, datetime
 from decimal import Decimal, localcontext
 from enum import StrEnum
 
-from harness.costs.prices import PRICE_TABLE, PriceTable, Provider, UnpricedUsageError
+from harness.costs.prices import (
+    PRICE_BOOK,
+    PRICE_TABLE,
+    PriceBook,
+    PriceTable,
+    Provider,
+    UnpricedUsageError,
+)
 from harness.costs.usage import MAX_TOKENS, MAX_USD, UsageReport, quantize_usd
 
 logger = logging.getLogger("harness.costs")
@@ -38,7 +46,8 @@ def _check_count(name: str, value: int) -> None:
         raise ValueError(f"{name} must be between 0 and {MAX_TOKENS}, got {value}")
 
 
-def price_usage(
+def _price_counts(
+    table: PriceTable,
     provider: Provider,
     model: str,
     *,
@@ -46,13 +55,7 @@ def price_usage(
     output_tokens: int,
     cache_read_tokens: int,
     cache_write_tokens: int,
-    table: PriceTable = PRICE_TABLE,
 ) -> Decimal:
-    """Price token counts: sum(tokens x USD per MTok) / 1e6, rounded half up to 9 places.
-
-    Use it for a running estimate inside a segment (pass the result to the caps as
-    `pending_usd`). Raises UnknownModelError, or CostOutOfRangeError at 10^11 USD or more.
-    """
     counts = {
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
@@ -78,6 +81,35 @@ def price_usage(
     return total
 
 
+def price_usage(
+    provider: Provider,
+    model: str,
+    *,
+    input_tokens: int,
+    output_tokens: int,
+    cache_read_tokens: int,
+    cache_write_tokens: int,
+    at: datetime | None = None,
+    prices: PriceBook = PRICE_BOOK,
+) -> Decimal:
+    """Price token counts with the table in effect at `at` (default now), as the ledger does.
+
+    sum(tokens x USD per MTok) / 1e6, rounded half up to 9 places. Use it for a running
+    estimate inside a segment (pass the result to the caps as `pending_usd`). Raises an
+    UnpricedUsageError subclass: an unpriced model, no table in effect, or a cost of 10^11 USD
+    or more.
+    """
+    return _price_counts(
+        prices.table_at(at or datetime.now(UTC)),
+        provider,
+        model,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        cache_read_tokens=cache_read_tokens,
+        cache_write_tokens=cache_write_tokens,
+    )
+
+
 def cost_usd(report: UsageReport, table: PriceTable = PRICE_TABLE) -> Decimal:
     """The billed cost of one report, priced from `table`.
 
@@ -89,14 +121,14 @@ def cost_usd(report: UsageReport, table: PriceTable = PRICE_TABLE) -> Decimal:
             f"{report.web_search_requests} web search requests on model {report.model!r} "
             "are not priced (docs/costs.md, decision C12)"
         )
-    return price_usage(
+    return _price_counts(
+        table,
         report.provider,
         report.model,
         input_tokens=report.input_tokens,
         output_tokens=report.output_tokens,
         cache_read_tokens=report.cache_read_tokens,
         cache_write_tokens=report.cache_write_tokens,
-        table=table,
     )
 
 
