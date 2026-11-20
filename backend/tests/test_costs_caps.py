@@ -1,0 +1,162 @@
+"""Basic hard spend caps (architecture 5.5 and 12, M1): deny at or over the cap."""
+
+from datetime import UTC, datetime, timedelta
+from decimal import Decimal
+from typing import Any
+from uuid import UUID, uuid4
+
+import pytest
+
+from harness.costs import (
+    CapDecision,
+    InMemoryCostLedger,
+    RunTenant,
+    UnknownRunError,
+    UsageReport,
+    check_hotel_daily_cap,
+    check_run_cap,
+    check_spend_cap,
+)
+from harness.tenancy import TenantContext
+
+ORG = UUID("0000000a-0000-4000-8000-000000000000")
+HOTEL = UUID("000000a1-0000-4000-8000-000000000000")
+OTHER_HOTEL = UUID("000000a2-0000-4000-8000-000000000000")
+
+
+@pytest.mark.parametrize(
+    ("cap", "spent", "allowed"),
+    [
+        ("10", "0", True),
+        ("10", "9.999999999", True),
+        ("10", "10", False),  # at the cap: deny
+        ("10", "10.000000001", False),
+        ("0", "0", False),  # a zero cap allows nothing
+    ],
+)
+def test_deny_at_or_over_the_cap(cap: str, spent: str, allowed: bool) -> None:
+    decision = check_spend_cap(Decimal(cap), Decimal(spent))
+    assert isinstance(decision, CapDecision)
+    assert decision.allowed is allowed
+
+
+def test_decision_reports_remaining_budget_and_reason() -> None:
+    allow = check_spend_cap(Decimal("10"), Decimal("2.5"))
+    assert allow.remaining_usd == Decimal("7.5")
+    deny = check_spend_cap(Decimal("10"), Decimal("12"))
+    assert deny.remaining_usd == Decimal("0")
+    assert "10" in deny.reason and "12" in deny.reason
+
+
+@pytest.mark.parametrize(("cap", "spent"), [("-1", "0"), ("1", "-1")])
+def test_negative_amounts_are_invalid(cap: str, spent: str) -> None:
+    with pytest.raises(ValueError, match="negative"):
+        check_spend_cap(Decimal(cap), Decimal(spent))
+
+
+def test_float_amounts_are_refused() -> None:
+    with pytest.raises(TypeError):
+        check_spend_cap(10.0, Decimal("1"))  # type: ignore[arg-type]
+
+
+def test_non_finite_amounts_are_invalid() -> None:
+    with pytest.raises(ValueError, match="finite"):
+        check_spend_cap(Decimal("Infinity"), Decimal("0"))
+
+
+# With the ledger ------------------------------------------------------------------------------
+
+
+class Runs:
+    def __init__(self) -> None:
+        self.runs: dict[UUID, RunTenant] = {}
+
+    def add(self, hotel_id: UUID = HOTEL) -> UUID:
+        run_id = uuid4()
+        self.runs[run_id] = RunTenant(org_id=ORG, hotel_id=hotel_id)
+        return run_id
+
+    def tenant_of(self, run_id: UUID) -> RunTenant:
+        try:
+            return self.runs[run_id]
+        except KeyError:
+            raise UnknownRunError(run_id) from None
+
+
+class Clock:
+    def __init__(self) -> None:
+        self.now = datetime(2026, 11, 20, 9, 0, tzinfo=UTC)
+
+    def __call__(self) -> datetime:
+        return self.now
+
+
+def _usage(run_id: UUID, segment_id: str, usd: int) -> UsageReport:
+    payload: dict[str, Any] = {
+        "run_id": run_id,
+        "segment_id": segment_id,
+        "provider": "openai",
+        "model": "gpt-5",  # 10 USD per MTok output
+        "input_tokens": 0,
+        "output_tokens": usd * 100_000,
+        "cache_read_tokens": 0,
+        "cache_write_tokens": 0,
+    }
+    return UsageReport.model_validate(payload)
+
+
+def _tenant(hotel_id: UUID = HOTEL) -> TenantContext:
+    return TenantContext(org_id=ORG, hotel_id=hotel_id, actor_id=uuid4())
+
+
+def test_run_cap_stops_the_run_after_the_report_that_reaches_it() -> None:
+    runs, clock = Runs(), Clock()
+    ledger = InMemoryCostLedger(runs, clock=clock)
+    run = runs.add()
+    cap = Decimal("5")
+    t = _tenant()
+
+    assert check_run_cap(ledger, t, run, cap).allowed  # before segment 1
+    ledger.record(_usage(run, "seg-1", 3))
+    assert check_run_cap(ledger, t, run, cap).allowed  # after report: 3 < 5, continue
+    assert check_run_cap(ledger, t, run, cap).allowed  # before segment 2
+    ledger.record(_usage(run, "seg-2", 2))
+    decision = check_run_cap(ledger, t, run, cap)  # after report: 5 >= 5, stop
+    assert not decision.allowed
+    assert decision.spent_usd == Decimal("5")
+
+
+def test_duplicate_report_does_not_push_a_run_over_its_cap() -> None:
+    runs, clock = Runs(), Clock()
+    ledger = InMemoryCostLedger(runs, clock=clock)
+    run = runs.add()
+    ledger.record(_usage(run, "seg-1", 3))
+    ledger.record(_usage(run, "seg-1", 3))  # resume resend
+    assert check_run_cap(ledger, _tenant(), run, Decimal("5")).allowed
+
+
+def test_hotel_daily_cap_blocks_new_runs_until_the_next_utc_day() -> None:
+    runs, clock = Runs(), Clock()
+    ledger = InMemoryCostLedger(runs, clock=clock)
+    cap = Decimal("10")
+    t = _tenant()
+
+    first = runs.add()
+    assert check_hotel_daily_cap(ledger, t, cap, now=clock()).allowed
+    ledger.record(_usage(first, "seg-1", 10))
+
+    # Same day: a new run for this hotel is blocked.
+    clock.now = datetime(2026, 11, 20, 23, 59, tzinfo=UTC)
+    assert not check_hotel_daily_cap(ledger, t, cap, now=clock()).allowed
+    # Another hotel in the same org has its own daily cap.
+    assert check_hotel_daily_cap(ledger, _tenant(OTHER_HOTEL), cap, now=clock()).allowed
+
+    # Next UTC day: allowed again.
+    clock.now += timedelta(minutes=1)
+    assert check_hotel_daily_cap(ledger, t, cap, now=clock()).allowed
+
+
+def test_daily_cap_needs_an_aware_time() -> None:
+    ledger = InMemoryCostLedger(Runs(), clock=Clock())
+    with pytest.raises(ValueError, match="timezone"):
+        check_hotel_daily_cap(ledger, _tenant(), Decimal("1"), now=datetime(2026, 11, 20))
