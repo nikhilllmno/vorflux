@@ -162,8 +162,15 @@ def cache_write_1h_from_model_usage(
     is not used: mapping it directly would price those writes at the 5-minute rate. When the
     5m count is present the result is the total minus the 5m count; when it is absent the
     result is None, and every cache write is priced at the 1-hour rate (decision C1). A 5m
-    count that does not fit the total also gives None.
+    count that does not fit the total also gives None. A float, bool or other non-int count
+    raises TypeError (strict, like `UsageReport`).
     """
+    for name, value in (
+        ("cache_creation_tokens", cache_creation_tokens),
+        ("ephemeral_5m_tokens", ephemeral_5m_tokens),
+    ):
+        if value is not None and (isinstance(value, bool) or not isinstance(value, int)):
+            raise TypeError(f"{name} must be an int, got {type(value).__name__}")
     if ephemeral_5m_tokens is None:
         return None
     if cache_creation_tokens < 0 or not 0 <= ephemeral_5m_tokens <= cache_creation_tokens:

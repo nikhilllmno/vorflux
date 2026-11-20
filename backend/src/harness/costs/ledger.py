@@ -121,9 +121,10 @@ class UnpricedUsageAlert:
 
     @property
     def summary(self) -> str:
-        """What the stop means, by reason (unknown_model and tiered_pricing refuse the model)."""
+        """What the stop means, by reason. unknown_model and tiered_pricing refuse the model for
+        every hotel (the price table is global, C11); other reasons stop only this run."""
         if self.refuses_model:
-            return "run stopped; model refused for this hotel until priced"
+            return "run stopped; model refused until priced"
         return "only this run stopped"
 
 

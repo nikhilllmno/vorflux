@@ -122,7 +122,11 @@ Two ids for one model in one segment (for example `claude-haiku-4-5` and
 billed. One model id served first-party and by another provider in one segment is also two
 keys, two rows. A second report with the same key is a no-op that returns `DUPLICATE`. If the
 resent token counts, 1-hour split or SDK cost differ from the stored row, the first row stays
-and a warning that contains "conflict" is logged on the `harness.costs` logger.
+and a warning that contains "conflict" is logged on the `harness.costs` logger. A resend of a
+segment with a changed `serving` is a new key, so it adds a row and no conflict warning. USD
+totals and caps stay correct, because only `first_party` is priced and any other `serving`
+stops the run. But the token totals of that run count those tokens again. The CLI gives one
+`provider` per model entry, so this needs an adapter bug.
 
 ## Prices
 
@@ -343,15 +347,17 @@ Decision C11. Built default: option (a). When a report is recorded unpriced:
   hotel_id, run_id, segment_id, provider, model, reason, recorded_at)`. The alert text
   (`UnpricedUsageAlert.summary`, also in the log event) depends on the reason. For
   `unknown_model` and `tiered_pricing` (`refuses_model` is true) it is "run stopped; model
-  refused for this hotel until priced". For `web_search`, `non_first_party`,
+  refused until priced" (refused for every hotel, see below). For `web_search`, `non_first_party`,
   `cost_out_of_range` and `no_price_table` it is "only this run stopped". The hook is called
   outside the lock. If it raises, the error is logged and the row and `stop_run` are kept.
   DEX-21 notifications connect to this hook.
-- The pre-run check (`check_run_models`) refuses that exact model id, for every hotel, while
-  the price table in effect cannot price it. For the hotel that hit it, `seen_unpriced` is
+- The pre-run check (`check_run_models`) refuses that exact model id for every hotel until it
+  is priced, because the price table is global: it refuses the id while the price table in
+  effect cannot price it. For the hotel that hit it, `seen_unpriced` is
   true.
 - The hotel daily cap counts priced spend only. Other runs of the hotel, including runs in
-  flight, and other models continue. Other hotels are not affected.
+  flight, and other models continue. Other hotels are not blocked; only that model id is
+  refused for them too.
 - It clears by itself: when a price table that prices the id takes effect (a new
   `effective_from`), `check_run_models` allows it again. No manual step. The old rows stay
   unpriced (rows are immutable).
@@ -577,7 +583,7 @@ rejected.
 | C8 | Pricing modes | Standard first-party only: no batch, flex, priority, fast or regional uplift; web search (C12) and Bedrock, Vertex AI or gateway prices (C13) are not modelled. Cache-write TTL is modelled (C1) | Add a pricing-mode field in contract v3 |
 | C9 | Explicit `pydantic` dependency | Not added now: it comes through FastAPI and pydantic-settings, and PR#5 edits `pyproject.toml`/`uv.lock` | Add `pydantic>=2.14,<3` after PR#5 merges |
 | C10 | `docs/backlog.md` | Not edited (PR#4 edits it) | Link this PR from the DEX-24 row after PR#4 merges |
-| C11 | Usage that cannot be priced | Option (a): record the tokens with `pricing_status = 'unpriced'` and no cost; stop only that run; raise an alert (`unpriced_usage_alert` log event and the `on_unpriced` hook for DEX-21); refuse that exact model id at the pre-run check until the price table in effect prices it (clears by itself). The hotel daily cap counts priced spend only (see "Unpriced usage: what happens") | (b): block the whole hotel until an owner or admin clears it with a separate append-only acknowledgement record; (c): fail open, price at an estimate (rejected: wrong bills) |
+| C11 | Usage that cannot be priced | Option (a): record the tokens with `pricing_status = 'unpriced'` and no cost; stop only that run; raise an alert (`unpriced_usage_alert` log event and the `on_unpriced` hook for DEX-21); refuse that exact model id for every hotel until it is priced, because the price table is global: the pre-run check (`check_run_models`) refuses it until the price table in effect prices it (clears by itself). The hotel daily cap counts priced spend only (see "Unpriced usage: what happens") | (b): block the whole hotel until an owner or admin clears it with a separate append-only acknowledgement record; (c): fail open, price at an estimate (rejected: wrong bills) |
 | C12 | Web search requests | Recorded unpriced, so only the run that uses web search stops and an alert is raised (C11); the model is not refused, because its tokens are priced | Price them at the published rate (about 10 USD per 1,000 searches) in a later table |
 | C13 | Non-first-party ids and serving (Bedrock, Vertex AI, gateway prefixes, `ft:`, or `serving` other than `first_party`) | Ids refused (`NonFirstPartyModelError`), recorded unpriced if they still run; a report with `serving` other than `first_party` is recorded unpriced (`NonFirstPartyServingError`) and its run stops, but the id is not refused. `:` stays refused, because no priced id has one (see "Prices") | Add provider-specific tables when a hotel needs them |
 | C14 | Concurrency of the hotel daily cap | Record, sum and check in one atomic step (a lock in memory; a per-hotel `pg_advisory_xact_lock` in Postgres) and check after each report. Worst case: the segments in flight when the cap is crossed | Reserve an estimated budget before each segment (stricter, more complex) |
