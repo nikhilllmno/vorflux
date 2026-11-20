@@ -78,7 +78,23 @@ def test_token_counts_fit_a_postgres_bigint() -> None:
         UsageReport.model_validate(_payload(output_tokens=2**63))
 
 
-@pytest.mark.parametrize("bad", ["-0.01", "-5.5E-17", "NaN", "Infinity", "abc", 0.3, -1, True, [1]])
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "-0.01",
+        "-5.5E-17",
+        "NaN",
+        "Infinity",
+        "abc",
+        0.3,
+        -1,
+        True,
+        [1],
+        "100000000000",
+        # Re-review N2: rounds up to 10^11, which numeric(20, 9) cannot hold.
+        "99999999999.9999999995",
+    ],
+)
 def test_bad_sdk_cost_becomes_null_and_keeps_the_tokens(
     bad: object, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -151,3 +167,8 @@ def test_key_uses_the_exact_model_id_that_was_sent() -> None:
     dated = UsageReport.model_validate(_payload(model="claude-haiku-4-5-20251001"))
     assert idempotency_key(dated).model == "claude-haiku-4-5-20251001"
     assert idempotency_key(dated) != idempotency_key(short)
+
+
+def test_largest_sdk_cost_that_fits_numeric_20_9_is_kept() -> None:
+    report = UsageReport.model_validate(_payload(sdk_reported_cost_usd="99999999999.9999999994"))
+    assert report.sdk_reported_cost_usd == Decimal("99999999999.999999999")

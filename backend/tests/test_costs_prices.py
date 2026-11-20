@@ -1,6 +1,8 @@
 """Price table contract: typed Decimal prices, a version, and a loud failure for unknown models."""
 
+import re
 from datetime import date
+from pathlib import Path
 from decimal import Decimal
 
 import pytest
@@ -13,7 +15,9 @@ from harness.costs import (
     Provider,
     TieredPricingError,
     TokenPrices,
+    UNPRICED_REASONS,
     UnknownModelError,
+    UnpricedUsageError,
 )
 
 
@@ -153,3 +157,30 @@ def test_token_prices_reject_floats_and_negatives() -> None:
         TokenPrices(input=1.5, output=one, cache_read=one, cache_write=one)  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="negative"):
         TokenPrices(input=Decimal("-1"), output=one, cache_read=one, cache_write=one)
+
+
+def _all_subclasses(cls: type[UnpricedUsageError]) -> list[type[UnpricedUsageError]]:
+    found: list[type[UnpricedUsageError]] = []
+    for sub in cls.__subclasses__():
+        found += [sub, *_all_subclasses(sub)]
+    return found
+
+
+def test_every_unpriced_reason_is_allowed_by_the_proposed_sql() -> None:
+    # Re-review N3: a reason code that the run_costs CHECK rejects would lose the tokens.
+    doc = (Path(__file__).parents[2] / "docs" / "costs.md").read_text(encoding="utf-8")
+    match = re.search(r"unpriced_reason text check \(unpriced_reason in \((.*?)\)\)", doc, re.S)
+    assert match is not None
+    sql_codes = set(re.findall(r"'([a-z_]+)'", match.group(1)))
+    assert sql_codes == set(UNPRICED_REASONS)
+    reasons = {sub.reason for sub in _all_subclasses(UnpricedUsageError)}
+    assert reasons == set(UNPRICED_REASONS)
+
+
+def test_unpriced_usage_error_needs_a_specific_reason() -> None:
+    with pytest.raises(TypeError, match="subclass"):
+        UnpricedUsageError("no reason")
+    with pytest.raises(TypeError, match="reason"):
+
+        class _NoCode(UnpricedUsageError):
+            reason = "unpriced"
