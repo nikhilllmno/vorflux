@@ -114,6 +114,18 @@ class UnpricedUsageAlert:
     reason: str
     recorded_at: datetime
 
+    @property
+    def refuses_model(self) -> bool:
+        """True for a model-pricing gap (C16 reasons): the pre-run check refuses the model."""
+        return self.reason in UNPRICED_LIMIT_REASONS
+
+    @property
+    def summary(self) -> str:
+        """What the stop means, by reason (unknown_model and tiered_pricing refuse the model)."""
+        if self.refuses_model:
+            return "run stopped; model refused for this hotel until priced"
+        return "only this run stopped"
+
 
 @dataclass(frozen=True, slots=True)
 class UnpricedModel:
@@ -359,8 +371,9 @@ class InMemoryCostLedger:
             recorded_at=row.recorded_at,
         )
         logger.error(
-            "unpriced_usage_alert: run stopped; model refused for this hotel until priced: "
+            "unpriced_usage_alert: %s: "
             "reason=%s org_id=%s hotel_id=%s run_id=%s segment_id=%s provider=%s model=%s",
+            alert.summary,
             alert.reason,
             alert.org_id,
             alert.hotel_id,

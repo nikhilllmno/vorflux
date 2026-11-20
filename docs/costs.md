@@ -76,10 +76,10 @@ the tokens are already spent:
   | `outputTokens` | `output_tokens` |
   | `cacheReadInputTokens` | `cache_read_tokens` |
   | `cacheCreationInputTokens` | `cache_write_tokens` |
-  | `cacheCreationEphemeral5mInputTokens`, `cacheCreationEphemeral1hInputTokens` | `cache_write_1h_tokens` = `cache_write_1h_from_model_usage(Δ cacheCreationInputTokens, Δ 5m, Δ 1h)`; null when either field is absent (C1) |
+  | `cacheCreationEphemeral5mInputTokens`, `cacheCreationEphemeral1hInputTokens` | `cache_write_1h_tokens` = `cache_write_1h_from_model_usage(Δ cacheCreationInputTokens, Δ cacheCreationEphemeral5mInputTokens)`; absent when the 5m count is absent (C1). The 1h count is not used |
   | `webSearchRequests` | `web_search_requests` |
   | `costUSD` | `sdk_reported_cost_usd` = `Decimal(str(end)) - Decimal(str(baseline))` |
-  | `provider`: absent or `firstParty` → `first_party`; `bedrock` → `bedrock`; `vertex` → `vertex`; anything else → `other` | `serving` |
+  | `provider`: `firstParty` → `first_party`; `bedrock` → `bedrock`; `vertex` → `vertex`; absent or anything else → `other` (fail closed) | `serving` |
 
   A segment that also used a small fast model, or that reported a short id and a dated id,
   sends one report for each.
@@ -88,16 +88,22 @@ the tokens are already spent:
   adds two optional fields to each `modelUsage` entry: `cacheCreationEphemeral5mInputTokens`
   and `cacheCreationEphemeral1hInputTokens`. The Python `ModelUsage` TypedDict does not declare
   them, but the SDK passes `modelUsage` through unchanged, so read them from the dict. Both
-  are already inside `cacheCreationInputTokens`. A write whose TTL the API did not report is in
-  neither, and the SDK's `costUSD` prices it at the 5-minute rate. Take each field as a segment
-  delta, the same as `costUSD` (an absent baseline counts as 0), and call
-  `cache_write_1h_from_model_usage(total, five_minute, one_hour)`. It returns `total -
-  five_minute`: the 1-hour count when every write reports its TTL, plus the writes with no
-  reported TTL, which are priced at the 1-hour rate (the safe side, C1). It returns null, so
-  every write is priced at the 1-hour rate, when either field is absent at the end of the
-  segment or the deltas do not fit the total. With a complete split, our cost matches
-  `costUSD` within the C6 tolerance (tested). Writes with no reported TTL, or a null split,
-  make our cost higher than `costUSD`, and `check_sdk_cost` logs a mismatch for that row.
+  are already inside `cacheCreationInputTokens`. A cache write with no reported lifetime is
+  counted in `cacheCreationInputTokens` but in neither TTL field, and the SDK's `costUSD`
+  prices it at the 5-minute rate. A direct map of the 1h count would also price those writes
+  at the 5-minute rate, so the 1h count is not used. The rule: when
+  `cacheCreationEphemeral5mInputTokens` is present, `cache_write_1h_tokens =
+  cacheCreationInputTokens - cacheCreationEphemeral5mInputTokens`; when it is absent,
+  `cache_write_1h_tokens` is absent, so every cache write uses the 1-hour rate. Take each
+  field as a segment delta, the same as `costUSD` (an absent baseline counts as 0), and call
+  `cache_write_1h_from_model_usage(total, five_minute)`. It also returns null when the 5m
+  delta does not fit the total. With every write reporting its lifetime, our cost matches
+  `costUSD` within the C6 tolerance (tested). Writes with no reported lifetime, or an absent
+  5m count, make our cost higher than `costUSD`, and `check_sdk_cost` logs a mismatch for
+  that row.
+  The `provider` field maps to `serving`. When it is absent, `serving` is `other`: the row is
+  recorded unpriced with `non_first_party` and the run stops (fail closed, the same as
+  hermes_like_agent PR#3).
 - OpenAI (Agents SDK): `input_tokens` INCLUDES cached tokens. Send
   `input_tokens = usage.input_tokens - usage.input_tokens_details.cached_tokens` and
   `cache_read_tokens = cached_tokens`. Send `cache_write_tokens = 0` for the models in the
@@ -187,8 +193,8 @@ cost_usd = (input_tokens × input + output_tokens × output
 
 When the split is unknown, every cache write is priced at the 1-hour rate. That over-prices
 5-minute writes by 0.75x input, which is the safe side for a cap. The Claude adapter sends
-the split from `model_usage` (see "Adapter notes"); only a CLI that does not report it gives
-null. For OpenAI both rates are the input price, so the split changes nothing.
+the split from `model_usage` (see "Adapter notes"); it is null only when the 5-minute count
+is absent. For OpenAI both rates are the input price, so the split changes nothing.
 
 The math is exact Decimal. The result is rounded half up to 9 decimal places
 (`COST_QUANTUM = 0.000000001`), which fits `numeric(20, 9)`. Totals are sums of rounded rows.
@@ -334,7 +340,11 @@ Decision C11. Built default: option (a). When a report is recorded unpriced:
 - An alert is raised once per new row (not for a duplicate): an ERROR log event
   `unpriced_usage_alert` on `harness.costs`, and the optional hook
   `InMemoryCostLedger(..., on_unpriced=callback)` gets an `UnpricedUsageAlert(org_id,
-  hotel_id, run_id, segment_id, provider, model, reason, recorded_at)`. The hook is called
+  hotel_id, run_id, segment_id, provider, model, reason, recorded_at)`. The alert text
+  (`UnpricedUsageAlert.summary`, also in the log event) depends on the reason. For
+  `unknown_model` and `tiered_pricing` (`refuses_model` is true) it is "run stopped; model
+  refused for this hotel until priced". For `web_search`, `non_first_party`,
+  `cost_out_of_range` and `no_price_table` it is "only this run stopped". The hook is called
   outside the lock. If it raises, the error is logged and the row and `stop_run` are kept.
   DEX-21 notifications connect to this hook.
 - The pre-run check (`check_run_models`) refuses that exact model id, for every hotel, while
@@ -557,7 +567,7 @@ rejected.
 
 | # | Decision | Safe default (built) | Options |
 |---|---|---|---|
-| C1 | Cache-write TTL to price | Optional `cache_write_1h_tokens`: a known split prices 5-minute writes at 1.25x input and 1-hour writes at 2x input; an unknown split (null) prices every cache write at the 1-hour rate (over-price, the safe side). Claude: from `model_usage`, `cache_write_1h_tokens = cacheCreationInputTokens - cacheCreationEphemeral5mInputTokens` (segment deltas), so writes with no reported TTL are priced at the 1-hour rate; null only when the CLI does not report the split. OpenAI: both rates equal the input price | Price an unknown split at the 5-minute rate (under-prices 1-hour writes); require the split from every adapter |
+| C1 | Cache-write TTL to price | Optional `cache_write_1h_tokens`: a known split prices 5-minute writes at 1.25x input and 1-hour writes at 2x input; an unknown split (null) prices every cache write at the 1-hour rate (over-price, the safe side). Claude, from `model_usage` (segment deltas): when `cacheCreationEphemeral5mInputTokens` is present, `cache_write_1h_tokens = cacheCreationInputTokens - cacheCreationEphemeral5mInputTokens`; when it is absent, `cache_write_1h_tokens` is absent, so every cache write uses the 1-hour rate. Cache writes with no reported lifetime are in `cacheCreationInputTokens` but in neither TTL field, so they get the 1-hour rate; a direct map of `cacheCreationEphemeral1hInputTokens` would give them the 5-minute rate, so the 1h count is not used. OpenAI: both rates equal the input price | Price an unknown split at the 5-minute rate (under-prices 1-hour writes); map the 1h count directly (under-prices writes with no reported lifetime); require the split from every adapter |
 | C2 | Models with prompt-length tiers (`claude-haiku-5-5`, `gpt-5.4`, `gpt-5.5`, `gpt-5.6-*`, `gpt-6*`) | Refuse before the run (`check_run_models` refuses it with `tiered_pricing`; `check_priced` raises `TieredPricingError`); if one still runs, its usage is recorded unpriced and the run stops (C11) | B: price at the higher tier (over-bill); C: price the short tier and cap prompt length in the model policy (DEX-23); D: contract v3 splits reports per tier |
 | C3 | Claude Agent SDK small fast model | Pin it to `claude-haiku-4-5` in the adapter: set `ANTHROPIC_SMALL_FAST_MODEL` (it has priority) and `ANTHROPIC_DEFAULT_HAIKU_MODEL`, because Haiku 5.5 is refused by C2. The orchestrator passes it to `check_run_models` before the run (runtime contract v2 `model_pins`) | Accept Haiku 5.5 after C2 changes |
 | C4 | Model ids | Key and store the exact id the runtime reported; resolve the price through explicit aliases only. An unknown snapshot id is recorded unpriced (the run stops) until it is added | Strip date suffixes automatically (rejected: a new snapshot can have a new price, and two ids in one segment would collapse to one key) |
