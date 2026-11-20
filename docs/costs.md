@@ -95,9 +95,15 @@ the tokens are already spent:
   `cacheCreationEphemeral5mInputTokens` is present, `cache_write_1h_tokens =
   cacheCreationInputTokens - cacheCreationEphemeral5mInputTokens`; when it is absent,
   `cache_write_1h_tokens` is absent, so every cache write uses the 1-hour rate. Take each
-  field as a segment delta, the same as `costUSD` (an absent baseline counts as 0), and call
-  `cache_write_1h_from_model_usage(total, five_minute)`. It also returns null when the 5m
-  delta does not fit the total. With every write reporting its lifetime, our cost matches
+  field as a segment delta, the same as `costUSD` (end snapshot minus baseline snapshot of
+  that model). Baseline rule: a missing baseline counts as 0 only for the total cache-write
+  count (`cacheCreationInputTokens`). If the baseline snapshot of the model, or the end
+  snapshot, has no `cacheCreationEphemeral5mInputTokens`, the 5m delta is unknown: pass
+  `five_minute=None`, so `cache_write_1h_tokens` is absent and the segment prices every cache
+  write at the 1-hour rate. A missing 5m baseline never counts as 0, because that makes the
+  5m delta too large (it would add 5-minute writes from before the segment, and under-price
+  the segment). Then call `cache_write_1h_from_model_usage(total, five_minute)`. It also
+  returns null when the 5m delta does not fit the total. With every write reporting its lifetime, our cost matches
   `costUSD` within the C6 tolerance (tested). Writes with no reported lifetime, or an absent
   5m count, make our cost higher than `costUSD`, and `check_sdk_cost` logs a mismatch for
   that row.
@@ -148,10 +154,11 @@ or before the UTC date of the report (decision C15). Two tables with one `effect
 refused. A price change is a new table with a later date; never edit a table that rows
 reference. Each row stores `price_table_version`.
 
-`price_usage` and `check_priced` choose the table the same way: `prices.table_at(at)`, where
-`at` defaults to now (UTC) and `prices` defaults to `PRICE_BOOK`. So a running estimate, the
-pre-run check and the final row use the same table. Before the first table they raise
-`NoPriceTableError`.
+`price_usage` and `check_run_models` choose the table the same way: `prices.table_at(...)`,
+where `prices` defaults to `PRICE_BOOK`. `price_usage` takes `at`, which defaults to now
+(UTC); `check_run_models` takes `now`. So a running estimate, the pre-run check and the final
+row use the same table. Before the first table, `price_usage` raises `NoPriceTableError` and
+`check_run_models` refuses every model with `no_price_table`.
 
 Rules. A model that cannot be priced is never priced as zero. `PriceTable.get` checks, in
 order:
@@ -235,7 +242,8 @@ subagent models). It returns `ModelCheck(refused=...)`; `allowed` is true when n
 refused. Each `RefusedModel` has `provider`, `model`, the `reason` code and `seen_unpriced`
 (true when this hotel already has unpriced usage of that exact id, from
 `CostLedger.unpriced_models(tenant)`). A known-unpriced model is refused before any token is
-spent. `check_priced(provider, model, *, at=None, prices=PRICE_BOOK)` checks one model.
+spent. `check_priced(provider, model, *, at=None, prices=PRICE_BOOK)` is a helper that
+checks one model against the table only; the pre-run check is `check_run_models`.
 `ModelCheck.failure_code` is `CONFIG_REJECTED` when a model is refused (see "Failure codes").
 
 ### SDK cost cross-check
