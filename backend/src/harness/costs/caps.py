@@ -12,7 +12,9 @@ Where the runner calls them (docs/costs.md, "Spend caps"):
 Unpriced usage (decision C11, option a): the run that has it stops (its run cap denies), an
 alert is raised, and `check_run_models` refuses that exact model id at the pre-run check until
 the price table in effect prices it. The hotel daily cap counts priced spend only, so the
-hotel's other runs and models continue.
+hotel's other runs and models continue, until UNPRICED_RUNS_HOTEL_DAILY_LIMIT runs of the hotel
+were stopped by unpriced usage in one UTC day (decision C16): then `check_hotel_daily_cap`
+denies new runs and new segments for the rest of that UTC day.
 """
 
 from __future__ import annotations
@@ -30,13 +32,24 @@ from harness.tenancy import TenantContext
 if TYPE_CHECKING:
     from harness.costs.ledger import CostLedger
 
+# Failure codes of runtime contract v2 that cost checks give. A cap deny is BUDGET_EXHAUSTED,
+# which the orchestrator owns.
+USAGE_UNPRICED = "USAGE_UNPRICED"  # a run stopped because it has unpriced usage
+CONFIG_REJECTED = "CONFIG_REJECTED"  # the pre-run model check refused a model id
+
+# Decision C16: runs of one hotel stopped by unpriced usage in one UTC day before
+# check_hotel_daily_cap denies the hotel for the rest of that day.
+UNPRICED_RUNS_HOTEL_DAILY_LIMIT = 3
+
 
 @dataclass(frozen=True, slots=True)
 class Spend:
-    """Spend in one scope: the priced total and the number of rows that have no price."""
+    """Spend in one scope: the priced total, the rows that have no price, and the distinct
+    runs that have such rows."""
 
     priced_usd: Decimal
     unpriced_rows: int
+    unpriced_runs: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -142,9 +155,28 @@ def check_hotel_daily_cap(
     now: datetime,
     pending_usd: Decimal = Decimal(0),
 ) -> CapDecision:
-    """Per-hotel cap for the UTC day that contains `now`, on priced spend only."""
+    """Per-hotel cap for the UTC day that contains `now`, on priced spend only.
+
+    Also denies when UNPRICED_RUNS_HOTEL_DAILY_LIMIT or more runs of the hotel have unpriced
+    usage in that UTC day (decision C16). `record` does not apply this limit, so a run in
+    flight stops at its next pre-segment call to this function.
+    """
     spend = ledger.hotel_spend(tenant, day=utc_day(now))
-    return check_hotel_spend(cap_usd, spend, pending_usd=pending_usd)
+    decision = check_hotel_spend(cap_usd, spend, pending_usd=pending_usd)
+    if spend.unpriced_runs < UNPRICED_RUNS_HOTEL_DAILY_LIMIT:
+        return decision
+    return CapDecision(
+        allowed=False,
+        cap_usd=decision.cap_usd,
+        spent_usd=decision.spent_usd,
+        remaining_usd=Decimal(0),
+        reason=(
+            f"{spend.unpriced_runs} runs of this hotel stopped on unpriced usage today (limit "
+            f"{UNPRICED_RUNS_HOTEL_DAILY_LIMIT}): no new runs until the next UTC day "
+            "(decision C16)"
+        ),
+        unpriced_rows=spend.unpriced_rows,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -162,6 +194,11 @@ class ModelCheck:
     @property
     def allowed(self) -> bool:
         return not self.refused
+
+    @property
+    def failure_code(self) -> str | None:
+        """CONFIG_REJECTED when a model is refused, else None."""
+        return CONFIG_REJECTED if self.refused else None
 
 
 def check_run_models(

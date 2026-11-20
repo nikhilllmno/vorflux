@@ -13,7 +13,7 @@ fields on every runtime event), 7.2 (cost isolation layer), 8.4 (tokens and cost
 
 ```
 before a run:      check_run_models(every model the runtime may call)         ─▶ refuse the run
-                   check_hotel_daily_cap (priced spend only)                   ─▶ block until next UTC day
+                   check_hotel_daily_cap (priced spend; C16 unpriced-run limit) ─▶ block until next UTC day
 before a segment:  check_run_cap + check_hotel_daily_cap
 during a segment:  the same checks with pending_usd = price_usage(tokens so far)
 after a segment:   runtime adapter ──UsageReport──▶ CostLedger.record(report, caps=SpendCaps(...))
@@ -35,13 +35,15 @@ sends two reports. Fields, exactly:
 | `run_id` | UUID | The harness run. Must exist (the ledger finds its org and hotel). |
 | `segment_id` | str | Non-blank, no surrounding whitespace, max 200 chars. Stable across resume. |
 | `provider` | `"anthropic"` \| `"openai"` | No other value. |
+| `serving` | `"first_party"` \| `"bedrock"` \| `"vertex"` \| `"other"` | Required. Who served the request. Only `first_party` is priced; any other value is recorded unpriced with `non_first_party` and the run stops (decision C13). |
 | `model` | str | The exact model id the runtime reported, unchanged. Max 200 chars. A model without a price is accepted and recorded unpriced. |
 | `input_tokens` | int, 0 to 2^63-1 | Input billed at the base input rate (not a cache read or write). |
 | `output_tokens` | int, 0 to 2^63-1 | Output, including reasoning or thinking tokens. |
 | `cache_read_tokens` | int, 0 to 2^63-1 | Input served from the prompt cache. |
-| `cache_write_tokens` | int, 0 to 2^63-1 | Input written to the prompt cache. |
-| `web_search_requests` | int, 0 to 2^63-1, optional (default 0) | Server-side web search calls (Anthropic `server_tool_use.web_search_requests`). Optional extension of v2. Any value above 0 is recorded unpriced (decision C12). |
-| `sdk_reported_cost_usd` | Decimal, optional | The SDK's own cost. A cross-check only. Normalised, never rejected (see below). |
+| `cache_write_tokens` | int, 0 to 2^63-1 | Input written to the prompt cache, at any TTL. |
+| `cache_write_1h_tokens` | int, 0 to 2^63-1, or null; optional (default null) | The 1-hour TTL part of `cache_write_tokens` (a subset, not a fifth bucket; more than `cache_write_tokens` is rejected). Null means the split is unknown, and every cache write is priced at the 1-hour rate (decision C1). |
+| `web_search_requests` | int, 0 to 2^63-1, optional (default 0) | Server-side web search calls (Claude: `ModelUsage.webSearchRequests`). Any value above 0 is recorded unpriced (decision C12). |
+| `sdk_reported_cost_usd` | Decimal, optional | The SDK's own cost (Claude: the delta of `ModelUsage.costUSD`). A cross-check only. Normalised, never rejected (see below). |
 
 Validation is strict: token counts must be real ints (not `1.5`, `"10"`, `true` or null) and
 fit a Postgres `bigint`, unknown fields are rejected, and the report is immutable.
@@ -61,16 +63,30 @@ the tokens are already spent:
 ### Adapter notes
 
 - The four token buckets are disjoint. Do not count a token twice.
-- Anthropic (Claude Agent SDK): the usage fields map one to one: `input_tokens`,
-  `output_tokens`, `cache_read_input_tokens` → `cache_read_tokens`,
-  `cache_creation_input_tokens` → `cache_write_tokens`,
-  `server_tool_use.web_search_requests` → `web_search_requests`. Send one report per key of
-  the result message's per-model usage, with that key as `model`. A segment that also used a
-  small fast model, or that reported a short id and a dated id, sends one report for each.
+- Anthropic (Claude Agent SDK): read `ResultMessage.model_usage`, never the combined
+  `ResultMessage.usage` (it merges every model, so it cannot be priced per model). Send one
+  report per key of `model_usage` that used tokens in the segment, with that key as `model`
+  (never `ModelUsage.canonicalModel`). Each value is the segment's delta for that model
+  (runtime contract v2, Section 4.3):
+
+  | `ModelUsage` field | `UsageReport` field |
+  |---|---|
+  | `inputTokens` | `input_tokens` |
+  | `outputTokens` | `output_tokens` |
+  | `cacheReadInputTokens` | `cache_read_tokens` |
+  | `cacheCreationInputTokens` | `cache_write_tokens` |
+  | (no split) | `cache_write_1h_tokens` = null, so every cache write is priced at the 1-hour rate (C1) |
+  | `webSearchRequests` | `web_search_requests` |
+  | `costUSD` | `sdk_reported_cost_usd` = `Decimal(str(end)) - Decimal(str(baseline))` |
+  | `provider`: absent or `firstParty` → `first_party`; `bedrock` → `bedrock`; `vertex` → `vertex`; anything else → `other` | `serving` |
+
+  A segment that also used a small fast model, or that reported a short id and a dated id,
+  sends one report for each.
 - OpenAI (Agents SDK): `input_tokens` INCLUDES cached tokens. Send
   `input_tokens = usage.input_tokens - usage.input_tokens_details.cached_tokens` and
   `cache_read_tokens = cached_tokens`. Send `cache_write_tokens = 0` for the models in the
-  table: they have no separate cache-write charge.
+  table: they have no separate cache-write charge. Send `serving = "first_party"` (the adapter
+  calls the OpenAI API directly).
 - Do not normalise the model id. Prices resolve dated snapshot ids through explicit aliases
   in the table (for example `claude-haiku-4-5-20251001` → `claude-haiku-4-5`).
 - On resume, resend a segment with the same `segment_id` and the same model ids. The ledger
@@ -81,21 +97,23 @@ the tokens are already spent:
 The key is `(run_id, segment_id, provider, model)`, with `model` exactly as received. Two ids
 for one model in one segment (for example `claude-haiku-4-5` and `claude-haiku-4-5-20251001`,
 which Claude Code CLI 2.1.327 reports) are two keys and are both billed. A second report with
-the same key is a no-op that returns `DUPLICATE`. If the resent token counts differ from the
-stored row, the first row stays and a warning that contains "conflict" is logged on the
+the same key is a no-op that returns `DUPLICATE`. If the resent token counts, `serving` or
+SDK cost differ from the stored row, the first row stays and a warning that contains "conflict" is logged on the
 `harness.costs` logger.
 
 ## Prices
 
 `harness/costs/prices.py` holds one `PriceTable` for both providers: version `2026-11-20`,
-effective from 2026-11-20. Each entry has four Decimal prices in USD per million tokens:
-input, output, cache read and cache write.
+effective from 2026-11-20. Each entry has five Decimal prices in USD per million tokens:
+input, output, cache read, cache write (`cache_write`, the 5-minute TTL) and 1-hour cache
+write (`cache_write_1h`).
 
 - Anthropic source: https://platform.claude.com/docs/en/about-claude/pricing (checked
-  2026-11-20). Cache write uses the 5-minute TTL rate (1.25x input).
+  2026-11-20). `cache_write` is the 5-minute TTL rate (1.25x input); `cache_write_1h` is the
+  1-hour TTL rate (2x input).
 - OpenAI source: https://developers.openai.com/api/docs/pricing, Standard tier (checked
-  2026-11-20). Cache write equals the input price, because these models have "No additional
-  cache-write charge" (https://developers.openai.com/api/docs/guides/prompt-caching).
+  2026-11-20). Both cache-write prices equal the input price, because these models have "No
+  additional cache-write charge" (https://developers.openai.com/api/docs/guides/prompt-caching).
 
 `PRICE_BOOK` (a `PriceBook`) holds every table by `effective_from`. The ledger prices each
 report with `PRICE_BOOK.table_at(recorded_at)`: the latest table whose `effective_from` is on
@@ -120,26 +138,48 @@ order:
 3. A non-first-party id: `NonFirstPartyModelError` (decision C13). An id that starts with
    `ft:` (fine-tuned), contains `anthropic.` or ends with `-v1:0`/`-v2:0` (Amazon Bedrock),
    contains `@` (Google Vertex AI), or contains `/` or `:` (a gateway or provider prefix).
-   Their prices differ from the first-party API.
+   Their prices differ from the first-party API. `non_first_party_kind(model)` is this check.
+
+Why `:` is refused. No first-party Anthropic or OpenAI API id contains `:`, `/` or `@`. A `:`
+appears only in OpenAI fine-tune ids (`ft:gpt-4o-mini-2024-07-18:org::id`), Bedrock version
+suffixes (`anthropic.claude-sonnet-4-6-v1:0`) and gateway prefixes (`vendor:claude-haiku-4-5`,
+`gpt-5:free`). A test passes every id and alias in the table, and every default model pin of
+runtime contract v2 (`claude-haiku-4-5` and the Sonnet, Opus and OpenAI ids in the table),
+through the check. `PriceTable` refuses to build with an id that the check flags, so pricing
+such an id needs a change to the rule first.
+
+Serving. A first-party id can still be served by Bedrock, Vertex AI or a gateway (for example
+when the CLI picks a provider from a settings file). The report's `serving` field says who
+served it. A report with `serving` other than `first_party` is recorded unpriced with
+`non_first_party` (`NonFirstPartyServingError`), whatever its model id; this check runs first.
 4. Anything else: `UnknownModelError`.
 
 Not modelled (decision C8): batch, priority, flex and fast modes; Anthropic
-`inference_geo: "us"` (1.1x); OpenAI regional processing (+10%); Anthropic 1-hour cache
-writes (2x input); web search requests (C12); Bedrock, Vertex AI and gateway prices (C13).
+`inference_geo: "us"` (1.1x); OpenAI regional processing (+10%); web search requests (C12);
+Bedrock, Vertex AI and gateway prices (C13).
 
 ### Cost formula
 
 ```
+one_hour = cache_write_1h_tokens if known, else cache_write_tokens      (decision C1)
 cost_usd = (input_tokens × input + output_tokens × output
-            + cache_read_tokens × cache_read + cache_write_tokens × cache_write) / 1,000,000
+            + cache_read_tokens × cache_read
+            + (cache_write_tokens − one_hour) × cache_write
+            + one_hour × cache_write_1h) / 1,000,000
 ```
+
+When the split is unknown, every cache write is priced at the 1-hour rate. That over-prices
+5-minute writes by 0.75x input, which is the safe side for a cap. The Claude SDK's
+`model_usage` has no split, so every Claude cache write is priced at the 1-hour rate. For
+OpenAI both rates are the input price, so the split changes nothing.
 
 The math is exact Decimal. The result is rounded half up to 9 decimal places
 (`COST_QUANTUM = 0.000000001`), which fits `numeric(20, 9)`. Totals are sums of rounded rows.
 A cost of 10^11 USD or more does not fit and raises `CostOutOfRangeError`.
 
 `price_usage(provider, model, *, input_tokens, output_tokens, cache_read_tokens,
-cache_write_tokens, at=None, prices=PRICE_BOOK)` applies the formula to raw counts with the
+cache_write_tokens, cache_write_1h_tokens=None, at=None, prices=PRICE_BOOK)` applies the
+formula (first-party serving) to raw counts with the
 table in effect at `at`. `cost_usd(report, table)` applies it to a report with a given table
 (the ledger passes `table_at(recorded_at)`). Use `price_usage` for a running estimate inside a
 segment (see "Spend caps").
@@ -150,13 +190,14 @@ Usage is always recorded. When a report cannot be priced, its row gets
 `pricing_status = 'unpriced'`, `cost_usd = null` and an `unpriced_reason`. The built default
 is decision C11 option (a); see "Unpriced usage: what happens" under "Spend caps". Reason codes (each is the `reason` of an `UnpricedUsageError` subclass;
 `UNPRICED_REASONS` in `prices.py` lists them, a subclass with another code fails at import, the
-base class cannot be raised, and a test checks that the SQL `unpriced_reason` list matches):
+base class cannot be raised, and a test checks that the SQL `unpriced_reason` list matches;
+another test checks that the SQL `serving` list matches `Serving`):
 
 | `unpriced_reason` | Cause |
 |---|---|
 | `unknown_model` | The id is not in the table (`UnknownModelError`). |
 | `tiered_pricing` | The model has prompt-length tiers (`TieredPricingError`, C2). |
-| `non_first_party` | A Bedrock, Vertex AI, gateway or fine-tuned id (`NonFirstPartyModelError`, C13). |
+| `non_first_party` | A Bedrock, Vertex AI, gateway or fine-tuned id (`NonFirstPartyModelError`), or `serving` other than `first_party` (`NonFirstPartyServingError`), C13. |
 | `web_search` | `web_search_requests > 0` (`WebSearchNotPricedError`, C12). |
 | `cost_out_of_range` | The cost is 10^11 USD or more (`CostOutOfRangeError`). |
 | `no_price_table` | No table was in effect at `recorded_at` (`NoPriceTableError`). `price_table_version` is null. |
@@ -168,6 +209,7 @@ refused. Each `RefusedModel` has `provider`, `model`, the `reason` code and `see
 (true when this hotel already has unpriced usage of that exact id, from
 `CostLedger.unpriced_models(tenant)`). A known-unpriced model is refused before any token is
 spent. `check_priced(provider, model, *, at=None, prices=PRICE_BOOK)` checks one model.
+`ModelCheck.failure_code` is `CONFIG_REJECTED` when a model is refused (see "Failure codes").
 
 ### SDK cost cross-check
 
@@ -192,16 +234,17 @@ backstop set to the same cap. It is never the authority.
   run's spend and the hotel's spend for the UTC day, and checks the caps in `SpendCaps(run_usd,
   hotel_daily_usd)`. `RecordResult` has `status` (`recorded` | `duplicate`), `row` (the
   stored row; the first one for a duplicate), `run_spend`, `hotel_day_spend`, `run_cap`,
-  `hotel_daily_cap` and `stop_run`. `stop_run` is true when the run has an unpriced row or a
-  checked cap denies. For a new unpriced row it raises the alert (C11) after the lock is
+  `hotel_daily_cap`, `stop_run` and `failure_code`. `stop_run` is true when the run has an
+  unpriced row or a checked cap denies. `failure_code` is `USAGE_UNPRICED` when the run has
+  an unpriced row, else null. For a new unpriced row it raises the alert (C11) after the lock is
   released.
 - `run_spend(tenant, run_id)`, `run_rows(tenant, run_id)`
 - `unpriced_models(tenant)`: one `UnpricedModel(provider, model, reason, rows,
   last_recorded_at)` per exact id and reason that the hotel ran unpriced
 - `hotel_spend(tenant, day=None)`, `org_spend(tenant, day=None)`
 
-A `Spend` is `priced_usd` (the sum of priced rows) and `unpriced_rows` (the count of rows
-without a cost). Every read takes an explicit `TenantContext`. Rows of another tenant are
+A `Spend` is `priced_usd` (the sum of priced rows), `unpriced_rows` (the count of rows
+without a cost) and `unpriced_runs` (the count of distinct runs that have such a row). Every read takes an explicit `TenantContext`. Rows of another tenant are
 invisible (they add nothing and are not returned), the same as RLS. Days are UTC calendar
 days of `recorded_at`. `org_spend` covers every hotel in the caller's org; it is a
 control-plane aggregate for an org-level cap.
@@ -220,10 +263,14 @@ The Postgres store must make record-and-check atomic per hotel, the same as the 
 2. `insert into public.run_costs (...) values (...) on conflict (run_id, segment_id, provider,
    model) do nothing returning *;` If no row returns, select the existing row (a duplicate).
 3. Sum the run and the hotel's UTC day:
-   `select coalesce(sum(cost_usd), 0), count(*) filter (where pricing_status = 'unpriced')
-   from public.run_costs where ...`. Under READ COMMITTED each statement takes a new
-   snapshot, so after the lock it sees every report of the hotel that committed before.
+   `select coalesce(sum(cost_usd), 0), count(*) filter (where pricing_status = 'unpriced'),
+   count(distinct run_id) filter (where pricing_status = 'unpriced') from public.run_costs
+   where ...`. Under READ COMMITTED each statement takes a new snapshot, so after the lock it
+   sees every report of the hotel that committed before.
 4. Commit, then return the cap decisions.
+5. Raise the unpriced alert (C11) only after the commit succeeds, and only when step 2's
+   insert returned a row that is unpriced. A rolled-back transaction or a duplicate insert
+   (no row returned) never raises an alert.
 
 Set `recorded_at` from the same clock time that picked the price table, not from the column
 default. Read-only checks (before a run or a segment) need no lock.
@@ -236,6 +283,7 @@ denies. A cap of 0 denies everything. A negative, non-finite or float amount is 
 denies whenever the run has an unpriced row (reason contains "unpriced", remaining 0,
 `unpriced_rows` set). `check_hotel_spend(cap_usd, spend, pending_usd=0)` checks
 `spend.priced_usd + pending_usd` only: the hotel daily cap counts priced spend only.
+`check_hotel_daily_cap` also applies the unpriced-run limit of decision C16 (see below).
 
 - After each report: `record(report, caps=SpendCaps(run_usd=..., hotel_daily_usd=...))`. If
   `stop_run` is true, the run stops. A duplicate adds nothing, so a resume cannot push a run
@@ -268,8 +316,25 @@ Decision C11. Built default: option (a). When a report is recorded unpriced:
 - It clears by itself: when a price table that prices the id takes effect (a new
   `effective_from`), `check_run_models` allows it again. No manual step. The old rows stay
   unpriced (rows are immutable).
-- Web search (C12) is the exception to the refusal: the model is priced, so it is not refused.
-  Only the run that used web search stops.
+- Web search (C12) and `serving` other than `first_party` (C13) are exceptions to the
+  refusal: the model id is priced, so it is not refused. Only the run that had that usage
+  stops.
+
+Limit of the model refusal. `check_run_models` refuses only the ids that the orchestrator
+passes to it. An id that the runtime calls but the orchestrator did not pass (an undeclared
+model) is admitted on each new run, and each such run stops after one segment, with no USD
+bound for that segment. The adapter model pins in runtime contract v2
+(https://github.com/nikhilllmno/hermes_like_agent/pull/3, `RunConfig.model_pins`) close this on
+the Claude side: the orchestrator passes every pinned id to `check_run_models`.
+
+Unpriced-run limit per hotel (decision C16). Built default: when 3 or more runs of one hotel
+(`UNPRICED_RUNS_HOTEL_DAILY_LIMIT`, counted as distinct `run_id`s with an unpriced row,
+`Spend.unpriced_runs`) were stopped by unpriced usage in one UTC day, `check_hotel_daily_cap`
+denies for that hotel for the rest of the UTC day (the reason contains "unpriced"). It clears
+at the next UTC day. Several unpriced rows in one run count once. `record` does not apply the
+limit, so its `hotel_daily_cap` stays a USD decision; but the orchestrator calls
+`check_hotel_daily_cap` before each segment too, so a run in flight in that hotel stops at its
+next segment boundary. Other hotels are not affected.
 
 Options for C11, and how each one clears:
 
@@ -286,7 +351,21 @@ Worst-case overshoot (decision C14):
 - Per hotel per day: the segments that are in flight in that hotel's concurrent runs when the
   cap is crossed. The atomic record gives each report a distinct total, so the first report
   that reaches the cap stops its run, and every later report and segment check denies.
-- An unpriced row cannot be bounded in USD; that is why it stops the run at once.
+- An unpriced row cannot be bounded in USD; that is why it stops the run at once. With C16,
+  a hotel has at most 3 unbounded segments per UTC day from undeclared models (plus the
+  segments in flight when the third run stops).
+
+### Failure codes (runtime contract v2)
+
+| Situation | Code | Who gives it |
+|---|---|---|
+| `check_run_models` refuses a model (`ModelCheck.failure_code`) | `CONFIG_REJECTED` | DEX-24 |
+| `record` stores or finds an unpriced row in the run (`RecordResult.failure_code`) | `USAGE_UNPRICED` | DEX-24 |
+| `price_usage` raises an `UnpricedUsageError` during a segment | `USAGE_UNPRICED` | orchestrator |
+| A cap deny: `stop_run` with no unpriced row, `check_run_cap`, `check_hotel_daily_cap` (including the C16 limit) | `BUDGET_EXHAUSTED` | orchestrator |
+
+`USAGE_UNPRICED` and `CONFIG_REJECTED` are constants in `harness.costs`. `RecordResult` gives
+no code for a cap deny, because the contract names that code and the orchestrator owns it.
 
 Wiring the caps into the orchestrator, and where the cap values live, is later work (DEX-14
 and DEX-23).
@@ -307,11 +386,13 @@ the service role (no update, delete or truncate grant, so the ledger stays appen
 | `run_id` | `uuid` | no | Composite FK `(org_id, hotel_id, run_id)` → `runs (org_id, hotel_id, id)` once DEX-14 adds `runs` |
 | `segment_id` | `text` | no | From the report |
 | `provider` | `text` | no | `'anthropic'` or `'openai'` |
+| `serving` | `text` | no | `'first_party'`, `'bedrock'`, `'vertex'` or `'other'`; not `first_party` only when unpriced |
 | `model` | `text` | no | The exact model id the runtime reported (not normalised) |
 | `input_tokens` | `bigint` | no | ≥ 0 |
 | `output_tokens` | `bigint` | no | ≥ 0 |
 | `cache_read_tokens` | `bigint` | no | ≥ 0 |
 | `cache_write_tokens` | `bigint` | no | ≥ 0 |
+| `cache_write_1h_tokens` | `bigint` | yes | 0 to `cache_write_tokens`; null when the TTL split is unknown (C1) |
 | `web_search_requests` | `bigint` | no | ≥ 0, default 0 |
 | `pricing_status` | `text` | no | `'priced'` or `'unpriced'` |
 | `unpriced_reason` | `text` | yes | A reason code; set only when unpriced |
@@ -336,11 +417,15 @@ create table public.run_costs (
   run_id uuid not null,  -- composite FK to public.runs below, after DEX-14
   segment_id text not null check (length(segment_id) between 1 and 200),
   provider text not null check (provider in ('anthropic', 'openai')),
+  serving text not null check (serving in ('first_party', 'bedrock', 'vertex', 'other')),
   model text not null check (length(model) between 1 and 200),
   input_tokens bigint not null check (input_tokens >= 0),
   output_tokens bigint not null check (output_tokens >= 0),
   cache_read_tokens bigint not null check (cache_read_tokens >= 0),
   cache_write_tokens bigint not null check (cache_write_tokens >= 0),
+  -- The 1-hour TTL part of cache_write_tokens; null when the split is unknown (decision C1).
+  cache_write_1h_tokens bigint
+    check (cache_write_1h_tokens >= 0 and cache_write_1h_tokens <= cache_write_tokens),
   web_search_requests bigint not null default 0 check (web_search_requests >= 0),
   pricing_status text not null check (pricing_status in ('priced', 'unpriced')),
   unpriced_reason text check (unpriced_reason in (
@@ -361,6 +446,8 @@ create table public.run_costs (
     or (pricing_status = 'unpriced' and cost_usd is null and unpriced_reason is not null
       and (price_table_version is null) = (unpriced_reason = 'no_price_table'))
   ),
+  -- Only first-party usage is priced (decision C13).
+  constraint run_costs_serving_priced check (serving = 'first_party' or pricing_status = 'unpriced'),
   constraint run_costs_hotel_fk foreign key (org_id, hotel_id)
     references public.hotels (org_id, id) on delete cascade
   -- After DEX-14: a cost row must belong to the same tenant as its run. Needs
@@ -417,25 +504,27 @@ create policy run_costs_select_owners_admins on public.run_costs
 
 The migration also needs the PR#5 catalog and isolation tests extended to `run_costs`: RLS
 forced, no write policy, a two-org read test, service role cannot update or delete, `NaN`
-costs are rejected, an inconsistent priced or unpriced row is rejected, and a row whose run
+costs are rejected, an inconsistent priced or unpriced row is rejected, a priced row with
+`serving` other than `first_party` is rejected, and a row whose run
 belongs to another hotel is rejected.
 
 ## Owner decisions (each with a safe default)
 
 | # | Decision | Safe default (built) | Options |
 |---|---|---|---|
-| C1 | Cache-write TTL to price | Anthropic 5-minute write rate (1.25x input); OpenAI write = input price | Add a TTL field in contract v3 to price 1-hour writes (2x input) |
-| C2 | Models with prompt-length tiers (`claude-haiku-5-5`, `gpt-5.4`, `gpt-5.5`, `gpt-5.6-*`, `gpt-6*`) | Refuse before the run (`check_priced` raises `TieredPricingError`); if one still runs, its usage is recorded unpriced and the run stops (C11) | B: price at the higher tier (over-bill); C: price the short tier and cap prompt length in the model policy (DEX-23); D: contract v3 splits reports per tier |
-| C3 | Claude Agent SDK small fast model | Pin it to `claude-haiku-4-5` in the adapter: set `ANTHROPIC_SMALL_FAST_MODEL` (it has priority) and `ANTHROPIC_DEFAULT_HAIKU_MODEL`, because Haiku 5.5 is refused by C2. The orchestrator runs `check_priced` on it before the run | Accept Haiku 5.5 after C2 changes |
+| C1 | Cache-write TTL to price | Optional `cache_write_1h_tokens`: a known split prices 5-minute writes at 1.25x input and 1-hour writes at 2x input; an unknown split (null, as from Claude's `model_usage`) prices every cache write at the 1-hour rate (over-price, the safe side). OpenAI: both rates equal the input price | Price an unknown split at the 5-minute rate (under-prices 1-hour writes); require the split from every adapter |
+| C2 | Models with prompt-length tiers (`claude-haiku-5-5`, `gpt-5.4`, `gpt-5.5`, `gpt-5.6-*`, `gpt-6*`) | Refuse before the run (`check_run_models` refuses it with `tiered_pricing`; `check_priced` raises `TieredPricingError`); if one still runs, its usage is recorded unpriced and the run stops (C11) | B: price at the higher tier (over-bill); C: price the short tier and cap prompt length in the model policy (DEX-23); D: contract v3 splits reports per tier |
+| C3 | Claude Agent SDK small fast model | Pin it to `claude-haiku-4-5` in the adapter: set `ANTHROPIC_SMALL_FAST_MODEL` (it has priority) and `ANTHROPIC_DEFAULT_HAIKU_MODEL`, because Haiku 5.5 is refused by C2. The orchestrator passes it to `check_run_models` before the run (runtime contract v2 `model_pins`) | Accept Haiku 5.5 after C2 changes |
 | C4 | Model ids | Key and store the exact id the runtime reported; resolve the price through explicit aliases only. An unknown snapshot id is recorded unpriced (the run stops) until it is added | Strip date suffixes automatically (rejected: a new snapshot can have a new price, and two ids in one segment would collapse to one key) |
 | C5 | Day boundary for the hotel daily cap | UTC day | The hotel's time zone, once `hotels` stores it |
 | C6 | SDK cost tolerance | Log above max(1%, 0.000001 USD) | Tighter tolerance, or alert instead of log |
 | C7 | Who reads `run_costs` | Owners and admins of the hotel or org (billing data) | Every member who can read the hotel (`private.can_read_hotel`) |
-| C8 | Pricing modes | Standard first-party only: no batch, flex, priority, fast or regional uplift; web search (C12) and Bedrock, Vertex AI or gateway prices (C13) are not modelled | Add a pricing-mode field in contract v3 |
+| C8 | Pricing modes | Standard first-party only: no batch, flex, priority, fast or regional uplift; web search (C12) and Bedrock, Vertex AI or gateway prices (C13) are not modelled. Cache-write TTL is modelled (C1) | Add a pricing-mode field in contract v3 |
 | C9 | Explicit `pydantic` dependency | Not added now: it comes through FastAPI and pydantic-settings, and PR#5 edits `pyproject.toml`/`uv.lock` | Add `pydantic>=2.14,<3` after PR#5 merges |
 | C10 | `docs/backlog.md` | Not edited (PR#4 edits it) | Link this PR from the DEX-24 row after PR#4 merges |
 | C11 | Usage that cannot be priced | Option (a): record the tokens with `pricing_status = 'unpriced'` and no cost; stop only that run; raise an alert (`unpriced_usage_alert` log event and the `on_unpriced` hook for DEX-21); refuse that exact model id at the pre-run check until the price table in effect prices it (clears by itself). The hotel daily cap counts priced spend only (see "Unpriced usage: what happens") | (b): block the whole hotel until an owner or admin clears it with a separate append-only acknowledgement record; (c): fail open, price at an estimate (rejected: wrong bills) |
 | C12 | Web search requests | Recorded unpriced, so only the run that uses web search stops and an alert is raised (C11); the model is not refused, because its tokens are priced | Price them at the published rate (about 10 USD per 1,000 searches) in a later table |
-| C13 | Non-first-party and fine-tuned ids (Bedrock, Vertex AI, gateway prefixes, `ft:`) | Refused (`NonFirstPartyModelError`), recorded unpriced if they still run | Add provider-specific tables when a hotel needs them |
+| C13 | Non-first-party ids and serving (Bedrock, Vertex AI, gateway prefixes, `ft:`, or `serving` other than `first_party`) | Ids refused (`NonFirstPartyModelError`), recorded unpriced if they still run; a report with `serving` other than `first_party` is recorded unpriced (`NonFirstPartyServingError`) and its run stops, but the id is not refused. `:` stays refused, because no priced id has one (see "Prices") | Add provider-specific tables when a hotel needs them |
 | C14 | Concurrency of the hotel daily cap | Record, sum and check in one atomic step (a lock in memory; a per-hotel `pg_advisory_xact_lock` in Postgres) and check after each report. Worst case: the segments in flight when the cap is crossed | Reserve an estimated budget before each segment (stricter, more complex) |
 | C15 | Price changes | One table per `effective_from` date (UTC); each report uses the table in effect at `recorded_at` and stores its version | Price by the run's start date |
+| C16 | Repeated unpriced runs in one hotel (undeclared models) | When 3 or more runs of a hotel are stopped by unpriced usage in one UTC day, `check_hotel_daily_cap` denies that hotel for the rest of the UTC day (reason contains "unpriced"); `UNPRICED_RUNS_HOTEL_DAILY_LIMIT = 3` | No limit (each run stops after one unbounded segment); a different count; alert only |

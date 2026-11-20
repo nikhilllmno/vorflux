@@ -238,7 +238,9 @@ def test_row_carries_tenant_cost_tokens_and_table_version(
     assert row.sdk_reported_cost_usd == Decimal("3.01")
     assert row.price_table_version == PRICE_TABLE.version
     assert row.recorded_at == clock.now
-    assert row.cost_usd == Decimal("3.000268500")
+    # 1M input x 3 + 10 output x 15 + 20 cache read x 0.30 + 30 cache write x 6 (split
+    # unknown, so the 1-hour rate) USD per MTok.
+    assert row.cost_usd == Decimal("3.000336000")
 
 
 def test_report_for_an_unknown_run_is_refused(

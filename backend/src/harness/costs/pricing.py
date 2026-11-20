@@ -13,6 +13,7 @@ from harness.costs.prices import (
     PriceBook,
     PriceTable,
     Provider,
+    Serving,
     UnpricedUsageError,
 )
 from harness.costs.usage import MAX_TOKENS, MAX_USD, UsageReport, quantize_usd
@@ -20,6 +21,13 @@ from harness.costs.usage import MAX_TOKENS, MAX_USD, UsageReport, quantize_usd
 logger = logging.getLogger("harness.costs")
 
 _PER_MTOK = Decimal(1_000_000)
+
+
+class NonFirstPartyServingError(UnpricedUsageError):
+    """A report served by Bedrock, Vertex AI or another host. Only first-party API usage is
+    priced (decision C13)."""
+
+    reason = "non_first_party"
 
 
 class WebSearchNotPricedError(UnpricedUsageError):
@@ -55,6 +63,7 @@ def _price_counts(
     output_tokens: int,
     cache_read_tokens: int,
     cache_write_tokens: int,
+    cache_write_1h_tokens: int | None,
 ) -> Decimal:
     counts = {
         "input_tokens": input_tokens,
@@ -64,6 +73,17 @@ def _price_counts(
     }
     for name, value in counts.items():
         _check_count(name, value)
+    if cache_write_1h_tokens is None:
+        # TTL split unknown: price every cache write at the 1-hour rate, the safe side (C1).
+        one_hour = cache_write_tokens
+    else:
+        _check_count("cache_write_1h_tokens", cache_write_1h_tokens)
+        if cache_write_1h_tokens > cache_write_tokens:
+            raise ValueError(
+                f"cache_write_1h_tokens ({cache_write_1h_tokens}) must not be more than "
+                f"cache_write_tokens ({cache_write_tokens})"
+            )
+        one_hour = cache_write_1h_tokens
     prices = table.get(provider, model).prices
     with localcontext() as ctx:
         ctx.prec = 60  # exact for any bigint token count and any price
@@ -72,7 +92,8 @@ def _price_counts(
                 input_tokens * prices.input
                 + output_tokens * prices.output
                 + cache_read_tokens * prices.cache_read
-                + cache_write_tokens * prices.cache_write
+                + (cache_write_tokens - one_hour) * prices.cache_write
+                + one_hour * prices.cache_write_1h
             )
             / _PER_MTOK
         )
@@ -89,12 +110,15 @@ def price_usage(
     output_tokens: int,
     cache_read_tokens: int,
     cache_write_tokens: int,
+    cache_write_1h_tokens: int | None = None,
     at: datetime | None = None,
     prices: PriceBook = PRICE_BOOK,
 ) -> Decimal:
     """Price token counts with the table in effect at `at` (default now), as the ledger does.
 
-    sum(tokens x USD per MTok) / 1e6, rounded half up to 9 places. Use it for a running
+    sum(tokens x USD per MTok) / 1e6, rounded half up to 9 places. `cache_write_1h_tokens` is
+    the 1-hour part of `cache_write_tokens`; None (unknown) prices every cache write at the
+    1-hour rate. Assumes first-party serving. Use it for a running
     estimate inside a segment (pass the result to the caps as `pending_usd`). Raises an
     UnpricedUsageError subclass: an unpriced model, no table in effect, or a cost of 10^11 USD
     or more.
@@ -107,6 +131,7 @@ def price_usage(
         output_tokens=output_tokens,
         cache_read_tokens=cache_read_tokens,
         cache_write_tokens=cache_write_tokens,
+        cache_write_1h_tokens=cache_write_1h_tokens,
     )
 
 
@@ -114,8 +139,14 @@ def cost_usd(report: UsageReport, table: PriceTable = PRICE_TABLE) -> Decimal:
     """The billed cost of one report, priced from `table`.
 
     Raises an UnpricedUsageError subclass when the report cannot be priced: an unknown,
-    tiered or non-first-party model, web search requests, or a cost out of range.
+    tiered or non-first-party model, non-first-party serving, web search requests, or a cost
+    out of range.
     """
+    if report.serving is not Serving.FIRST_PARTY:
+        raise NonFirstPartyServingError(
+            f"model {report.model!r} was served by {report.serving}; the price table holds "
+            "first-party API prices only (docs/costs.md, decision C13)"
+        )
     if report.web_search_requests:
         raise WebSearchNotPricedError(
             f"{report.web_search_requests} web search requests on model {report.model!r} "
@@ -129,6 +160,7 @@ def cost_usd(report: UsageReport, table: PriceTable = PRICE_TABLE) -> Decimal:
         output_tokens=report.output_tokens,
         cache_read_tokens=report.cache_read_tokens,
         cache_write_tokens=report.cache_write_tokens,
+        cache_write_1h_tokens=report.cache_write_1h_tokens,
     )
 
 

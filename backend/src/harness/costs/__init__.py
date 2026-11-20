@@ -1,6 +1,9 @@
 """Per-run token cost tracking and basic hard spend caps (DEX-24 part 1, docs/costs.md)."""
 
 from harness.costs.caps import (
+    CONFIG_REJECTED,
+    UNPRICED_RUNS_HOTEL_DAILY_LIMIT,
+    USAGE_UNPRICED,
     CapDecision,
     ModelCheck,
     RefusedModel,
@@ -37,14 +40,17 @@ from harness.costs.prices import (
     PriceBook,
     PriceTable,
     Provider,
+    Serving,
     TieredPricingError,
     TokenPrices,
     UnknownModelError,
     UnpricedUsageError,
     check_priced,
+    non_first_party_kind,
 )
 from harness.costs.pricing import (
     CostOutOfRangeError,
+    NonFirstPartyServingError,
     SdkCostCheck,
     WebSearchNotPricedError,
     check_sdk_cost,
@@ -61,11 +67,14 @@ from harness.costs.usage import (
 )
 
 __all__ = [
+    "CONFIG_REJECTED",
     "COST_QUANTUM",
     "MAX_TOKENS",
     "PRICE_BOOK",
     "PRICE_TABLE",
     "UNPRICED_REASONS",
+    "UNPRICED_RUNS_HOTEL_DAILY_LIMIT",
+    "USAGE_UNPRICED",
     "CapDecision",
     "CostLedger",
     "CostOutOfRangeError",
@@ -75,6 +84,7 @@ __all__ = [
     "ModelPrice",
     "NoPriceTableError",
     "NonFirstPartyModelError",
+    "NonFirstPartyServingError",
     "PriceBook",
     "PriceTable",
     "PricingStatus",
@@ -85,6 +95,7 @@ __all__ = [
     "RunTenant",
     "RunTenantLookup",
     "SdkCostCheck",
+    "Serving",
     "Spend",
     "SpendCaps",
     "TieredPricingError",
@@ -108,6 +119,7 @@ __all__ = [
     "check_spend_cap",
     "cost_usd",
     "idempotency_key",
+    "non_first_party_kind",
     "price_usage",
     "quantize_usd",
 ]

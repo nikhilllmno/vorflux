@@ -24,6 +24,19 @@ class Provider(StrEnum):
     OPENAI = "openai"
 
 
+class Serving(StrEnum):
+    """Who served the request (runtime contract v2). Only first-party API usage is priced.
+
+    The CLI and SDKs can route the same model id through Amazon Bedrock, Google Vertex AI or a
+    gateway, which bill at other prices; that usage is recorded unpriced (decision C13).
+    """
+
+    FIRST_PARTY = "first_party"
+    BEDROCK = "bedrock"
+    VERTEX = "vertex"
+    OTHER = "other"
+
+
 # Every value of run_costs.unpriced_reason (the CHECK list in docs/costs.md must match).
 UNPRICED_REASONS = (
     "unknown_model",
@@ -79,8 +92,15 @@ class NoPriceTableError(UnpricedUsageError):
     reason = "no_price_table"
 
 
-def _non_first_party_kind(model: str) -> str | None:
-    """Name the kind of a model id that is not a first-party API id, or return None."""
+def non_first_party_kind(model: str) -> str | None:
+    """Name the kind of a model id that is not a first-party API id, or return None.
+
+    No first-party Anthropic or OpenAI API id contains ':', '/' or '@'. Those characters appear
+    in OpenAI fine-tune ids (`ft:...`), Bedrock version suffixes (`-v1:0`), Vertex AI versions
+    (`@20250929`) and gateway or provider prefixes (`openai/gpt-5`, `vendor:model`). A
+    PriceTable refuses an id that this check flags, so pricing such an id needs a rule change
+    first (docs/costs.md, decision C13).
+    """
     if model.startswith("ft:"):
         return "fine-tuned"
     if "anthropic." in model or model.endswith(("-v1:0", "-v2:0")):
@@ -99,10 +119,11 @@ class TokenPrices:
     input: Decimal
     output: Decimal
     cache_read: Decimal
-    cache_write: Decimal
+    cache_write: Decimal  # 5-minute TTL (Anthropic); OpenAI has one rate, equal to input
+    cache_write_1h: Decimal  # 1-hour TTL; also the rate when the TTL split is unknown (C1)
 
     def __post_init__(self) -> None:
-        for name in ("input", "output", "cache_read", "cache_write"):
+        for name in ("input", "output", "cache_read", "cache_write", "cache_write_1h"):
             value = getattr(self, name)
             if not isinstance(value, Decimal):
                 raise TypeError(f"{name} price must be a Decimal, got {type(value).__name__}")
@@ -158,6 +179,12 @@ class PriceTable:
             self._tiered[(provider, model)] = _Tiered(provider, model, rule)
 
     def _claim(self, key: tuple[Provider, str]) -> None:
+        kind = non_first_party_kind(key[1])
+        if kind is not None:
+            raise ValueError(
+                f"model id {key[1]!r} fails the first-party id check ({kind}); change "
+                "non_first_party_kind before pricing it (docs/costs.md, decision C13)"
+            )
         if key in self._by_id or key in self._tiered:
             raise ValueError(f"duplicate model id in price table: {key[0]}/{key[1]}")
 
@@ -176,7 +203,7 @@ class PriceTable:
                 "a usage report does not carry per-request prompt length, so it cannot be "
                 "priced (docs/costs.md, decision C2)"
             )
-        kind = _non_first_party_kind(model)
+        kind = non_first_party_kind(model)
         if kind is not None:
             raise NonFirstPartyModelError(
                 f"model {model!r} ({provider}) looks like a {kind} id; the price table holds "
@@ -254,10 +281,17 @@ _D = Decimal
 
 
 def _anthropic(model: str, inp: str, out: str, read: str, write: str, *aliases: str) -> ModelPrice:
+    # `write` is the 5-minute cache write (1.25x input); a 1-hour cache write costs 2x input.
     return ModelPrice(
         Provider.ANTHROPIC,
         model,
-        TokenPrices(input=_D(inp), output=_D(out), cache_read=_D(read), cache_write=_D(write)),
+        TokenPrices(
+            input=_D(inp),
+            output=_D(out),
+            cache_read=_D(read),
+            cache_write=_D(write),
+            cache_write_1h=2 * _D(inp),
+        ),
         aliases,
     )
 
@@ -268,7 +302,13 @@ def _openai(model: str, inp: str, out: str, cached: str) -> ModelPrice:
     return ModelPrice(
         Provider.OPENAI,
         model,
-        TokenPrices(input=_D(inp), output=_D(out), cache_read=_D(cached), cache_write=_D(inp)),
+        TokenPrices(
+            input=_D(inp),
+            output=_D(out),
+            cache_read=_D(cached),
+            cache_write=_D(inp),
+            cache_write_1h=_D(inp),
+        ),
     )
 
 
@@ -277,7 +317,8 @@ OPENAI_PRICING_URL = "https://developers.openai.com/api/docs/pricing"
 
 # Anthropic: source ANTHROPIC_PRICING_URL, checked 2026-11-20. Standard global routing.
 # Columns: input, output, cache read (hits and refreshes), cache write at the 5-minute TTL.
-# Not modelled: 1-hour cache writes (2x input), batch (-50%), fast mode, inference_geo="us"
+# The 1-hour cache write (2x input) is computed in _anthropic (decision C1).
+# Not modelled: batch (-50%), fast mode, inference_geo="us"
 # (1.1x). Retired models (Opus 4.1, Opus 4, Sonnet 4) and Mythos are left out on purpose.
 _ANTHROPIC = (
     _anthropic("claude-fable-5-2", "8", "40", "0.20", "10"),

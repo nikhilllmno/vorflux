@@ -23,6 +23,7 @@ from typing import Protocol, runtime_checkable
 from uuid import UUID
 
 from harness.costs.caps import (
+    USAGE_UNPRICED,
     CapDecision,
     Spend,
     SpendCaps,
@@ -30,7 +31,7 @@ from harness.costs.caps import (
     check_run_spend,
     utc_day,
 )
-from harness.costs.prices import PRICE_BOOK, PriceBook, Provider, UnpricedUsageError
+from harness.costs.prices import PRICE_BOOK, PriceBook, Provider, Serving, UnpricedUsageError
 from harness.costs.pricing import check_sdk_cost, cost_usd
 from harness.costs.usage import UsageKey, UsageReport, idempotency_key, quantize_usd
 from harness.tenancy import TenantContext
@@ -79,11 +80,13 @@ class CostRow:
     run_id: UUID
     segment_id: str
     provider: Provider
+    serving: Serving
     model: str  # the exact id the runtime reported
     input_tokens: int
     output_tokens: int
     cache_read_tokens: int
     cache_write_tokens: int
+    cache_write_1h_tokens: int | None  # None when the TTL split is unknown
     web_search_requests: int
     pricing_status: PricingStatus
     unpriced_reason: str | None  # set only when unpriced
@@ -140,6 +143,14 @@ class RecordResult:
             return True
         return any(d is not None and not d.allowed for d in (self.run_cap, self.hotel_daily_cap))
 
+    @property
+    def failure_code(self) -> str | None:
+        """USAGE_UNPRICED when unpriced usage stops the run, else None.
+
+        A cap deny is BUDGET_EXHAUSTED in runtime contract v2; the orchestrator owns that code.
+        """
+        return USAGE_UNPRICED if self.run_spend.unpriced_rows else None
+
 
 def utc_now() -> datetime:
     return datetime.now(UTC)
@@ -182,11 +193,13 @@ def build_cost_row(
         run_id=report.run_id,
         segment_id=report.segment_id,
         provider=report.provider,
+        serving=report.serving,
         model=report.model,
         input_tokens=report.input_tokens,
         output_tokens=report.output_tokens,
         cache_read_tokens=report.cache_read_tokens,
         cache_write_tokens=report.cache_write_tokens,
+        cache_write_1h_tokens=report.cache_write_1h_tokens,
         web_search_requests=report.web_search_requests,
         pricing_status=PricingStatus.PRICED if cost is not None else PricingStatus.UNPRICED,
         unpriced_reason=reason,
@@ -225,7 +238,9 @@ class CostLedger(Protocol):
 
 def _same_usage(row: CostRow, report: UsageReport) -> bool:
     return (
-        row.input_tokens == report.input_tokens
+        row.serving == report.serving
+        and row.cache_write_1h_tokens == report.cache_write_1h_tokens
+        and row.input_tokens == report.input_tokens
         and row.output_tokens == report.output_tokens
         and row.cache_read_tokens == report.cache_read_tokens
         and row.cache_write_tokens == report.cache_write_tokens
@@ -237,12 +252,16 @@ def _same_usage(row: CostRow, report: UsageReport) -> bool:
 def _spend(rows: Iterable[CostRow]) -> Spend:
     priced = Decimal(0)
     unpriced = 0
+    unpriced_runs: set[UUID] = set()
     for row in rows:
         if row.cost_usd is None:
             unpriced += 1
+            unpriced_runs.add(row.run_id)
         else:
             priced += row.cost_usd
-    return Spend(priced_usd=quantize_usd(priced), unpriced_rows=unpriced)
+    return Spend(
+        priced_usd=quantize_usd(priced), unpriced_rows=unpriced, unpriced_runs=len(unpriced_runs)
+    )
 
 
 def _on_day(row: CostRow, day: date | None) -> bool:

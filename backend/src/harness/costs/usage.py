@@ -7,7 +7,8 @@ disjoint:
 - input_tokens: input tokens billed at the base input rate (not read from or written to cache)
 - output_tokens: output tokens, including reasoning/thinking tokens
 - cache_read_tokens: input tokens served from the prompt cache
-- cache_write_tokens: input tokens written to the prompt cache
+- cache_write_tokens: input tokens written to the prompt cache, at any TTL
+  (cache_write_1h_tokens, when known, is the 1-hour part of it, not a separate bucket)
 
 The OpenAI Agents SDK reports `input_tokens` with cached tokens included, so the OpenAI adapter
 must send `input_tokens - cached_tokens` as input_tokens (docs/costs.md, "Adapter notes").
@@ -26,7 +27,7 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator, model_validator
 
-from harness.costs.prices import Provider
+from harness.costs.prices import Provider, Serving
 
 logger = logging.getLogger("harness.costs")
 
@@ -74,11 +75,16 @@ class UsageReport(BaseModel):
     run_id: UUID
     segment_id: Annotated[str, Field(min_length=1, max_length=200)]
     provider: Provider
+    # Who served the request. Only first_party usage is priced (decision C13).
+    serving: Serving
     model: Annotated[str, Field(min_length=1, max_length=200)]
     input_tokens: TokenCount
     output_tokens: TokenCount
     cache_read_tokens: TokenCount
     cache_write_tokens: TokenCount
+    # Optional. The 1-hour TTL part of cache_write_tokens. None means the split is unknown,
+    # and every cache write is priced at the 1-hour rate (decision C1).
+    cache_write_1h_tokens: TokenCount | None = None
     # Optional. Server-side web search calls, which the price table does not price yet
     # (docs/costs.md, decision C12): a report with any is recorded unpriced.
     web_search_requests: TokenCount = 0
@@ -102,6 +108,17 @@ class UsageReport(BaseModel):
                 data["sdk_reported_cost_usd"],
             )
         return {**data, "sdk_reported_cost_usd": cost}
+
+    @model_validator(mode="after")
+    def _one_hour_writes_are_a_subset(self) -> UsageReport:
+        if self.cache_write_1h_tokens is not None and (
+            self.cache_write_1h_tokens > self.cache_write_tokens
+        ):
+            raise ValueError(
+                f"cache_write_1h_tokens ({self.cache_write_1h_tokens}) must not be more than "
+                f"cache_write_tokens ({self.cache_write_tokens})"
+            )
+        return self
 
     @field_validator("segment_id", "model")
     @classmethod
