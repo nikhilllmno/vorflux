@@ -178,22 +178,26 @@ def _unpriced(run_id: UUID) -> UsageReport:
     return UsageReport.model_validate(payload)
 
 
-def test_unpriced_usage_counts_as_over_every_cap() -> None:
-    # Review F2: spend that cannot be priced is unknown, so the caps fail closed.
+def test_unpriced_usage_denies_its_run_cap_but_not_the_hotel_daily_cap() -> None:
+    # Re-review N1 (owner decision C11, option a): the run with unpriced usage stops; the
+    # hotel daily cap counts priced spend only, so the hotel's other runs continue.
     runs, clock = Runs(), Clock()
     ledger = InMemoryCostLedger(runs, clock=clock)
-    run = runs.add()
+    run, other = runs.add(), runs.add()
     ledger.record(_unpriced(run))
+    ledger.record(_usage(other, "seg-1", 3))
     t = _tenant()
     run_cap = check_run_cap(ledger, t, run, Decimal("1000"))
+    assert not run_cap.allowed
+    assert run_cap.unpriced_rows == 1
+    assert "unpriced" in run_cap.reason
+    assert check_run_cap(ledger, t, other, Decimal("1000")).allowed
     daily_cap = check_hotel_daily_cap(ledger, t, Decimal("1000"), now=clock())
-    for decision in (run_cap, daily_cap):
-        assert not decision.allowed
-        assert decision.unpriced_rows == 1
-        assert "unpriced" in decision.reason
-    # The next UTC day starts clean for new runs; the run itself stays stopped.
+    assert daily_cap.allowed
+    assert daily_cap.spent_usd == Decimal("3")
+    assert check_hotel_daily_cap(ledger, t, Decimal("3"), now=clock()).allowed is False
+    # The run itself stays stopped on later days.
     clock.now += timedelta(days=1)
-    assert check_hotel_daily_cap(ledger, t, Decimal("1000"), now=clock()).allowed
     assert not check_run_cap(ledger, t, run, Decimal("1000")).allowed
 
 

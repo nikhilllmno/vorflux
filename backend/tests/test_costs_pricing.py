@@ -1,7 +1,7 @@
 """cost_usd: one price table for both providers, exact Decimal math, SDK cost as a cross-check."""
 
 import logging
-from datetime import date
+from datetime import UTC, date, datetime
 from decimal import Decimal
 from typing import Any
 from uuid import UUID
@@ -11,6 +11,8 @@ import pytest
 from harness.costs import (
     COST_QUANTUM,
     ModelPrice,
+    NoPriceTableError,
+    PriceBook,
     PriceTable,
     Provider,
     SdkCostCheck,
@@ -210,3 +212,43 @@ def test_tiny_absolute_differences_are_not_mismatches() -> None:
 def test_sdk_cost_of_zero_against_real_usage_is_a_mismatch() -> None:
     report = _report(input_tokens=1_000_000, sdk_reported_cost_usd="0")
     assert check_sdk_cost(report, cost_usd(report)) is SdkCostCheck.MISMATCH
+
+
+def _book() -> PriceBook:
+    def table(version: str, effective: date, price: str) -> PriceTable:
+        p = Decimal(price)
+        prices = TokenPrices(input=p, output=p, cache_read=p, cache_write=p)
+        return PriceTable(
+            version=version,
+            effective_from=effective,
+            source_urls={},
+            entries=[ModelPrice(Provider.ANTHROPIC, "claude-sonnet-4-6", prices)],
+        )
+
+    return PriceBook([table("v1", date(2026, 11, 1), "3"), table("v2", date(2026, 12, 1), "2")])
+
+
+def test_price_usage_picks_the_table_by_date_like_the_ledger() -> None:
+    # Re-review N4: a running estimate and the final row use the same table.
+    counts = {
+        "input_tokens": 1_000_000,
+        "output_tokens": 0,
+        "cache_read_tokens": 0,
+        "cache_write_tokens": 0,
+    }
+    book = _book()
+    old = datetime(2026, 11, 30, 23, 59, tzinfo=UTC)
+    new = datetime(2026, 12, 1, tzinfo=UTC)
+    assert price_usage(Provider.ANTHROPIC, "claude-sonnet-4-6", at=old, prices=book, **counts) == 3
+    assert price_usage(Provider.ANTHROPIC, "claude-sonnet-4-6", at=new, prices=book, **counts) == 2
+    with pytest.raises(NoPriceTableError):
+        price_usage(
+            Provider.ANTHROPIC,
+            "claude-sonnet-4-6",
+            at=datetime(2026, 10, 31, tzinfo=UTC),
+            prices=book,
+            **counts,
+        )
+    assert check_priced(Provider.ANTHROPIC, "claude-sonnet-4-6", at=new, prices=book).model == (
+        "claude-sonnet-4-6"
+    )

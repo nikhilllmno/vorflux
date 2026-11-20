@@ -27,7 +27,9 @@ from harness.costs import (
     SpendCaps,
     TokenPrices,
     UnknownRunError,
+    UnpricedUsageAlert,
     UsageReport,
+    check_run_models,
 )
 from harness.tenancy import TenantContext
 
@@ -268,6 +270,7 @@ def test_unpriced_usage_keeps_its_tokens_and_stops_the_run(
     assert ledger.run_spend(t, run).unpriced_rows == 1
     assert ledger.hotel_spend(t).unpriced_rows == 1
     assert any(reason in r.getMessage() for r in caplog.records)
+    assert [a.reason for a in ledger.unpriced_models(t)] == [reason]
     # A resend of the same report is still a duplicate, and still says stop.
     again = ledger.record(usage)
     assert again.status is RecordStatus.DUPLICATE
@@ -434,3 +437,104 @@ def test_clock_must_be_timezone_aware(runs: StaticRuns, report: ReportFactory) -
     naive = InMemoryCostLedger(runs, clock=lambda: datetime(2026, 11, 20, 10, 0))
     with pytest.raises(ValueError, match="timezone"):
         naive.record(report(run))
+
+
+def test_unpriced_row_stops_only_its_own_run(
+    ledger: InMemoryCostLedger, runs: StaticRuns, report: ReportFactory
+) -> None:
+    # Re-review N1 (C11 option a): other runs of the hotel, including runs in flight, go on.
+    caps = SpendCaps(run_usd=Decimal("100"), hotel_daily_usd=Decimal("10"))
+    bad, in_flight = runs.add(ORG_A, HOTEL_A1), runs.add(ORG_A, HOTEL_A1)
+    ledger.record(report(in_flight, input_tokens=1_000_000), caps=caps)  # 3 USD
+    stopped = ledger.record(report(bad, model="claude-imaginary-9"), caps=caps)
+    assert stopped.stop_run
+    assert stopped.run_cap is not None and not stopped.run_cap.allowed
+    assert stopped.hotel_daily_cap is not None and stopped.hotel_daily_cap.allowed
+    going = ledger.record(report(in_flight, segment_id="seg-2"), caps=caps)  # 6 USD
+    assert not going.stop_run
+    assert going.hotel_daily_cap is not None
+    assert going.hotel_daily_cap.spent_usd == Decimal("6")
+    assert going.hotel_daily_cap.allowed
+    # The daily cap still stops runs on priced spend.
+    over = ledger.record(report(in_flight, segment_id="seg-3", input_tokens=2_000_000), caps=caps)
+    assert over.stop_run
+
+
+def test_unpriced_row_raises_one_alert(
+    runs: StaticRuns, report: ReportFactory, clock: Clock, caplog: pytest.LogCaptureFixture
+) -> None:
+    alerts: list[UnpricedUsageAlert] = []
+    ledger = InMemoryCostLedger(runs, clock=clock, on_unpriced=alerts.append)
+    run = runs.add(ORG_A, HOTEL_A1)
+    usage = report(run, model="claude-imaginary-9")
+    with caplog.at_level(logging.WARNING, logger="harness.costs"):
+        ledger.record(usage)
+        ledger.record(usage)  # a duplicate does not alert again
+        ledger.record(report(run, segment_id="seg-2"))  # priced: no alert
+    assert alerts == [
+        UnpricedUsageAlert(
+            org_id=ORG_A,
+            hotel_id=HOTEL_A1,
+            run_id=run,
+            segment_id="seg-1",
+            provider=Provider.ANTHROPIC,
+            model="claude-imaginary-9",
+            reason="unknown_model",
+            recorded_at=clock.now,
+        )
+    ]
+    events = [r for r in caplog.records if "unpriced_usage_alert" in r.getMessage()]
+    assert len(events) == 1
+    assert events[0].levelno == logging.ERROR
+
+
+def test_a_failing_alert_hook_does_not_lose_the_row(
+    runs: StaticRuns, report: ReportFactory, clock: Clock, caplog: pytest.LogCaptureFixture
+) -> None:
+    def broken(alert: UnpricedUsageAlert) -> None:
+        raise RuntimeError("notifier down")
+
+    ledger = InMemoryCostLedger(runs, clock=clock, on_unpriced=broken)
+    run = runs.add(ORG_A, HOTEL_A1)
+    with caplog.at_level(logging.ERROR, logger="harness.costs"):
+        result = ledger.record(report(run, model="claude-imaginary-9"))
+    assert result.status is RecordStatus.RECORDED
+    assert result.stop_run
+    assert len(ledger.run_rows(tenant(ORG_A, HOTEL_A1), run)) == 1
+    assert any("alert hook failed" in r.getMessage() for r in caplog.records)
+
+
+def test_pre_run_check_refuses_an_unpriced_model_until_the_table_covers_it(
+    runs: StaticRuns, report: ReportFactory, clock: Clock
+) -> None:
+    # Re-review N1: the exact model id is refused for the hotel; other models continue; the
+    # refusal clears by itself when a price table that prices the id takes effect.
+    book = PriceBook(
+        [
+            _table("v1", date(2026, 11, 1), "3", "claude-sonnet-4-6"),
+            _table("v2", date(2026, 12, 1), "2", "claude-sonnet-4-6", "claude-new-6"),
+        ]
+    )
+    ledger = InMemoryCostLedger(runs, prices=book, clock=clock)
+    t = tenant(ORG_A, HOTEL_A1)
+    clock.now = datetime(2026, 11, 30, 12, tzinfo=UTC)
+    ledger.record(report(runs.add(ORG_A, HOTEL_A1), model="claude-new-6"))
+    ledger.record(report(runs.add(ORG_A, HOTEL_A1), segment_id="ws", web_search_requests=2))
+    new = (Provider.ANTHROPIC, "claude-new-6")
+    known = (Provider.ANTHROPIC, "claude-sonnet-4-6")
+
+    check = check_run_models(ledger, t, [new, known], now=clock.now, prices=book)
+    assert not check.allowed
+    [refused] = check.refused
+    assert (refused.provider, refused.model, refused.reason) == (*new, "unknown_model")
+    assert refused.seen_unpriced  # this hotel already ran it unpriced
+    # The model of the web search row is priced, so it is not refused: only that run stopped.
+    assert check_run_models(ledger, t, [known], now=clock.now, prices=book).allowed
+    # Another hotel never ran the id, but the table still cannot price it.
+    other = check_run_models(ledger, tenant(ORG_A, HOTEL_A2), [new], now=clock.now, prices=book)
+    assert not other.allowed
+    assert not other.refused[0].seen_unpriced
+    # v2 prices the id from 2026-12-01 UTC: the refusal clears with no manual step.
+    assert check_run_models(
+        ledger, t, [new, known], now=datetime(2026, 12, 1, tzinfo=UTC), prices=book
+    ).allowed
