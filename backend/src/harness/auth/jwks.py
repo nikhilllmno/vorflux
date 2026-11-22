@@ -13,7 +13,8 @@ Cache rules (docs/auth.md, "Signing keys"):
   random kids cannot turn the API into a JWKS request amplifier. Concurrent callers share a
   single fetch.
 - Each fetch has a total deadline (`fetch_timeout_seconds`, default 10 s), not only a timeout per
-  socket operation.
+  socket operation. `HttpJwksFetcher` also stops its own worker thread at a shorter deadline
+  (8 s), so a slow endpoint cannot leave fetch threads running.
 - If a refresh fails, or returns a document with no usable key, the last good keys stay in use
   for up to `max_stale_seconds` after they were fetched. With no usable keys (none fetched yet,
   or the last good ones too old), verification raises `JwksUnavailableError` (HTTP 503).
@@ -22,13 +23,17 @@ Cache rules (docs/auth.md, "Signing keys"):
 """
 
 import asyncio
+import contextlib
+import http.client
 import json
 import logging
+import socket
+import ssl
+import threading
 import time
-import urllib.request
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Protocol
 from urllib.parse import urlsplit
 
 from jwt import PyJWK, PyJWKError
@@ -170,6 +175,10 @@ class JwksCache:
         if self._background is not None:
             await self._background
 
+    @property
+    def fetch_timeout_seconds(self) -> float:
+        return self._fetch_timeout
+
     def _start_background_refresh(self) -> None:
         if self._background is None or self._background.done():
             self._background = asyncio.create_task(self._refresh(self._attempts))
@@ -217,33 +226,92 @@ class JwksCache:
                 self._attempts += 1
 
 
-class _NoRedirect(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, *args: Any, **kwargs: Any) -> None:
-        return None  # a redirect is an error: never follow it to another host or scheme
-
-
 class HttpJwksFetcher:
-    """Fetches the JWKS over HTTPS (or plain HTTP for a local stack; config.py checks which)."""
+    """Fetches the JWKS over HTTPS (or plain HTTP for a local stack; config.py checks which).
 
-    def __init__(self, url: str, *, timeout_seconds: float = 5.0, max_bytes: int = 64 * 1024):
-        if urlsplit(url).scheme not in ("https", "http"):
-            raise ValueError("JWKS URL must be http(s)")
+    Bounds on one fetch:
+
+    - `timeout_seconds` per socket operation (connect, each read).
+    - `total_seconds` for the whole fetch. At the deadline a timer shuts the socket down, so the
+      worker thread ends even when the server sends one byte just inside each socket timeout.
+      Keep it below `JwksCache.fetch_timeout_seconds`, so that a thread never outlives the wait
+      for it and fetch threads cannot pile up.
+    - `max_bytes` for the body. Redirects are not followed (`http.client` never follows them).
+    """
+
+    def __init__(
+        self,
+        url: str,
+        *,
+        timeout_seconds: float = 5.0,
+        total_seconds: float = 8.0,
+        max_bytes: int = 64 * 1024,
+    ) -> None:
+        parts = urlsplit(url)
+        if parts.scheme not in ("https", "http") or not parts.hostname:
+            raise ValueError("JWKS URL must be an absolute http(s) URL")
+        if timeout_seconds <= 0 or total_seconds <= 0 or max_bytes <= 0:
+            raise ValueError("JWKS fetch limits must be positive")
         self._url = url
         self._timeout = timeout_seconds
+        self._total = total_seconds
         self._max_bytes = max_bytes
-        self._opener = urllib.request.build_opener(_NoRedirect)
+
+    @property
+    def total_seconds(self) -> float:
+        return self._total
 
     async def fetch(self) -> object:
         return await asyncio.to_thread(self._fetch_sync)
 
+    def _connection(self) -> http.client.HTTPConnection:
+        parts = urlsplit(self._url)
+        host, port = parts.hostname or "", parts.port
+        if parts.scheme == "https":
+            context = ssl.create_default_context()  # verifies the certificate and host name
+            return http.client.HTTPSConnection(host, port, timeout=self._timeout, context=context)
+        return http.client.HTTPConnection(host, port, timeout=self._timeout)
+
     def _fetch_sync(self) -> object:
-        request = urllib.request.Request(  # noqa: S310 - the scheme is checked in __init__
-            self._url, headers={"Accept": "application/json", "User-Agent": "harness-auth"}
-        )
-        with self._opener.open(request, timeout=self._timeout) as response:
+        parts = urlsplit(self._url)
+        path = (parts.path or "/") + (f"?{parts.query}" if parts.query else "")
+        connection = self._connection()
+        expired = threading.Event()
+        # `getresponse()` can drop `connection.sock` while the response still reads from it,
+        # so the timer keeps its own reference to the socket.
+        opened: list[socket.socket] = []
+
+        def stop() -> None:
+            expired.set()
+            for sock in opened:
+                with contextlib.suppress(OSError):
+                    sock.shutdown(socket.SHUT_RDWR)  # wakes a read that is blocked right now
+
+        timer = threading.Timer(self._total, stop)
+        timer.daemon = True
+        timer.start()
+        try:
+            connection.connect()
+            if connection.sock is not None:
+                opened.append(connection.sock)
+            if expired.is_set():  # the deadline passed while the socket was being opened
+                raise TimeoutError("JWKS fetch exceeded its total deadline")
+            connection.request(
+                "GET", path, headers={"Accept": "application/json", "User-Agent": "harness-auth"}
+            )
+            response = connection.getresponse()
             if response.status != 200:
                 raise OSError(f"JWKS endpoint returned HTTP {response.status}")
-            body: bytes = response.read(self._max_bytes + 1)
+            body = response.read(self._max_bytes + 1)
+        except Exception:
+            if expired.is_set():
+                raise TimeoutError("JWKS fetch exceeded its total deadline") from None
+            raise
+        finally:
+            timer.cancel()
+            connection.close()
+        if expired.is_set():
+            raise TimeoutError("JWKS fetch exceeded its total deadline")
         if len(body) > self._max_bytes:
             raise ValueError("JWKS document is too large")
         return json.loads(body)

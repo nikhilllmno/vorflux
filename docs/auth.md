@@ -73,8 +73,11 @@ standby key before Supabase Auth signs with it
   is on the server side, not in the user's token.
 - It keeps only signature keys of type `RSA` (RS256, at least 2048 bits) and `EC` on P-256
   (ES256). It never uses a symmetric (`oct`) key. A `kid` that is listed twice is ignored.
-- The HTTP fetcher uses HTTPS, does not follow redirects, has a 5 second timeout per socket
-  operation and a 10 second total deadline per fetch, and refuses a document larger than 64 KiB. Settings allow plain HTTP only for `127.0.0.1`, `localhost` or
+- The HTTP fetcher uses HTTPS (certificate and host name verified), does not follow redirects,
+  has a 5 second timeout per socket operation, and refuses a document larger than 64 KiB. Its
+  worker thread stops at an 8 second total deadline (a timer shuts the socket down), and the
+  cache stops waiting at 10 seconds, so a slow endpoint cannot leave fetch threads running. It
+  connects directly and does not use `HTTPS_PROXY`. Settings allow plain HTTP only for `127.0.0.1`, `localhost` or
   `::1` when `HARNESS_ENVIRONMENT` is `local` or `test`.
 
 ### Why there is no HS256 fallback
@@ -246,7 +249,7 @@ Each decision has a safe default, which is what this PR builds.
 | A4 | Effective role with several memberships | The highest covering role (org-wide or this hotel), as PR #5 RLS. | (b) The hotel-scoped row wins over the org-wide row. |
 | A5 | Anonymous Supabase sign-ins | Refused (`is_anonymous`). | (b) Accept them; they still need a membership to reach a hotel. |
 | A6 | Membership caching | None: one indexed query per request, so removal is immediate. | (b) Cache for up to 30 s. |
-| A7 | JWKS timing | Cache 10 min, refreshed in the background (cached kids never wait); refetch for an unknown kid at most every 30 s; 10 s total deadline per fetch; last good keys for up to 1 h when the endpoint fails **or** returns no usable key. After an urgent key revocation, restart the API to drop the cache. | (b) Shorter cache; (c) fail closed at once on a refresh failure or an empty JWKS. |
+| A7 | JWKS timing | Cache 10 min, refreshed in the background (cached kids never wait); refetch for an unknown kid at most every 30 s; 10 s total deadline per fetch (the fetch thread itself stops at 8 s); last good keys for up to 1 h when the endpoint fails **or** returns no usable key. After an urgent key revocation, restart the API to drop the cache. | (b) Shorter cache; (c) fail closed at once on a refresh failure or an empty JWKS. |
 | A8 | Postgres driver for the provider (follow-up) | `psycopg` (already in PR #5 as a dev dependency) becomes a runtime dependency. | (b) `asyncpg`. |
 | A9 | `SUPABASE_JWT_ISSUER` in `.env.example` | Keep it until PR #5 merges, then remove it in the PR #5 follow-up (removing it now would conflict with PR #5). | (b) Read it as an alias of `HARNESS_AUTH_ISSUER`. |
 | A10 | Minimum role per action | The table in "Roles". | Change a row. |
@@ -258,7 +261,7 @@ Each decision has a safe default, which is what this PR builds.
 | File | What it proves |
 |---|---|
 | `test_auth_tokens.py` | Valid ES256 and RS256 tokens; expired, no `exp`, `nbf` and `iat` in the future, no `iat`; wrong or missing `iss` and `aud`; another key with our `kid`, tampered payload, embedded `jwk` header; malformed and oversized tokens; `alg: none` in any case; HS256 signed with the public key; a symmetric key in the JWKS; header `alg` that does not match the key type or the JWK `alg`; an encryption key; an algorithm outside the allow-list; a `crit` header with an unknown or bad extension; no `kid`; bad `sub`, non-user `role`, anonymous sessions. |
-| `test_auth_jwks.py` | One fetch for many tokens; refetch after the TTL; rotation (a new `kid` causes one refetch and verifies; the old key stays valid while published, and is refused after it is removed); unknown-kid refetch rate limit; 10 concurrent requests share one fetch; after the TTL, 20 requests with a cached kid get keys at once while one background refresh waits on a hanging endpoint; a hanging fetch hits the total deadline and does not block later refreshes; outage: 503 with no keys, last good keys up to max stale, retries rate-limited; a JWKS with no usable key is 503 at first fetch, keeps the last good keys on a refresh, and an unknown kid next to usable keys is 401; malformed documents; only asymmetric signature keys are kept. |
+| `test_auth_jwks.py` | One fetch for many tokens; refetch after the TTL; rotation (a new `kid` causes one refetch and verifies; the old key stays valid while published, and is refused after it is removed); unknown-kid refetch rate limit; 10 concurrent requests share one fetch; after the TTL, 20 requests with a cached kid get keys at once while one background refresh waits on a hanging endpoint; a hanging fetch hits the total deadline and does not block later refreshes; the fetch thread stops at its own deadline on a slow drip and on a stall; outage: 503 with no keys, last good keys up to max stale, retries rate-limited; a JWKS with no usable key is 503 at first fetch, keeps the last good keys on a refresh, and an unknown kid next to usable keys is 401; malformed documents; only asymmetric signature keys are kept. |
 | `test_auth_memberships.py` | In-memory provider: org-wide and hotel-scoped scope, hotel of another org, highest role wins, PR #5 constraints, removal. |
 | `test_auth_api.py` | HTTP edge: 200 with the context; 401 for missing, malformed and bad tokens, before any membership check and before path validation; 403 for no membership, cross-org (including another org's hotel under your own org), cross-hotel; identical 403 bodies whether the org or hotel exists or not; role too low looks the same as no membership; hotel admin rights do not carry to other hotels; removal takes effect at once; 503 when auth, the provider or the JWKS is missing, and for the in-memory provider in staging and production; every 503 has the same body. |
 | `test_auth_config.py` | Settings defaults, env variable names, empty variables, refused algorithms, blank issuer or audience, `local` or `test` refused on Fly.io, issuer and JWKS URL set together, HTTPS rule, the HTTP fetcher (size cap, no redirects) and an end-to-end app that builds its verifier from settings and fetches the JWKS once. |
