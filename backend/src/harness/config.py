@@ -48,15 +48,13 @@ class Settings(BaseSettings):
             raise ValueError("set HARNESS_AUTH_ISSUER and HARNESS_AUTH_JWKS_URL together")
         if self.auth_issuer is not None and not self.auth_issuer.strip():
             raise ValueError("HARNESS_AUTH_ISSUER cannot be blank")
+        if not self.auth_audience.strip():
+            raise ValueError("HARNESS_AUTH_AUDIENCE cannot be blank")
         if self.auth_jwks_url is not None:
             _check_jwks_url(
                 self.auth_jwks_url, allow_local_http=self.environment in ("local", "test")
             )
         return self
-
-    @property
-    def auth_configured(self) -> bool:
-        return self.auth_issuer is not None and self.auth_jwks_url is not None
 
 
 def _check_jwks_url(url: str, *, allow_local_http: bool) -> None:

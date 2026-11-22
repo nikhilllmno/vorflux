@@ -29,11 +29,9 @@ from harness.auth.jwks import JwksUnavailableError
 from harness.auth.memberships import InMemoryMembershipProvider, MembershipProvider
 from harness.auth.tokens import AuthenticatedUser, InvalidTokenError, TokenVerifier
 from harness.config import Settings
-from harness.tenancy import Action, TenantContext, min_role_for
+from harness.tenancy import Action, TenantContext
 
 logger = logging.getLogger(__name__)
-
-_FORBIDDEN = "forbidden"
 
 
 def _unauthorized(*, invalid_token: bool) -> HTTPException:
@@ -111,7 +109,6 @@ def require_tenant(action: Action) -> Callable[..., Awaitable[TenantContext]]:
     The org and hotel come from the `org_id` and `hotel_id` path parameters. The same callable
     is returned for the same action, so `app.dependency_overrides` can target it.
     """
-    minimum = min_role_for(action)
 
     async def tenant_for_request(
         user: AuthenticatedUserDep,
@@ -120,10 +117,11 @@ def require_tenant(action: Action) -> Callable[..., Awaitable[TenantContext]]:
         hotel_id: Annotated[UUID, Path()],
     ) -> TenantContext:
         role = await provider.role_for(user.user_id, org_id, hotel_id)
-        if role is None or not role.at_least(minimum):
+        tenant = TenantContext(org_id=org_id, hotel_id=hotel_id, actor_id=user.user_id, role=role)
+        if not tenant.allows(action):  # no role, or below the action's minimum
             logger.info("denied %s for user %s (role %s)", action, user.user_id, role)
-            raise HTTPException(status.HTTP_403_FORBIDDEN, _FORBIDDEN)
-        return TenantContext(org_id=org_id, hotel_id=hotel_id, actor_id=user.user_id, role=role)
+            raise HTTPException(status.HTTP_403_FORBIDDEN, "forbidden")
+        return tenant
 
     tenant_for_request.__name__ = f"require_tenant_{action.value}"
     return tenant_for_request

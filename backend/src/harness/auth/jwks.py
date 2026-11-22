@@ -12,7 +12,8 @@ Cache rules (docs/auth.md, "Signing keys"):
   random kids cannot turn the API into a JWKS request amplifier. Concurrent callers share a
   single fetch.
 - If a refresh fails, the last good keys stay in use for up to `max_stale_seconds` after they
-  were fetched. With no usable keys, verification raises `JwksUnavailableError` (HTTP 503).
+  were fetched. With no usable keys (none fetched, too old, or a document with no usable key),
+  verification raises `JwksUnavailableError` (HTTP 503).
 - Only asymmetric signature keys are kept: `RSA` (RS256, at least 2048 bits) and `EC` on P-256
   (ES256). A symmetric (`oct`) key is never used, even if the document lists one.
 """
@@ -165,8 +166,8 @@ class JwksCache:
         return self._attempted_at is None or self._clock() - self._attempted_at >= self._min_refetch
 
     def _usable_keys(self) -> dict[str, VerificationKey]:
-        if self._keys is None:
-            raise JwksUnavailableError("signing keys have not been fetched")
+        if not self._keys:
+            raise JwksUnavailableError("no usable signing key has been fetched")
         if self._age() > self._max_stale:
             raise JwksUnavailableError("signing keys are too old and cannot be refreshed")
         return self._keys

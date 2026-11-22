@@ -64,7 +64,8 @@ standby key before Supabase Auth signs with it
   `HARNESS_AUTH_JWKS_MIN_REFETCH_SECONDS` (default 30). Forged tokens with random kids cannot turn
   the API into a JWKS request amplifier. Concurrent requests share one fetch.
 - If a refresh fails, the last good keys stay in use for up to 1 hour after they were fetched.
-  With no usable keys, the API returns 503.
+  With no usable keys (none fetched, too old, or a JWKS that lists no usable key), the API
+  returns 503, not 401: the fault is on the server side, not in the user's token.
 - It keeps only signature keys of type `RSA` (RS256, at least 2048 bits) and `EC` on P-256
   (ES256). It never uses a symmetric (`oct`) key. A `kid` that is listed twice is ignored.
 - The HTTP fetcher uses HTTPS, does not follow redirects, has a 5 second timeout, and refuses a
@@ -87,7 +88,7 @@ legacy secret can move to signing keys from the dashboard with no downtime. See 
 | 401, `WWW-Authenticate: Bearer error="invalid_token"` | The token fails any check | `not authenticated` |
 | 403 | No membership covers the hotel, the hotel is not in the org, the org or hotel does not exist, or the role is below the action's minimum | `forbidden` (identical in every case) |
 | 422 | A path id is not a UUID (only after the token is valid) | validation error |
-| 503 | Auth is not configured, no membership provider is set, the in-memory provider is set outside `local` or `test`, or no signing keys can be loaded | short reason |
+| 503 | Auth is not configured, no membership provider is set, the in-memory provider is set outside `local` or `test`, or no usable signing key can be loaded | short reason |
 
 - The token is checked before the path ids. A caller without a valid token always gets 401 and
   learns nothing about orgs or hotels.
@@ -184,7 +185,7 @@ follow-up PR:
 |---|---|---|
 | `HARNESS_AUTH_ISSUER` | unset | `https://<project-ref>.supabase.co/auth/v1`. Set it together with the JWKS URL. |
 | `HARNESS_AUTH_JWKS_URL` | unset | `<issuer>/.well-known/jwks.json`. HTTPS; plain HTTP only for a local stack. |
-| `HARNESS_AUTH_AUDIENCE` | `authenticated` | Supabase user tokens. |
+| `HARNESS_AUTH_AUDIENCE` | `authenticated` | Supabase user tokens. Cannot be blank. |
 | `HARNESS_AUTH_ALGORITHMS` | `["ES256","RS256"]` | JSON list. Only these two values are accepted. |
 | `HARNESS_AUTH_LEEWAY_SECONDS` | `10` | 0 to 60. |
 | `HARNESS_AUTH_JWKS_CACHE_SECONDS` | `600` | 30 to 86400. |
@@ -223,8 +224,8 @@ Each decision has a safe default, which is what this PR builds.
 | File | What it proves |
 |---|---|
 | `test_auth_tokens.py` | Valid ES256 and RS256 tokens; expired, no `exp`, `nbf` and `iat` in the future, no `iat`; wrong or missing `iss` and `aud`; another key with our `kid`, tampered payload, embedded `jwk` header; malformed and oversized tokens; `alg: none` in any case; HS256 signed with the public key; a symmetric key in the JWKS; header `alg` that does not match the key type or the JWK `alg`; an encryption key; an algorithm outside the allow-list; no `kid`; bad `sub`, non-user `role`, anonymous sessions. |
-| `test_auth_jwks.py` | One fetch for many tokens; refetch after the TTL; rotation (a new `kid` causes one refetch and verifies; the old key stays valid while published, and is refused after it is removed); unknown-kid refetch rate limit; 10 concurrent requests share one fetch; outage: 503 with no keys, last good keys up to max stale, retries rate-limited; malformed documents; only asymmetric signature keys are kept. |
+| `test_auth_jwks.py` | One fetch for many tokens; refetch after the TTL; rotation (a new `kid` causes one refetch and verifies; the old key stays valid while published, and is refused after it is removed); unknown-kid refetch rate limit; 10 concurrent requests share one fetch; outage: 503 with no keys, last good keys up to max stale, retries rate-limited; a JWKS with no usable key is 503 and an unknown kid next to usable keys is 401; malformed documents; only asymmetric signature keys are kept. |
 | `test_auth_memberships.py` | In-memory provider: org-wide and hotel-scoped scope, hotel of another org, highest role wins, PR #5 constraints, removal. |
 | `test_auth_api.py` | HTTP edge: 200 with the context; 401 for missing, malformed and bad tokens, before any membership check and before path validation; 403 for no membership, cross-org (including another org's hotel under your own org), cross-hotel; identical 403 bodies whether the org or hotel exists or not; role too low looks the same as no membership; hotel admin rights do not carry to other hotels; removal takes effect at once; 503 when auth, the provider or the JWKS is missing, and for the in-memory provider in staging and production. |
-| `test_auth_config.py` | Settings defaults, env variable names, empty variables, refused algorithms, issuer and JWKS URL set together, HTTPS rule, the HTTP fetcher (size cap) and an end-to-end app that builds its verifier from settings and fetches the JWKS once. |
+| `test_auth_config.py` | Settings defaults, env variable names, empty variables, refused algorithms, blank issuer or audience, issuer and JWKS URL set together, HTTPS rule, the HTTP fetcher (size cap, no redirects) and an end-to-end app that builds its verifier from settings and fetches the JWKS once. |
 | `test_tenancy.py` | Role ranks match PR #5, the minimum role per action, a context without a role allows nothing. |
