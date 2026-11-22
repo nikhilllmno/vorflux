@@ -5,7 +5,7 @@ Each PR description has the full detail.
 
 ## Merge order and check
 
-Merge in this order: #4, #5, #6, #7. Use a merge commit, as for #1 and #2.
+Merge in this order: #4, #5, #6, #7, then #9 (DEX-12, section below). Use a merge commit, as for #1 and #2.
 
 - I merged the four branches locally onto `main` at `17b91f0`, in this order. Each merge was clean.
 - Backend checks passed after each step. All five CI jobs passed on the combined result:
@@ -124,4 +124,39 @@ Merge in this order: #4, #5, #6, #7. Use a merge commit, as for #1 and #2.
   `runs` table (DEX-14). In the PR that adds `runs`, or right after it, `run_costs` becomes a migration.
   It then joins `TABLES` in `backend/tests/rls/world.py` and the table-coverage test.
 
-Reply 'use defaults' to accept every default above and merge in this order. That reply approves the defaults and the four merges only. It does not approve the first `supabase db push`, runbook step S5, or the DEX-9 required-check change (decision 16); each needs its own approval.
+## PR #9: request auth and TenantContext, DEX-12 ([description](https://github.com/nikhilllmno/vorflux/pull/9))
+
+- Changes: the API verifies Supabase access tokens against the project JWKS (ES256 and RS256 only;
+  `none`, HS256 and algorithm/key mismatches are refused) and builds a `TenantContext` (user, org,
+  hotel, role) per request through `require_tenant(action)`. 401 for a missing or bad token, one
+  identical 403 for every tenant denial, 503 when auth or the membership provider is not set.
+  Only an in-memory membership provider ships; tenant routes return 503 in a deployed app until the
+  Postgres provider lands. Adds `pyjwt[crypto]` and the `HARNESS_AUTH_*` names in `.env.example`.
+- Risk: medium-low (4/10, review). Security-sensitive code, but it fails closed, has no migration
+  or data, and no hosted environment sets `HARNESS_AUTH_*`. Only `/v1/orgs/{org_id}/hotels/{hotel_id}/me` uses it.
+- Merge order: after #7. I merged #9 locally onto `main` + #4 to #7 in that order (throwaway branch,
+  not pushed). The only conflict is `backend/uv.lock` (#5 adds `psycopg` at the same place in the
+  lock file). With the stack's lock file and `uv lock`, the backend checks pass: 725 passed, 893
+  database tests skipped (no local stack; #9 changes no SQL). Before you merge #9, ask me to merge
+  `main` into its branch; that regenerates the lock file. No other file conflicts.
+- Rollback: revert the PR. Nothing else calls the dependency yet.
+- Open decisions (default = what the PR builds; full table in `docs/auth.md`):
+  - A1 No HS256 shared-secret fallback; the hosted project uses asymmetric signing keys.
+  - A2 The tenant comes from the path `/v1/orgs/{org_id}/hotels/{hotel_id}/...`.
+  - A3 One identical 403 for every tenant denial; resource ids inside an allowed hotel stay 404.
+  - A4 Effective role = highest covering membership (org-wide or this hotel), as #5 RLS.
+  - A5 Anonymous Supabase sign-ins are refused.
+  - A6 No membership cache; a removed membership takes effect on the next request.
+  - A7 JWKS cache 10 min, unknown-kid refetch at most every 30 s, last good keys up to 1 h in an outage.
+  - A8 `psycopg` becomes a runtime dependency for the Postgres provider.
+  - A9 Remove the `SUPABASE_JWT_ISSUER` placeholder in the #5 follow-up.
+  - A10 Minimum role per action: viewer view; operator runs and changes; admin approval settings
+    and members; owner org.
+  - A11 Org-level routes (no hotel) come later.
+- Unblocked after merge (follow-up PRs, each right after the merge that unblocks it):
+  - After #5 and #9: `PostgresMembershipProvider` (one query on `memberships` joined to `hotels`) and
+    remove `SUPABASE_JWT_ISSUER` from `.env.example`.
+  - After #6 and #9: build PR #6's `Principal` from the verified user, gate the approval routes with
+    `require_tenant`, and make `approvals.model.HotelRole` an import of `harness.tenancy.HotelRole`.
+
+Reply 'use defaults' to accept every default above and merge in this order. That reply approves the defaults and the four merges (#4 to #7) only; #9 needs its own approval. It does not approve the first `supabase db push`, runbook step S5, or the DEX-9 required-check change (decision 16); each needs its own approval.
