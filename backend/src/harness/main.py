@@ -6,6 +6,7 @@ from typing import Any
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 
+import harness.auth.api
 from harness import __version__
 from harness.config import Settings, get_settings
 from harness.runtimes import FakeRuntime, RuntimeRegistry
@@ -29,6 +30,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         allow_methods=["GET", "POST"],
         allow_headers=["Authorization", "Content-Type"],
     )
+    # Tenant routes authenticate with `harness.auth.require_tenant` (docs/auth.md).
+    app.include_router(harness.auth.api.router)
 
     @app.get("/healthz")
     def healthz() -> dict[str, str]:
