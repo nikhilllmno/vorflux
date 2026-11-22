@@ -7,7 +7,13 @@ import pytest
 from auth_world import FakeClock, FakeJwksEndpoint, es256_key, mint, rs256_key, verifier
 from cryptography.hazmat.primitives.asymmetric import ec, rsa
 
-from harness.auth import InvalidTokenError, JwksUnavailableError, TokenVerifier, parse_jwks
+from harness.auth import (
+    InvalidTokenError,
+    JwksCache,
+    JwksUnavailableError,
+    TokenVerifier,
+    parse_jwks,
+)
 
 
 def accepts(check: TokenVerifier, token: str) -> bool:
@@ -34,16 +40,82 @@ def test_keys_are_refetched_after_the_cache_ttl() -> None:
     key = es256_key()
     endpoint, clock = FakeJwksEndpoint(), FakeClock()
     endpoint.publish(key)
-    check = verifier(endpoint, clock, ttl_seconds=600)
+    cache = JwksCache(endpoint, ttl_seconds=600, clock=clock)
 
-    assert accepts(check, mint(key))
-    clock.advance(599)
-    assert accepts(check, mint(key))
-    assert endpoint.calls == 1
+    async def scenario() -> None:
+        assert await cache.get(key.kid) is not None
+        clock.advance(599)
+        assert await cache.get(key.kid) is not None
+        await cache.wait_for_background_refresh()
+        assert endpoint.calls == 1
 
-    clock.advance(2)
-    assert accepts(check, mint(key))
-    assert endpoint.calls == 2
+        clock.advance(2)
+        assert await cache.get(key.kid) is not None
+        await cache.wait_for_background_refresh()
+        assert endpoint.calls == 2
+
+    asyncio.run(scenario())
+
+
+def test_stale_keys_are_served_while_one_refresh_runs_in_the_background() -> None:
+    """After the TTL, requests with a cached kid never wait for a slow JWKS endpoint."""
+    key = es256_key()
+    endpoint, clock = FakeJwksEndpoint(), FakeClock()
+    endpoint.publish(key)
+    cache = JwksCache(endpoint, ttl_seconds=600, clock=clock)
+
+    async def scenario() -> None:
+        assert await cache.get(key.kid) is not None
+        clock.advance(601)
+        endpoint.hold = asyncio.Event()  # the endpoint does not answer until released
+
+        found = await asyncio.wait_for(
+            asyncio.gather(*(cache.get(key.kid) for _ in range(20))), timeout=1
+        )
+
+        assert all(k is not None for k in found)
+        await asyncio.sleep(0)
+        assert endpoint.calls == 2  # one refresh started, shared by all 20 requests
+        endpoint.hold.set()
+        await cache.wait_for_background_refresh()
+        assert endpoint.calls == 2
+
+    asyncio.run(scenario())
+
+
+def test_a_hanging_fetch_has_a_total_deadline() -> None:
+    endpoint = FakeJwksEndpoint(hold=asyncio.Event())  # never released
+    endpoint.publish(es256_key())
+    cache = JwksCache(endpoint, fetch_timeout_seconds=0.05, clock=FakeClock())
+
+    async def scenario() -> None:
+        with pytest.raises(JwksUnavailableError):
+            await asyncio.wait_for(cache.get("any"), timeout=2)
+
+    asyncio.run(scenario())
+
+
+def test_a_hanging_background_refresh_does_not_block_later_refreshes() -> None:
+    old, new = es256_key(), es256_key()
+    endpoint, clock = FakeJwksEndpoint(), FakeClock()
+    endpoint.publish(old)
+    cache = JwksCache(
+        endpoint, ttl_seconds=600, min_refetch_seconds=30, fetch_timeout_seconds=0.05, clock=clock
+    )
+
+    async def scenario() -> None:
+        assert await cache.get(old.kid) is not None
+        clock.advance(601)
+        endpoint.hold = asyncio.Event()
+        assert await cache.get(old.kid) is not None  # starts a refresh that times out
+        await cache.wait_for_background_refresh()
+
+        endpoint.hold = None
+        endpoint.publish(old, new)
+        clock.advance(31)
+        assert await asyncio.wait_for(cache.get(new.kid), timeout=1) is not None
+
+    asyncio.run(scenario())
 
 
 def test_rotation_unknown_kid_triggers_one_refetch_and_then_verifies() -> None:
@@ -123,18 +195,24 @@ def test_concurrent_unknown_kids_share_one_refetch() -> None:
     assert endpoint.calls == 2
 
 
-def test_revoked_key_is_dropped_on_the_next_fetch() -> None:
+def test_revoked_key_is_dropped_when_the_refresh_completes() -> None:
     old, new = es256_key(), es256_key()
     endpoint, clock = FakeJwksEndpoint(), FakeClock()
     endpoint.publish(old, new)
-    check = verifier(endpoint, clock, ttl_seconds=600)
-    assert accepts(check, mint(old))
+    cache = JwksCache(endpoint, ttl_seconds=600, clock=clock)
 
-    endpoint.publish(new)
-    clock.advance(601)
+    async def scenario() -> None:
+        assert await cache.get(old.kid) is not None
+        endpoint.publish(new)
+        clock.advance(601)
 
-    assert not accepts(check, mint(old))
-    assert accepts(check, mint(new))
+        await cache.get(new.kid)  # the first request after the TTL starts the refresh
+        await cache.wait_for_background_refresh()
+
+        assert await cache.get(old.kid) is None
+        assert await cache.get(new.kid) is not None
+
+    asyncio.run(scenario())
 
 
 def test_first_fetch_failure_is_unavailable_not_invalid() -> None:
@@ -169,15 +247,39 @@ def test_failed_refresh_is_retried_no_more_than_the_refetch_interval() -> None:
     key = es256_key()
     endpoint, clock = FakeJwksEndpoint(), FakeClock()
     endpoint.publish(key)
-    check = verifier(endpoint, clock, ttl_seconds=600, min_refetch_seconds=30)
+    cache = JwksCache(endpoint, ttl_seconds=600, min_refetch_seconds=30, clock=clock)
+
+    async def scenario() -> None:
+        assert await cache.get(key.kid) is not None
+        endpoint.fail = True
+        clock.advance(601)
+
+        for _ in range(10):
+            assert await cache.get(key.kid) is not None
+            await cache.wait_for_background_refresh()
+
+        assert endpoint.calls == 2
+
+    asyncio.run(scenario())
+
+
+def test_refresh_with_no_usable_key_keeps_the_last_good_keys() -> None:
+    """A bad document is treated like a failed fetch, so a forged kid cannot cause an outage."""
+    key = es256_key()
+    endpoint, clock = FakeJwksEndpoint(), FakeClock()
+    endpoint.publish(key)
+    check = verifier(endpoint, clock, min_refetch_seconds=30, max_stale_seconds=3600)
     assert accepts(check, mint(key))
-    endpoint.fail = True
-    clock.advance(601)
+    clock.advance(31)
 
-    for _ in range(10):
-        assert accepts(check, mint(key))
-
+    endpoint.publish()  # 200 with {"keys": []}
+    assert not accepts(check, mint(es256_key()))  # forged kid forces the refetch
     assert endpoint.calls == 2
+
+    assert accepts(check, mint(key))
+    clock.advance(3600)
+    with pytest.raises(JwksUnavailableError):
+        asyncio.run(check.verify(mint(key)))
 
 
 @pytest.mark.parametrize("document", [{}, {"keys": "not-a-list"}, [], "text"])

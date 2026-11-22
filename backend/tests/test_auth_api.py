@@ -295,3 +295,25 @@ def test_jwks_outage_gets_503_not_401(world: World) -> None:
 
     with TestClient(app) as client:
         assert client.get(me(world.org_a, world.a1), headers=world.auth("owner")).status_code == 503
+
+
+def test_every_503_has_the_same_body(world: World) -> None:
+    """The body does not tell a caller which part of the configuration is missing."""
+    bodies = set()
+    for verifier_set, provider_set, outage in [
+        (False, True, False),
+        (True, False, False),
+        (True, True, True),
+    ]:
+        world.endpoint.fail = outage
+        app = create_app(Settings(environment="test"))
+        if verifier_set:
+            app.state.token_verifier = verifier(world.endpoint)
+        if provider_set:
+            app.state.membership_provider = world.provider
+        with TestClient(app) as client:
+            response = client.get(me(world.org_a, world.a1), headers=world.auth("owner"))
+        assert response.status_code == 503
+        bodies.add(response.content)
+
+    assert len(bodies) == 1

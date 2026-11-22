@@ -222,6 +222,14 @@ def test_algorithm_outside_the_configured_allow_list_is_rejected(
     rejected(verifier(endpoint, algorithms=("ES256",)), mint(rsa_key))
 
 
+@pytest.mark.parametrize("crit", [["urn:example:unknown"], "not-a-list", [], [42]])
+def test_crit_header_with_unknown_or_bad_extensions_is_rejected(
+    check: TokenVerifier, key: SigningKey, crit: Any
+) -> None:
+    """Guards PyJWT's `crit` handling across upgrades (RFC 7515, section 4.1.11)."""
+    rejected(check, mint(key, headers={"crit": crit, "urn:example:unknown": True}))
+
+
 def test_token_without_kid_is_rejected(check: TokenVerifier, key: SigningKey) -> None:
     token = jwt.encode(claims(), key.private_key, "ES256")  # no kid header
 

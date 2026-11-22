@@ -109,6 +109,25 @@ def test_local_supabase_stack_may_use_http(url: str) -> None:
     assert Settings(auth_issuer=ISSUER, auth_jwks_url=url).auth_jwks_url == url
 
 
+@pytest.mark.parametrize("environment", ["local", "test"])
+def test_local_or_test_environment_is_refused_on_fly(
+    monkeypatch: pytest.MonkeyPatch, environment: str
+) -> None:
+    """A Fly machine that forgets HARNESS_ENVIRONMENT must not start as `local`."""
+    monkeypatch.setenv("FLY_APP_NAME", "harness-api")
+
+    with pytest.raises(ValidationError):
+        Settings(environment=environment)  # type: ignore[arg-type]
+    with pytest.raises(ValidationError):
+        Settings()
+
+
+def test_deployed_environments_start_on_fly(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("FLY_APP_NAME", "harness-api")
+
+    assert Settings(environment="staging").environment == "staging"
+
+
 def test_local_http_jwks_is_refused_in_production() -> None:
     with pytest.raises(ValidationError):
         Settings(
