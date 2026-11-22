@@ -137,11 +137,12 @@ Merge in this order: #4, #5, #6, #7, then #9 (DEX-12, section below). Use a merg
   Postgres provider lands. Adds `pyjwt[crypto]` and the `HARNESS_AUTH_*` names in `.env.example`.
 - Risk: Medium (4/10, review). Security-sensitive code, but it fails closed, has no migration
   or data, and no hosted environment sets `HARNESS_AUTH_*`. Only `/v1/orgs/{org_id}/hotels/{hotel_id}/me` uses it.
-- Merge order: after #7. I merged #9 locally onto `main` + #4 to #7 in that order (throwaway branch,
-  not pushed). The only conflict is `backend/uv.lock` (#5 adds `psycopg` at the same place in the
-  lock file). With the stack's lock file and `uv lock`, the backend checks pass: 725 passed, 893
-  database tests skipped (no local stack; #9 changes no SQL). Before you merge #9, ask me to merge
-  `main` into its branch; that regenerates the lock file. No other file conflicts.
+- Head: `cad1157`, CI 4/4 green. Backend on the branch: 174 passed.
+- Merge order: after #7. I merged `cad1157` locally onto `main` + #4 to #7 in that order (throwaway
+  branch, not pushed). Only `backend/uv.lock` conflicts (#5 adds `psycopg` and #9 adds
+  `pyjwt`/`cryptography` at the same place in the lock file). Fix: keep the stack's lock file and run
+  `uv lock`. Then the backend checks pass: 737 passed, 893 database tests skipped (#9 changes no SQL).
+  Before you merge #9, ask me to merge `main` into its branch; that regenerates the lock file.
 - Rollback: revert the PR. Nothing else calls the dependency yet.
 - Open decisions (default = what the PR builds; full table in `docs/auth.md`):
   - A1 No HS256 shared-secret fallback; the hosted project uses asymmetric signing keys.
@@ -150,20 +151,23 @@ Merge in this order: #4, #5, #6, #7, then #9 (DEX-12, section below). Use a merg
   - A4 Effective role = highest covering membership (org-wide or this hotel), as #5 RLS.
   - A5 Anonymous Supabase sign-ins are refused.
   - A6 No membership cache; a removed membership takes effect on the next request.
-  - A7 JWKS cache 10 min, unknown-kid refetch at most every 30 s, last good keys up to 1 h in an outage.
+  - A7 JWKS cache 10 min, refreshed in the background; unknown-kid refetch at most every 30 s;
+    last good keys up to 1 h when the endpoint fails or returns no usable key.
   - A8 `psycopg` becomes a runtime dependency for the Postgres provider.
   - A9 Remove the `SUPABASE_JWT_ISSUER` placeholder in the #5 follow-up.
   - A10 Minimum role per action: viewer view; operator runs and changes; admin approval settings
     and members; owner org.
   - A11 Org-level routes (no hotel) come later.
+  - A12 Gate for code approvals (PR #6 follow-up), quoted from `docs/auth.md`: "Hotel member with
+    `view`, **or** an unexpired `code_reviewer` team role; hotel approvals need hotel membership.
+    PR #6's service makes the approver check." Option: "(b) Code approvals only on a separate team
+    route (`/v1/team/approvals`)."
 - Unblocked after merge (follow-up PRs, each right after the merge that unblocks it):
   - After #5 and #9: `PostgresMembershipProvider` (one query on `memberships` joined to `hotels`) and
     remove `SUPABASE_JWT_ISSUER` from `.env.example`.
-  - After #6 and #9: build PR #6's `Principal` from the verified user, gate the approval routes with
-    `require_tenant`, and make `approvals.model.HotelRole` an import of `harness.tenancy.HotelRole`.
-    Gap: code approvals (`git_push`, `code_change`) need a different gate. PR #6 lets a `code_reviewer`
-    with no hotel membership view and decide them, so `require_tenant(Action.VIEW)` would return 403
-    and they could never be decided. The gate is still open in the
-    [PR #9 review](https://github.com/nikhilllmno/vorflux/pull/9#pullrequestreview-6011000981).
+  - After #6 and #9: build PR #6's `Principal` from the verified user, gate hotel approvals with
+    `require_tenant(Action.VIEW)` and code approvals (`git_push`, `code_change`) as A12 says, and make
+    `approvals.model.HotelRole` an import of `harness.tenancy.HotelRole`. With A12, a `code_reviewer`
+    who is not a hotel member can still view and decide code approvals.
 
-Reply 'use defaults' to accept every default above and merge in this order. That reply covers PR #4 to #7 only: their defaults (PR #5 decisions 1 to 16, PR #6 decisions 1 to 12 and the open question, C1 to C16) and their four merges. It does not cover PR #9: the #9 merge and A1 to A11 need their own approval. It does not approve the first `supabase db push`, runbook step S5, or the DEX-9 required-check change (decision 16); each needs its own approval.
+Reply 'use defaults' to accept every default above and merge in this order. That reply covers PR #4 to #7 only: their defaults (PR #5 decisions 1 to 16, PR #6 decisions 1 to 12 and the open question, C1 to C16) and their four merges. It does not cover PR #9: the #9 merge and A1 to A12 need their own approval. It does not approve the first `supabase db push`, runbook step S5, or the DEX-9 required-check change (decision 16); each needs its own approval.
