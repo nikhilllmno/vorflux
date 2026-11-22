@@ -510,7 +510,7 @@ flowchart TD
 
 | Layer | Mechanism |
 |---|---|
-| Identity | Supabase Auth JWT. The API builds an immutable `TenantContext` (`org_id`, `hotel_id`, `actor_id`, `allowed_repos`) at the edge. Every service function takes it as an argument; there is no global "current tenant". |
+| Identity | Supabase Auth JWT (asymmetric signing keys, verified against the project JWKS). The API builds an immutable `TenantContext` (`org_id`, `hotel_id`, `actor_id`, `role`, `allowed_repos`) at the edge, after a membership check. Every service function takes it as an argument; there is no global "current tenant". Details: [`auth.md`](auth.md). |
 | Data | One Postgres schema, `org_id` and `hotel_id` on every tenant row, composite indexes that start with `org_id`. RLS policies on every tenant table, keyed on JWT claims, as a second guard under the API. The service role is used only by the control plane. |
 | Storage | Supabase Storage paths `org/<org_id>/hotel/<hotel_id>/...` with bucket policies. Signed URLs with short TTL. |
 | Compute | One sandbox per run, never reused across hotels. Sandboxes live in a dedicated Fly app and network with no route to the control-plane database. |
