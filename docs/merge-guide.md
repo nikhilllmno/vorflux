@@ -1,6 +1,6 @@
-# Merge guide: PR #4 to PR #7
+# Merge guide: PR #4 to PR #7, then PR #9
 
-Status on 2026-11-21. All four PRs are drafts with green CI (4 jobs each; #5 adds a fifth).
+Status on 2026-11-22. All five PRs (#4 to #7 and #9) are drafts with green CI (4 jobs each; #5 adds a fifth).
 Each PR description has the full detail.
 
 ## Merge order and check
@@ -12,9 +12,11 @@ Merge in this order: #4, #5, #6, #7, then #9 (DEX-12, section below). Use a merg
   secret scan, backend (584 passed), database (917 RLS tests), web, deploy config.
 - No branch needed a rebase. If `main` moves before you merge, ask me to check again.
 - Each PR is a draft. Mark it ready, then merge it. Merge the next PR after the last one is on `main`.
-- Merge the four PRs as they are. Each "Unblocked after merge" item is a separate follow-up PR,
+- Merge the PRs as they are. Each "Unblocked after merge" item is a separate follow-up PR,
   opened right after the merge that unblocks it. It never changes a PR branch in this stack.
-  No later PR in the stack changes the files that a follow-up edits, so the order stays conflict-free.
+- One follow-up overlaps a later PR: C9 (after #5) edits `backend/pyproject.toml` and `backend/uv.lock`,
+  and #9 edits both. The fix is the same as for the #9 lock conflict below: merge `main` into the #9
+  branch and run `uv lock`. No other follow-up file is changed by a later PR.
 - To undo a merged PR: `git revert -m 1 <merge commit>`, then open a PR with the revert.
 - Merging changes no hosted database and deploys nothing. CI only validates.
 
@@ -132,7 +134,7 @@ Merge in this order: #4, #5, #6, #7, then #9 (DEX-12, section below). Use a merg
   identical 403 for every tenant denial, 503 when auth or the membership provider is not set.
   Only an in-memory membership provider ships; tenant routes return 503 in a deployed app until the
   Postgres provider lands. Adds `pyjwt[crypto]` and the `HARNESS_AUTH_*` names in `.env.example`.
-- Risk: medium-low (4/10, review). Security-sensitive code, but it fails closed, has no migration
+- Risk: Medium (4/10, review). Security-sensitive code, but it fails closed, has no migration
   or data, and no hosted environment sets `HARNESS_AUTH_*`. Only `/v1/orgs/{org_id}/hotels/{hotel_id}/me` uses it.
 - Merge order: after #7. I merged #9 locally onto `main` + #4 to #7 in that order (throwaway branch,
   not pushed). The only conflict is `backend/uv.lock` (#5 adds `psycopg` at the same place in the
@@ -158,5 +160,9 @@ Merge in this order: #4, #5, #6, #7, then #9 (DEX-12, section below). Use a merg
     remove `SUPABASE_JWT_ISSUER` from `.env.example`.
   - After #6 and #9: build PR #6's `Principal` from the verified user, gate the approval routes with
     `require_tenant`, and make `approvals.model.HotelRole` an import of `harness.tenancy.HotelRole`.
+    Gap: code approvals (`git_push`, `code_change`) need a different gate. PR #6 lets a `code_reviewer`
+    with no hotel membership view and decide them, so `require_tenant(Action.VIEW)` would return 403
+    and they could never be decided. The gate is still open in the
+    [PR #9 review](https://github.com/nikhilllmno/vorflux/pull/9#pullrequestreview-6011000981).
 
-Reply 'use defaults' to accept every default above and merge in this order. That reply approves the defaults and the four merges (#4 to #7) only; #9 needs its own approval. It does not approve the first `supabase db push`, runbook step S5, or the DEX-9 required-check change (decision 16); each needs its own approval.
+Reply 'use defaults' to accept every default above and merge in this order. That reply covers PR #4 to #7 only: their defaults (PR #5 decisions 1 to 16, PR #6 decisions 1 to 12 and the open question, C1 to C15) and their four merges. It does not cover PR #9: the #9 merge and A1 to A11 need their own approval. It does not approve the first `supabase db push`, runbook step S5, or the DEX-9 required-check change (decision 16); each needs its own approval.
