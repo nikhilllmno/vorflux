@@ -140,7 +140,6 @@ def verifier(
     ttl_seconds: float = 600,
     min_refetch_seconds: float = 30,
     max_stale_seconds: float = 3600,
-    leeway_seconds: float = 10,
 ) -> TokenVerifier:
     cache = JwksCache(
         endpoint,
@@ -154,5 +153,5 @@ def verifier(
         issuer=ISSUER,
         audience=AUDIENCE,
         algorithms=algorithms,
-        leeway_seconds=leeway_seconds,
+        leeway_seconds=10,
     )

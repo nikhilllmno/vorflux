@@ -5,6 +5,7 @@ import time
 from typing import Any
 from uuid import uuid4
 
+import jwt
 import pytest
 from auth_world import (
     AUDIENCE,
@@ -77,24 +78,23 @@ def test_expiry_inside_the_leeway_is_accepted(check: TokenVerifier, key: Signing
 # --- Time claims -------------------------------------------------------------------------------
 
 
-def test_expired_token_is_rejected(check: TokenVerifier, key: SigningKey) -> None:
-    rejected(check, mint(key, exp=int(time.time()) - 60))
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        pytest.param({"exp": -60}, id="expired"),
+        pytest.param({"exp": None}, id="no-exp"),
+        pytest.param({"nbf": 300}, id="nbf-in-future"),
+        pytest.param({"iat": 300}, id="iat-in-future"),
+        pytest.param({"iat": None}, id="no-iat"),
+    ],
+)
+def test_bad_or_missing_time_claims_are_rejected(
+    check: TokenVerifier, key: SigningKey, overrides: dict[str, int | None]
+) -> None:
+    now = int(time.time())
+    claims_ = {name: None if delta is None else now + delta for name, delta in overrides.items()}
 
-
-def test_token_without_exp_is_rejected(check: TokenVerifier, key: SigningKey) -> None:
-    rejected(check, mint(key, exp=None))
-
-
-def test_token_not_valid_yet_is_rejected(check: TokenVerifier, key: SigningKey) -> None:
-    rejected(check, mint(key, nbf=int(time.time()) + 300))
-
-
-def test_token_issued_in_the_future_is_rejected(check: TokenVerifier, key: SigningKey) -> None:
-    rejected(check, mint(key, iat=int(time.time()) + 300))
-
-
-def test_token_without_iat_is_rejected(check: TokenVerifier, key: SigningKey) -> None:
-    rejected(check, mint(key, iat=None))
+    rejected(check, mint(key, **claims_))
 
 
 # --- Issuer and audience -----------------------------------------------------------------------
@@ -179,7 +179,7 @@ def test_hs256_signed_with_the_public_key_is_rejected(endpoint: FakeJwksEndpoint
 def test_symmetric_key_in_the_jwks_is_never_used(endpoint: FakeJwksEndpoint) -> None:
     secret = b"a-shared-secret-that-must-never-verify-a-token"
     oct_jwk = {"kty": "oct", "kid": "legacy", "alg": "HS256", "k": "YS1zaGFyZWQtc2VjcmV0"}
-    endpoint.publish(oct_jwk)
+    endpoint.publish(es256_key(), oct_jwk)
 
     token = hmac_token(secret, {"alg": "HS256", "typ": "JWT", "kid": "legacy"}, claims())
 
@@ -195,16 +195,20 @@ def test_header_alg_that_does_not_match_the_key_type_is_rejected(
     rejected(verifier(endpoint), mint(rsa_attacker))
 
 
-def test_header_alg_that_differs_from_the_jwk_alg_is_rejected(endpoint: FakeJwksEndpoint) -> None:
+def test_header_alg_that_differs_from_the_jwk_alg_is_rejected(
+    endpoint: FakeJwksEndpoint, key: SigningKey
+) -> None:
     rsa_key = rs256_key()
-    endpoint.publish({**rsa_key.public_jwk, "alg": "RS512"})
+    endpoint.publish(key, {**rsa_key.public_jwk, "alg": "RS512"})
 
     rejected(verifier(endpoint), mint(rsa_key))
 
 
-def test_key_published_for_encryption_is_not_used_to_verify(endpoint: FakeJwksEndpoint) -> None:
+def test_key_published_for_encryption_is_not_used_to_verify(
+    endpoint: FakeJwksEndpoint, key: SigningKey
+) -> None:
     ec_key = es256_key()
-    endpoint.publish({**ec_key.public_jwk, "use": "enc"})
+    endpoint.publish(key, {**ec_key.public_jwk, "use": "enc"})
 
     rejected(verifier(endpoint), mint(ec_key))
 
@@ -219,8 +223,6 @@ def test_algorithm_outside_the_configured_allow_list_is_rejected(
 
 
 def test_token_without_kid_is_rejected(check: TokenVerifier, key: SigningKey) -> None:
-    import jwt
-
     token = jwt.encode(claims(), key.private_key, "ES256")  # no kid header
 
     rejected(check, token)

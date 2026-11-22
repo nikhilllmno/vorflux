@@ -2,8 +2,10 @@
 
 import asyncio
 
+import jwt
 import pytest
 from auth_world import FakeClock, FakeJwksEndpoint, es256_key, mint, rs256_key, verifier
+from cryptography.hazmat.primitives.asymmetric import ec, rsa
 
 from harness.auth import InvalidTokenError, JwksUnavailableError, TokenVerifier, parse_jwks
 
@@ -178,31 +180,38 @@ def test_failed_refresh_is_retried_no_more_than_the_refetch_interval() -> None:
     assert endpoint.calls == 2
 
 
+@pytest.mark.parametrize("document", [{}, {"keys": "not-a-list"}, [], "text"])
+def test_malformed_jwks_document_is_refused(document: object) -> None:
+    with pytest.raises(ValueError):
+        parse_jwks(document)
+
+
 @pytest.mark.parametrize(
-    "document",
+    "keys",
     [
-        {},
-        {"keys": "not-a-list"},
-        {"keys": [{"kty": "EC"}]},  # no kid, no curve
         [],
+        [{"kty": "oct", "kid": "secret", "alg": "HS256", "k": "c2VjcmV0"}],
+        [{"kty": "EC", "kid": "no-curve"}],
     ],
 )
-def test_malformed_jwks_document_gives_no_keys(document: object) -> None:
-    class Endpoint(FakeJwksEndpoint):
-        async def fetch(self) -> object:  # type: ignore[override]
-            self.calls += 1
-            return document
+def test_jwks_with_no_usable_key_is_unavailable_not_invalid(keys: list[object]) -> None:
+    """No usable key is a server-side problem (503), not a bad user token (401)."""
+    endpoint = FakeJwksEndpoint()
+    endpoint.publish(*keys)  # type: ignore[arg-type]
 
-    check = verifier(Endpoint())
+    with pytest.raises(JwksUnavailableError):
+        asyncio.run(verifier(endpoint).verify(mint(es256_key())))
 
-    with pytest.raises((InvalidTokenError, JwksUnavailableError)):
-        asyncio.run(check.verify(mint(es256_key())))
+
+def test_unknown_kid_with_usable_keys_is_invalid() -> None:
+    endpoint = FakeJwksEndpoint()
+    endpoint.publish(es256_key())
+
+    with pytest.raises(InvalidTokenError):
+        asyncio.run(verifier(endpoint).verify(mint(es256_key())))
 
 
 def test_only_asymmetric_signature_keys_are_kept() -> None:
-    import jwt
-    from cryptography.hazmat.primitives.asymmetric import ec, rsa
-
     good_ec, good_rsa = es256_key("ec"), rs256_key("rsa")
     p384 = jwt.algorithms.ECAlgorithm.to_jwk(
         ec.generate_private_key(ec.SECP384R1()).public_key(), as_dict=True
