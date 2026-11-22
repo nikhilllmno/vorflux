@@ -113,15 +113,16 @@ Merge in this order: #4, #5, #6, #7, then #9 (DEX-12, section below). Use a merg
   - C11 Usage with no price: option (a), stop that run and alert (`unpriced_usage_alert` log event,
     `on_unpriced` hook). The model id is refused for every hotel until priced, because the price table is global.
     The refusal clears by itself when a price table prices the id.
-    Options: (b) block the hotel until cleared, (c) estimate (rejected).
+    Options: (b) block the hotel until cleared, (c) estimate (not recommended: it bills wrong amounts).
   - C12 Web search requests: recorded with no price; that run stops.
   - C13 Non-first-party and fine-tuned ids: refused. A report with `serving` other than
     `first_party` is recorded unpriced and its run stops, but the id is not refused.
   - C14 Daily cap concurrency: atomic record, check after each report.
   - C15 Price changes: one table per `effective_from` date (UTC).
-- Already decided (round 4, listed for completeness): C16. A hotel with 3 runs stopped for
-  `unknown_model` or `tiered_pricing` in one UTC day is blocked (`UNPRICED_LIMIT`) until 00:00 UTC
-  (05:30 IST). Other stop reasons, such as web search, do not count.
+  - C16 Pricing-gap limit (open: a default set on 2026-11-20; the owner has not answered): 3 runs stopped
+    for a model-pricing gap (`unknown_model`, `tiered_pricing`) in one UTC day block new runs for that
+    hotel until 00:00 UTC (05:30 IST), with code `UNPRICED_LIMIT`. Other stop reasons, such as web
+    search, do not count. Options: no limit, a different count, or alert only.
 - Unblocked after merge: nothing yet. The `run_costs` SQL in `docs/costs.md` also waits for the
   `runs` table (DEX-14). In the PR that adds `runs`, or right after it, `run_costs` becomes a migration.
   It then joins `TABLES` in `backend/tests/rls/world.py` and the table-coverage test.
@@ -165,4 +166,4 @@ Merge in this order: #4, #5, #6, #7, then #9 (DEX-12, section below). Use a merg
     and they could never be decided. The gate is still open in the
     [PR #9 review](https://github.com/nikhilllmno/vorflux/pull/9#pullrequestreview-6011000981).
 
-Reply 'use defaults' to accept every default above and merge in this order. That reply covers PR #4 to #7 only: their defaults (PR #5 decisions 1 to 16, PR #6 decisions 1 to 12 and the open question, C1 to C15) and their four merges. It does not cover PR #9: the #9 merge and A1 to A11 need their own approval. It does not approve the first `supabase db push`, runbook step S5, or the DEX-9 required-check change (decision 16); each needs its own approval.
+Reply 'use defaults' to accept every default above and merge in this order. That reply covers PR #4 to #7 only: their defaults (PR #5 decisions 1 to 16, PR #6 decisions 1 to 12 and the open question, C1 to C16) and their four merges. It does not cover PR #9: the #9 merge and A1 to A11 need their own approval. It does not approve the first `supabase db push`, runbook step S5, or the DEX-9 required-check change (decision 16); each needs its own approval.
