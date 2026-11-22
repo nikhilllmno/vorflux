@@ -381,7 +381,7 @@ bound for that segment. The adapter model pins in runtime contract v2
 (https://github.com/nikhilllmno/hermes_like_agent/pull/3, `RunConfig.model_pins`) close this on
 the Claude side: the orchestrator passes every pinned id to `check_run_models`.
 
-Unpriced-run limit per hotel (decision C16, owner decision in review round 4). When 3 or more
+Unpriced-run limit per hotel (decision C16). Default (chosen by Ember on 2026-11-20 after review round 4; the owner has not answered). When 3 or more
 runs of one hotel (`UNPRICED_RUNS_HOTEL_DAILY_LIMIT`) were stopped by a model-pricing gap in
 one UTC day, `check_hotel_unpriced_limit` denies that hotel for the rest of the UTC day with
 `UNPRICED_LIMIT` (the reason names C16 and contains "unpriced"). A model-pricing gap is an
@@ -394,7 +394,8 @@ a web search row and a gap row counts once. It clears at the next UTC day. The c
 cap, so it applies to a hotel with no daily cap; `check_hotel_daily_cap` calls it too. `record`
 does not apply the limit, so its `hotel_daily_cap` stays a USD decision; the orchestrator calls
 the check before each segment, so a run in flight in that hotel stops at its next segment
-boundary. Other hotels are not affected.
+boundary. Other hotels are not affected. The alternatives that still wait for the owner are in
+the C16 row of "Owner decisions".
 
 Options for C11, and how each one clears:
 
@@ -597,4 +598,4 @@ rejected.
 | C13 | Non-first-party ids and serving (Bedrock, Vertex AI, gateway prefixes, `ft:`, or `serving` other than `first_party`) | Ids refused (`NonFirstPartyModelError`), recorded unpriced if they still run; a report with `serving` other than `first_party` is recorded unpriced (`NonFirstPartyServingError`) and its run stops, but the id is not refused. `:` stays refused, because no priced id has one (see "Prices") | Add provider-specific tables when a hotel needs them |
 | C14 | Concurrency of the hotel daily cap | Record, sum and check in one atomic step (a lock in memory; a per-hotel `pg_advisory_xact_lock` in Postgres) and check after each report. Worst case: the segments in flight when the cap is crossed | Reserve an estimated budget before each segment (stricter, more complex) |
 | C15 | Price changes | One table per `effective_from` date (UTC); each report uses the table in effect at `recorded_at` and stores its version | Price by the run's start date |
-| C16 | Repeated runs stopped by a model-pricing gap in one hotel | Owner decision (round 4): when 3 or more runs of a hotel are stopped by unpriced usage with reason `unknown_model` or `tiered_pricing` (`UNPRICED_LIMIT_REASONS`) in one UTC day, `check_hotel_unpriced_limit` denies that hotel for the rest of the UTC day with `UNPRICED_LIMIT`; it needs no daily cap, and `check_hotel_daily_cap` calls it. `web_search`, `non_first_party`, `cost_out_of_range` and `no_price_table` do not count, because each one already stops its own run (C12, C13 unchanged). `UNPRICED_RUNS_HOTEL_DAILY_LIMIT = 3` | Count every unpriced reason; count `unknown_model` only; no limit; a different count; alert only |
+| C16 | Repeated runs stopped by a model-pricing gap in one hotel | Default (chosen by Ember on 2026-11-20 after review round 4; the owner has not answered): when 3 or more runs of a hotel are stopped by unpriced usage with reason `unknown_model` or `tiered_pricing` (`UNPRICED_LIMIT_REASONS`) in one UTC day, `check_hotel_unpriced_limit` denies that hotel for the rest of the UTC day with `UNPRICED_LIMIT`; it needs no daily cap, and `check_hotel_daily_cap` calls it. `web_search`, `non_first_party`, `cost_out_of_range` and `no_price_table` do not count, because each one already stops its own run (C12, C13 unchanged). `UNPRICED_RUNS_HOTEL_DAILY_LIMIT = 3` | Option (a) as review comment r4639844361 wrote it: count only `unknown_model` on an id that was not passed to `check_run_models`; count every unpriced reason; count `unknown_model` only; no limit; a different count; alert only |

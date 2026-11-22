@@ -189,8 +189,9 @@ def _unpriced(run_id: UUID) -> UsageReport:
 
 
 def test_unpriced_usage_denies_its_run_cap_but_not_the_hotel_daily_cap() -> None:
-    # Re-review N1 (owner decision C11, option a): the run with unpriced usage stops; the
-    # hotel daily cap counts priced spend only, so the hotel's other runs continue.
+    # Re-review N1 (C11 built default, option a; waits for the owner): the run with unpriced
+    # usage stops; the hotel daily cap counts priced spend only, so the hotel's other runs
+    # continue.
     runs, clock = Runs(), Clock()
     ledger = InMemoryCostLedger(runs, clock=clock)
     run, other = runs.add(), runs.add()
@@ -384,8 +385,9 @@ def test_run_cap_deny_for_unpriced_usage_gives_usage_unpriced() -> None:
 def test_runs_stopped_for_other_reasons_do_not_block_the_hotel(
     overrides: dict[str, Any], reason: str
 ) -> None:
-    # Owner decision (round 4): web_search, non_first_party, cost_out_of_range and
-    # no_price_table each stop their own run already; C16 does not count them.
+    # C16 built default (round 4; waits for the owner): web_search, non_first_party,
+    # cost_out_of_range and no_price_table each stop their own run already; C16 does not
+    # count them.
     runs, clock = Runs(), Clock()
     ledger = InMemoryCostLedger(runs, clock=clock)
     t = _tenant()
