@@ -7,13 +7,16 @@ Auth signs with it, so a token with an unknown `kid` usually means our copy is o
 Cache rules (docs/auth.md, "Signing keys"):
 
 - Fetch on first use, then again when the copy is older than `ttl_seconds` (default 10 minutes,
-  the same as Supabase's edge cache).
+  the same as Supabase's edge cache). That refresh runs in the background: requests whose `kid`
+  is in the copy keep using it and never wait for the JWKS endpoint.
 - An unknown `kid` causes at most one refetch per `min_refetch_seconds`, so forged tokens with
   random kids cannot turn the API into a JWKS request amplifier. Concurrent callers share a
   single fetch.
-- If a refresh fails, the last good keys stay in use for up to `max_stale_seconds` after they
-  were fetched. With no usable keys (none fetched, too old, or a document with no usable key),
-  verification raises `JwksUnavailableError` (HTTP 503).
+- Each fetch has a total deadline (`fetch_timeout_seconds`, default 10 s), not only a timeout per
+  socket operation.
+- If a refresh fails, or returns a document with no usable key, the last good keys stay in use
+  for up to `max_stale_seconds` after they were fetched. With no usable keys (none fetched yet,
+  or the last good ones too old), verification raises `JwksUnavailableError` (HTTP 503).
 - Only asymmetric signature keys are kept: `RSA` (RS256, at least 2048 bits) and `EC` on P-256
   (ES256). A symmetric (`oct`) key is never used, even if the document lists one.
 """
@@ -125,35 +128,54 @@ class JwksCache:
         ttl_seconds: float = 600,
         min_refetch_seconds: float = 30,
         max_stale_seconds: float = 3600,
+        fetch_timeout_seconds: float = 10,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
-        if ttl_seconds <= 0 or min_refetch_seconds <= 0:
-            raise ValueError("JWKS ttl and refetch interval must be positive")
+        if ttl_seconds <= 0 or min_refetch_seconds <= 0 or fetch_timeout_seconds <= 0:
+            raise ValueError("JWKS ttl, refetch interval and fetch timeout must be positive")
         if max_stale_seconds < ttl_seconds:
             raise ValueError("JWKS max_stale_seconds must be at least ttl_seconds")
         self._fetcher = fetcher
         self._ttl = ttl_seconds
         self._min_refetch = min_refetch_seconds
         self._max_stale = max_stale_seconds
+        self._fetch_timeout = fetch_timeout_seconds
         self._clock = clock
         self._keys: dict[str, VerificationKey] | None = None
         self._fetched_at = 0.0  # last successful fetch
         self._attempted_at: float | None = None  # last fetch attempt, successful or not
         self._attempts = 0  # bumps on every attempt; lets waiting callers skip a duplicate fetch
         self._lock = asyncio.Lock()
+        self._background: asyncio.Task[None] | None = None
 
     async def get(self, kid: str) -> VerificationKey | None:
         """The key for `kid`, or None if the published set does not have it.
 
-        Raises JwksUnavailableError when there are no usable keys at all.
+        Waits for a fetch only when there are no usable keys or `kid` is unknown. Raises
+        JwksUnavailableError when there are no usable keys at all.
         """
-        if (self._keys is None or self._age() >= self._ttl) and self._may_fetch():
+        if self._has_usable_keys():
+            if self._age() >= self._ttl and self._may_attempt():
+                self._start_background_refresh()
+        elif self._may_fetch():
             await self._refresh(self._attempts)
         key = self._usable_keys().get(kid)
         if key is None and self._may_fetch():
             await self._refresh(self._attempts)
             key = self._usable_keys().get(kid)
         return key
+
+    async def wait_for_background_refresh(self) -> None:
+        """Wait until a background refresh (if one runs) has finished. For tests and shutdown."""
+        if self._background is not None:
+            await self._background
+
+    def _start_background_refresh(self) -> None:
+        if self._background is None or self._background.done():
+            self._background = asyncio.create_task(self._refresh(self._attempts))
+
+    def _has_usable_keys(self) -> bool:
+        return bool(self._keys) and self._age() <= self._max_stale
 
     def _may_fetch(self) -> bool:
         """True if a fetch may start now, or one is in flight (the caller then waits for it)."""
@@ -179,12 +201,18 @@ class JwksCache:
             started = self._clock()
             self._attempted_at = started
             try:
-                keys = parse_jwks(await self._fetcher.fetch())
-            except Exception as error:  # any failure keeps the old keys
+                document = await asyncio.wait_for(self._fetcher.fetch(), self._fetch_timeout)
+                keys = parse_jwks(document)
+            except Exception as error:  # any failure (timeout included) keeps the old keys
                 logger.warning("JWKS refresh failed: %s", type(error).__name__)
             else:
-                self._keys = keys
-                self._fetched_at = started
+                if keys:
+                    self._keys = keys
+                    self._fetched_at = started
+                elif self._keys:
+                    logger.error("JWKS lists no usable signing key; keeping the last good keys")
+                else:
+                    logger.error("JWKS lists no usable signing key")
             finally:
                 self._attempts += 1
 

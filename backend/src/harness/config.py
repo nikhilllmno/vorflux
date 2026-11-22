@@ -1,5 +1,6 @@
 """Process settings, read once from the environment (variable names are in `.env.example`)."""
 
+import os
 from functools import lru_cache
 from typing import Literal, Self
 from urllib.parse import urlsplit
@@ -41,6 +42,14 @@ class Settings(BaseSettings):
     auth_leeway_seconds: int = Field(default=10, ge=0, le=60)
     auth_jwks_cache_seconds: int = Field(default=600, ge=30, le=86_400)
     auth_jwks_min_refetch_seconds: int = Field(default=30, ge=1, le=3_600)
+
+    @model_validator(mode="after")
+    def _check_environment(self) -> Self:
+        # Fly.io sets FLY_APP_NAME on every machine. `local` and `test` allow the in-memory
+        # membership provider and an http JWKS URL, so a deployed machine must name its stage.
+        if self.environment in ("local", "test") and os.environ.get("FLY_APP_NAME"):
+            raise ValueError("set HARNESS_ENVIRONMENT to staging or production on Fly.io")
+        return self
 
     @model_validator(mode="after")
     def _check_auth(self) -> Self:

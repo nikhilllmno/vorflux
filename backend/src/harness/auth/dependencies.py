@@ -13,8 +13,9 @@ Responses (docs/auth.md, "HTTP behaviour"):
   checked before the path ids, so a caller without a valid token learns nothing about them.
 - 403 `forbidden`: no membership that covers the hotel, the hotel is not in the org, either does
   not exist, or the role is below the action's minimum. All of these give the same response.
-- 503: auth or the membership provider is not configured, or the signing keys cannot be loaded.
-  The routes fail closed.
+- 503 `service unavailable` (one body for every cause; the cause is logged): auth or the
+  membership provider is not configured, or the signing keys cannot be loaded. The routes fail
+  closed.
 """
 
 import functools
@@ -41,8 +42,10 @@ def _unauthorized(*, invalid_token: bool) -> HTTPException:
     )
 
 
-def _unavailable(detail: str) -> HTTPException:
-    return HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, detail)
+def _unavailable(reason: str) -> HTTPException:
+    """503 with one generic body; the reason goes to the server log only."""
+    logger.error("tenant route unavailable: %s", reason)
+    return HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "service unavailable")
 
 
 def _bearer_token(authorization: str | None) -> str | None:
@@ -80,8 +83,7 @@ async def get_authenticated_user(request: Request) -> AuthenticatedUser:
         logger.info("rejected access token: %s", error.reason)
         raise _unauthorized(invalid_token=True) from None
     except JwksUnavailableError:
-        logger.error("cannot verify access tokens: signing keys are unavailable")
-        raise _unavailable("authentication is temporarily unavailable") from None
+        raise _unavailable("signing keys are unavailable") from None
 
 
 def get_membership_provider(request: Request) -> MembershipProvider:
@@ -93,8 +95,9 @@ def get_membership_provider(request: Request) -> MembershipProvider:
         "local",
         "test",
     ):
-        logger.error("the in-memory membership provider is refused in %s", settings.environment)
-        raise _unavailable("tenancy is not configured")
+        raise _unavailable(
+            f"the in-memory membership provider is refused in {settings.environment}"
+        )
     return provider
 
 
