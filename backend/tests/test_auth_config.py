@@ -3,6 +3,7 @@
 import asyncio
 import json
 import threading
+import time
 from collections.abc import Iterator
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
@@ -13,7 +14,7 @@ from auth_world import ISSUER, es256_key, mint
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
-from harness.auth import HttpJwksFetcher, InMemoryMembershipProvider, TokenVerifier
+from harness.auth import HttpJwksFetcher, InMemoryMembershipProvider, JwksCache, TokenVerifier
 from harness.config import Settings
 from harness.main import create_app
 from harness.tenancy import HotelRole
@@ -144,12 +145,15 @@ class _Server:
     def __init__(self) -> None:
         self.body: bytes = b'{"keys": []}'
         self.redirect_to: str | None = None
+        self.stall_seconds = 0.0  # wait before the status line
+        self.drip_seconds = 0.0  # wait between body bytes
         self.requests = 0
         outer = self
 
         class Handler(BaseHTTPRequestHandler):
             def do_GET(self) -> None:
                 outer.requests += 1
+                time.sleep(outer.stall_seconds)
                 if outer.redirect_to is not None:
                     self.send_response(302)
                     self.send_header("Location", outer.redirect_to)
@@ -157,13 +161,24 @@ class _Server:
                     return
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(outer.body)))
                 self.end_headers()
-                self.wfile.write(outer.body)
+                if not outer.drip_seconds:
+                    self.wfile.write(outer.body)
+                    return
+                try:
+                    for i in range(len(outer.body)):
+                        self.wfile.write(outer.body[i : i + 1])
+                        self.wfile.flush()
+                        time.sleep(outer.drip_seconds)
+                except OSError:
+                    pass  # the client gave up
 
             def log_message(self, *args: Any) -> None:
                 pass
 
         self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.httpd.daemon_threads = True  # do not wait for a slow handler at shutdown
         self.url = f"http://127.0.0.1:{self.httpd.server_address[1]}/auth/v1/.well-known/jwks.json"
 
 
@@ -198,6 +213,39 @@ def test_http_fetcher_does_not_follow_redirects(server: _Server) -> None:
 
     with pytest.raises(OSError):
         asyncio.run(HttpJwksFetcher(server.url).fetch())
+
+
+def _elapsed_fetch(fetcher: HttpJwksFetcher) -> float:
+    started = time.monotonic()
+    with pytest.raises((OSError, TimeoutError)):
+        asyncio.run(fetcher.fetch())  # returns only when the worker thread has finished
+    return time.monotonic() - started
+
+
+def test_http_fetcher_thread_stops_at_the_total_deadline_on_a_slow_drip(server: _Server) -> None:
+    """Each byte comes inside the socket timeout, so only a total deadline stops the read."""
+    server.body = json.dumps({"keys": [dict(es256_key().public_jwk)]}).encode()
+    server.drip_seconds = 0.1
+
+    elapsed = _elapsed_fetch(HttpJwksFetcher(server.url, timeout_seconds=1, total_seconds=0.5))
+
+    assert elapsed < 1.5
+
+
+def test_http_fetcher_thread_stops_at_the_total_deadline_on_a_stall(server: _Server) -> None:
+    server.stall_seconds = 3
+
+    elapsed = _elapsed_fetch(HttpJwksFetcher(server.url, timeout_seconds=5, total_seconds=0.5))
+
+    assert elapsed < 1.5
+
+
+def test_http_fetcher_deadline_is_shorter_than_the_cache_deadline() -> None:
+    """The worker thread ends before the cache stops waiting, so fetch threads cannot pile up."""
+    fetcher = HttpJwksFetcher("https://project-ref.supabase.test/auth/v1/.well-known/jwks.json")
+    cache = JwksCache(fetcher)
+
+    assert fetcher.total_seconds < cache.fetch_timeout_seconds
 
 
 def test_app_builds_a_verifier_from_settings_end_to_end(server: _Server) -> None:
