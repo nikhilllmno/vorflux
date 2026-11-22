@@ -137,11 +137,13 @@ Merge in this order: #4, #5, #6, #7, then #9 (DEX-12, section below). Use a merg
   Postgres provider lands. Adds `pyjwt[crypto]` and the `HARNESS_AUTH_*` names in `.env.example`.
 - Risk: Medium (4/10, review). Security-sensitive code, but it fails closed, has no migration
   or data, and no hosted environment sets `HARNESS_AUTH_*`. Only `/v1/orgs/{org_id}/hotels/{hotel_id}/me` uses it.
-- Head: `cad1157`, CI 4/4 green. Backend on the branch: 174 passed.
-- Merge order: after #7. I merged `cad1157` locally onto `main` + #4 to #7 in that order (throwaway
+- Side effect: the JWKS fetcher "connects directly and does not use `HTTPS_PROXY`" (`docs/auth.md`).
+  Fly.io uses no proxy for the key fetch. A host that needs a proxy to reach Supabase gets 503 on tenant routes.
+- Head: `36bba07`, CI 4/4 green. Backend on the branch: 177 passed.
+- Merge order: after #7. I merged `36bba07` locally onto `main` + #4 to #7 in that order (throwaway
   branch, not pushed). Only `backend/uv.lock` conflicts (#5 adds `psycopg` and #9 adds
   `pyjwt`/`cryptography` at the same place in the lock file). Fix: keep the stack's lock file and run
-  `uv lock`. Then the backend checks pass: 737 passed, 893 database tests skipped (#9 changes no SQL).
+  `uv lock`. Then the backend checks pass: 740 passed, 893 database tests skipped (#9 changes no SQL).
   Before you merge #9, ask me to merge `main` into its branch; that regenerates the lock file.
 - Rollback: revert the PR. Nothing else calls the dependency yet.
 - Open decisions (default = what the PR builds; full table in `docs/auth.md`):
@@ -151,8 +153,10 @@ Merge in this order: #4, #5, #6, #7, then #9 (DEX-12, section below). Use a merg
   - A4 Effective role = highest covering membership (org-wide or this hotel), as #5 RLS.
   - A5 Anonymous Supabase sign-ins are refused.
   - A6 No membership cache; a removed membership takes effect on the next request.
-  - A7 JWKS cache 10 min, refreshed in the background; unknown-kid refetch at most every 30 s;
-    last good keys up to 1 h when the endpoint fails or returns no usable key.
+  - A7 JWKS timing, quoted from `docs/auth.md`: "Cache 10 min, refreshed in the background (cached kids
+    never wait); refetch for an unknown kid at most every 30 s; 10 s total deadline per fetch (the fetch
+    thread itself stops at 8 s); last good keys for up to 1 h when the endpoint fails **or** returns no
+    usable key. After an urgent key revocation, restart the API to drop the cache."
   - A8 `psycopg` becomes a runtime dependency for the Postgres provider.
   - A9 Remove the `SUPABASE_JWT_ISSUER` placeholder in the #5 follow-up.
   - A10 Minimum role per action: viewer view; operator runs and changes; admin approval settings
