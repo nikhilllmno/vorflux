@@ -22,7 +22,8 @@ layers). Linear: [DEX-12](https://linear.app/dextr-ai/issue/DEX-12/m1-supabase-j
 4. `require_tenant(action)` asks the `MembershipProvider` for the user's role in that hotel of that
    org, compares it with the minimum role for the action, and returns an immutable
    `TenantContext(org_id, hotel_id, actor_id, role)`. Service functions take this context as an
-   argument (§7.2); nothing reads tenant scope from globals or tool arguments.
+   argument (§7.2) and use `tenant.org_id` and `tenant.hotel_id`, never org or hotel ids from the
+   request body or query string. Nothing reads tenant scope from globals or tool arguments.
 
 ```python
 @router.post("/runs")
@@ -59,17 +60,21 @@ standby key before Supabase Auth signs with it
 `JwksCache` (`harness/auth/jwks.py`) follows these rules:
 
 - It fetches the JWKS on first use and again when the copy is older than
-  `HARNESS_AUTH_JWKS_CACHE_SECONDS` (default 600, the same as Supabase's edge cache).
+  `HARNESS_AUTH_JWKS_CACHE_SECONDS` (default 600, the same as Supabase's edge cache). That
+  refresh runs in the background: a request whose `kid` is in the copy uses it and does not wait
+  for the JWKS endpoint. A request waits only when there are no usable keys or its `kid` is
+  unknown.
 - A token with an unknown `kid` causes at most one refetch per
   `HARNESS_AUTH_JWKS_MIN_REFETCH_SECONDS` (default 30). Forged tokens with random kids cannot turn
   the API into a JWKS request amplifier. Concurrent requests share one fetch.
-- If a refresh fails, the last good keys stay in use for up to 1 hour after they were fetched.
-  With no usable keys (none fetched, too old, or a JWKS that lists no usable key), the API
-  returns 503, not 401: the fault is on the server side, not in the user's token.
+- If a refresh fails, or returns a JWKS that lists no usable key, the last good keys stay in use
+  for up to 1 hour after they were fetched, and the API logs an error. With no usable keys (none
+  fetched yet, or the last good ones older than 1 hour), the API returns 503, not 401: the fault
+  is on the server side, not in the user's token.
 - It keeps only signature keys of type `RSA` (RS256, at least 2048 bits) and `EC` on P-256
   (ES256). It never uses a symmetric (`oct`) key. A `kid` that is listed twice is ignored.
-- The HTTP fetcher uses HTTPS, does not follow redirects, has a 5 second timeout, and refuses a
-  document larger than 64 KiB. Settings allow plain HTTP only for `127.0.0.1`, `localhost` or
+- The HTTP fetcher uses HTTPS, does not follow redirects, has a 5 second timeout per socket
+  operation and a 10 second total deadline per fetch, and refuses a document larger than 64 KiB. Settings allow plain HTTP only for `127.0.0.1`, `localhost` or
   `::1` when `HARNESS_ENVIRONMENT` is `local` or `test`.
 
 ### Why there is no HS256 fallback
@@ -88,7 +93,7 @@ legacy secret can move to signing keys from the dashboard with no downtime. See 
 | 401, `WWW-Authenticate: Bearer error="invalid_token"` | The token fails any check | `not authenticated` |
 | 403 | No membership covers the hotel, the hotel is not in the org, the org or hotel does not exist, or the role is below the action's minimum | `forbidden` (identical in every case) |
 | 422 | A path id is not a UUID (only after the token is valid) | validation error |
-| 503 | Auth is not configured, no membership provider is set, the in-memory provider is set outside `local` or `test`, or no usable signing key can be loaded | short reason |
+| 503 | Auth is not configured, no membership provider is set, the in-memory provider is set outside `local` or `test`, or no usable signing key can be loaded | `service unavailable` (identical in every case; the cause goes to the server log) |
 
 - The token is checked before the path ids. A caller without a valid token always gets 401 and
   learns nothing about orgs or hotels.
@@ -96,7 +101,9 @@ legacy secret can move to signing keys from the dashboard with no downtime. See 
   a hotel exists. The provider answers all these cases with one query shape.
 - Inside an allowed hotel, a resource id that belongs to another tenant still returns 404, not 403
   (§7.4). That rule belongs to each resource route, not to this dependency.
-- The reason for a 401 or 403 goes to the server log only.
+- The reason for a 401, 403 or 503 goes to the server log only.
+- The unknown-`kid` refetch limit is per process. The API image runs one uvicorn process per
+  machine, so the limit is one refetch per 30 seconds per machine.
 
 ## Roles
 
@@ -121,6 +128,19 @@ approval policy (DEX-20, PR #6), which admins configure per operation kind.
 Our team's roles (`code_reviewer`, `platform`) give no access through `require_tenant`. A
 `TenantContext` that has no role allows no action.
 
+### Rules for the members routes (later PR)
+
+`require_tenant(Action.MANAGE_MEMBERS)` lets an admin of one hotel reach that hotel's members
+route. The route runs with the service role, so it must also enforce these rules in code (they
+match what PR #5 RLS lets each caller see):
+
+- A hotel-scoped admin manages only membership rows with `hotel_id` equal to that hotel.
+- Nobody grants or keeps a role above their own effective role in that hotel, and nobody changes
+  a row whose role is above their own.
+- Org-wide rows (`hotel_id` null) are managed only through an org route with
+  `require_org(Action.MANAGE_MEMBERS)` (decision A11), which needs an org-wide `admin` or `owner`
+  row. PR #5 RLS shows org-wide rows only to those users.
+
 ## Membership provider
 
 ```python
@@ -134,6 +154,9 @@ class MembershipProvider(Protocol):
 - `create_app` sets no provider, so tenant routes return 503 until the Postgres provider exists.
 - The provider is read on every request (no cache), so a removed membership takes effect on the
   next request, as in RLS.
+- Sign-out, a ban or a revoked Supabase session do **not** take effect at once. The API accepts
+  the access token until its `exp` (Supabase default: 1 hour after it is issued). To cut access
+  at once, remove the membership.
 
 ## How this joins PR #5 (tenancy schema and RLS)
 
@@ -153,9 +176,12 @@ where m.user_id = $1 and m.org_id = $2 and (m.hotel_id is null or m.hotel_id = $
 - It runs in the control plane with the service role, which bypasses RLS (§4.1). The API checks
   the role in code; RLS is the second guard under it (§7.2).
 - **`auth.uid()` alignment.** `TenantContext.actor_id` is the JWT `sub`, which is the value that
-  `auth.uid()` returns in Postgres. The API and the RLS policies therefore name the same user. If a
-  later route forwards the user's own token to the Data API, RLS applies to the same user and the
-  same scope as `require_tenant`.
+  `auth.uid()` returns in Postgres. The API and the RLS policies therefore name the same user. For
+  **reads**, if a later route forwards the user's own token to the Data API, RLS applies to the
+  same user and the same scope as `require_tenant`. For **writes** it does not: PR #5 grants
+  `authenticated` only `SELECT` and has no insert, update or delete policy, so every write that
+  `require_tenant` allows (for example an operator who starts a run) goes through the control
+  plane with the service role.
 - `create_app` sets `app.state.membership_provider` to the Postgres provider. The Postgres driver
   becomes a runtime dependency then (PR #5 has `psycopg` as a dev dependency only); see decision A8.
 - The PR #5 isolation tests already cover the scope rule in SQL. The follow-up adds a test that
@@ -170,8 +196,14 @@ follow-up PR:
   token is always a person; a run token from DEX-18 must use another issuer or audience, so it
   cannot pass these checks), `memberships` from a new `MembershipProvider.memberships_for(user_id)`,
   and `team_roles` from `public.team_roles` (unexpired rows only).
-- Gates each approval route with `require_tenant(Action.VIEW)`, so a non-member gets the same
-  403 as here. PR #6's service still makes its own approver check (role in the request snapshot and
+- Gates each **hotel** approval route (operation kinds other than `git_push` and `code_change`)
+  with `require_tenant(Action.VIEW)`, so a non-member gets the same 403 as here.
+- Gates **code** approvals (`git_push`, `code_change`) differently, because PR #6 lets a person
+  with an unexpired `code_reviewer` team role view and decide them in any hotel without a hotel
+  membership. A code-approval route accepts a caller who passes `require_tenant(Action.VIEW)` **or**
+  has that team role (a `require_team_role("code_reviewer")` dependency that reads
+  `public.team_roles`). It still checks that the hotel belongs to the org (the `hotels` join),
+  because PR #6's `Membership.covers` does not. See decision A12. PR #6's service still makes its own approver check (role in the request snapshot and
   in the current policy, no self-approval of `high` risk). `code_reviewer` approvals
   (`git_push`, `code_change`) come from `team_roles`, not from a hotel membership.
 - Makes `harness.approvals.model.HotelRole` an import of `harness.tenancy.HotelRole` (same labels
@@ -183,6 +215,7 @@ follow-up PR:
 
 | Variable | Default | Notes |
 |---|---|---|
+| `HARNESS_ENVIRONMENT` | `local` | `local` and `test` allow the in-memory provider and an http JWKS URL. Settings refuse them when `FLY_APP_NAME` is set (every Fly.io machine), so a deployed machine must say `staging` or `production`. |
 | `HARNESS_AUTH_ISSUER` | unset | `https://<project-ref>.supabase.co/auth/v1`. Set it together with the JWKS URL. |
 | `HARNESS_AUTH_JWKS_URL` | unset | `<issuer>/.well-known/jwks.json`. HTTPS; plain HTTP only for a local stack. |
 | `HARNESS_AUTH_AUDIENCE` | `authenticated` | Supabase user tokens. Cannot be blank. |
@@ -213,19 +246,20 @@ Each decision has a safe default, which is what this PR builds.
 | A4 | Effective role with several memberships | The highest covering role (org-wide or this hotel), as PR #5 RLS. | (b) The hotel-scoped row wins over the org-wide row. |
 | A5 | Anonymous Supabase sign-ins | Refused (`is_anonymous`). | (b) Accept them; they still need a membership to reach a hotel. |
 | A6 | Membership caching | None: one indexed query per request, so removal is immediate. | (b) Cache for up to 30 s. |
-| A7 | JWKS timing | Cache 10 min, refetch for an unknown kid at most every 30 s, last good keys for up to 1 h in an outage. After an urgent key revocation, restart the API to drop the cache. | (b) Shorter cache; (c) fail closed at once on a refresh failure. |
+| A7 | JWKS timing | Cache 10 min, refreshed in the background (cached kids never wait); refetch for an unknown kid at most every 30 s; 10 s total deadline per fetch; last good keys for up to 1 h when the endpoint fails **or** returns no usable key. After an urgent key revocation, restart the API to drop the cache. | (b) Shorter cache; (c) fail closed at once on a refresh failure or an empty JWKS. |
 | A8 | Postgres driver for the provider (follow-up) | `psycopg` (already in PR #5 as a dev dependency) becomes a runtime dependency. | (b) `asyncpg`. |
 | A9 | `SUPABASE_JWT_ISSUER` in `.env.example` | Keep it until PR #5 merges, then remove it in the PR #5 follow-up (removing it now would conflict with PR #5). | (b) Read it as an alias of `HARNESS_AUTH_ISSUER`. |
 | A10 | Minimum role per action | The table in "Roles". | Change a row. |
-| A11 | Org-level routes (no hotel) | Not in this PR. A later `require_org(action)` uses org-wide memberships only. | — |
+| A11 | Org-level routes (no hotel) | Not in this PR. A later `require_org(action)` uses org-wide memberships only. This is stricter than PR #5 `orgs_select_members`, which lets any member (also hotel-scoped) read the org row; a hotel-scoped member reads org details through the hotel routes. | (b) Let hotel-scoped members read the org row through `require_org(Action.VIEW)`, as RLS does. |
+| A12 | Gate for code approvals (PR #6 follow-up) | Hotel member with `view`, **or** an unexpired `code_reviewer` team role; hotel approvals need hotel membership. PR #6's service makes the approver check. | (b) Code approvals only on a separate team route (`/v1/team/approvals`). |
 
 ## Tests
 
 | File | What it proves |
 |---|---|
-| `test_auth_tokens.py` | Valid ES256 and RS256 tokens; expired, no `exp`, `nbf` and `iat` in the future, no `iat`; wrong or missing `iss` and `aud`; another key with our `kid`, tampered payload, embedded `jwk` header; malformed and oversized tokens; `alg: none` in any case; HS256 signed with the public key; a symmetric key in the JWKS; header `alg` that does not match the key type or the JWK `alg`; an encryption key; an algorithm outside the allow-list; no `kid`; bad `sub`, non-user `role`, anonymous sessions. |
-| `test_auth_jwks.py` | One fetch for many tokens; refetch after the TTL; rotation (a new `kid` causes one refetch and verifies; the old key stays valid while published, and is refused after it is removed); unknown-kid refetch rate limit; 10 concurrent requests share one fetch; outage: 503 with no keys, last good keys up to max stale, retries rate-limited; a JWKS with no usable key is 503 and an unknown kid next to usable keys is 401; malformed documents; only asymmetric signature keys are kept. |
+| `test_auth_tokens.py` | Valid ES256 and RS256 tokens; expired, no `exp`, `nbf` and `iat` in the future, no `iat`; wrong or missing `iss` and `aud`; another key with our `kid`, tampered payload, embedded `jwk` header; malformed and oversized tokens; `alg: none` in any case; HS256 signed with the public key; a symmetric key in the JWKS; header `alg` that does not match the key type or the JWK `alg`; an encryption key; an algorithm outside the allow-list; a `crit` header with an unknown or bad extension; no `kid`; bad `sub`, non-user `role`, anonymous sessions. |
+| `test_auth_jwks.py` | One fetch for many tokens; refetch after the TTL; rotation (a new `kid` causes one refetch and verifies; the old key stays valid while published, and is refused after it is removed); unknown-kid refetch rate limit; 10 concurrent requests share one fetch; after the TTL, 20 requests with a cached kid get keys at once while one background refresh waits on a hanging endpoint; a hanging fetch hits the total deadline and does not block later refreshes; outage: 503 with no keys, last good keys up to max stale, retries rate-limited; a JWKS with no usable key is 503 at first fetch, keeps the last good keys on a refresh, and an unknown kid next to usable keys is 401; malformed documents; only asymmetric signature keys are kept. |
 | `test_auth_memberships.py` | In-memory provider: org-wide and hotel-scoped scope, hotel of another org, highest role wins, PR #5 constraints, removal. |
-| `test_auth_api.py` | HTTP edge: 200 with the context; 401 for missing, malformed and bad tokens, before any membership check and before path validation; 403 for no membership, cross-org (including another org's hotel under your own org), cross-hotel; identical 403 bodies whether the org or hotel exists or not; role too low looks the same as no membership; hotel admin rights do not carry to other hotels; removal takes effect at once; 503 when auth, the provider or the JWKS is missing, and for the in-memory provider in staging and production. |
-| `test_auth_config.py` | Settings defaults, env variable names, empty variables, refused algorithms, blank issuer or audience, issuer and JWKS URL set together, HTTPS rule, the HTTP fetcher (size cap, no redirects) and an end-to-end app that builds its verifier from settings and fetches the JWKS once. |
+| `test_auth_api.py` | HTTP edge: 200 with the context; 401 for missing, malformed and bad tokens, before any membership check and before path validation; 403 for no membership, cross-org (including another org's hotel under your own org), cross-hotel; identical 403 bodies whether the org or hotel exists or not; role too low looks the same as no membership; hotel admin rights do not carry to other hotels; removal takes effect at once; 503 when auth, the provider or the JWKS is missing, and for the in-memory provider in staging and production; every 503 has the same body. |
+| `test_auth_config.py` | Settings defaults, env variable names, empty variables, refused algorithms, blank issuer or audience, `local` or `test` refused on Fly.io, issuer and JWKS URL set together, HTTPS rule, the HTTP fetcher (size cap, no redirects) and an end-to-end app that builds its verifier from settings and fetches the JWKS once. |
 | `test_tenancy.py` | Role ranks match PR #5, the minimum role per action, a context without a role allows nothing. |
