@@ -57,5 +57,10 @@ describe("build-time guard", () => {
     vi.stubEnv("NEXT_PUBLIC_SUPABASE_ANON_KEY", PUBLISHABLE_KEY);
     const config = (await import("../../next.config")).default;
     expect(config.cacheComponents).toBe(true);
+    expect(config.poweredByHeader).toBe(false);
+    const rules = (await config.headers?.()) ?? [];
+    const keys = rules.flatMap((rule) => rule.headers.map((h) => h.key));
+    expect(rules.map((rule) => rule.source)).toEqual(["/:path*"]);
+    expect(keys).toEqual(expect.arrayContaining(["Content-Security-Policy", "Referrer-Policy"]));
   });
 });

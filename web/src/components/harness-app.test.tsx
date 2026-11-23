@@ -16,6 +16,7 @@ import {
   meFor,
   ORG_A,
   ORG_B,
+  OTHER_USER_ID,
   USER,
   USER_ID,
 } from "@/test/fixtures";
@@ -125,6 +126,17 @@ describe("sign-in and sign-out", () => {
 
     act(() => authControl.emit(null));
     expect(await screen.findByRole("heading", { name: "Sign in" })).toBeDefined();
+  });
+
+  it("forgets the chosen hotel when another tab signs out", async () => {
+    const { deps, authControl } = fakeDeps();
+    render(<HarnessApp deps={deps} />);
+    await screen.findByText(/as operator/);
+    expect(deps.selection.load(USER_ID)).not.toBeNull();
+
+    act(() => authControl.emit(null));
+    await screen.findByRole("heading", { name: "Sign in" });
+    expect(deps.selection.load(USER_ID)).toBeNull();
   });
 
   it("stops listening to auth events when it unmounts", async () => {
@@ -252,6 +264,19 @@ describe("hotel switcher", () => {
 });
 
 describe("API errors for the chosen hotel", () => {
+  it("does not show a role that the API reports for another user", async () => {
+    // For example, another tab signed in as someone else while this request was in flight.
+    const { deps } = fakeDeps();
+    deps.api.getMe.mockImplementation(async (tenant) => ({
+      ...meFor(tenant, "owner"),
+      userId: OTHER_USER_ID,
+    }));
+    render(<HarnessApp deps={deps} />);
+
+    expect((await screen.findByRole("alert")).textContent).toBe("Something went wrong. Try again.");
+    expect(screen.queryByText(/as owner/)).toBeNull();
+  });
+
   it("shows one plain message for a 403", async () => {
     const { deps } = fakeDeps();
     deps.api.getMe.mockRejectedValue(new HarnessApiError("forbidden", 403));

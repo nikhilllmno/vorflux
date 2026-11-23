@@ -72,4 +72,35 @@ describe("parsePublicConfig", () => {
       });
     },
   );
+
+  it.each(["NEXT_PUBLIC_SUPABASE_URL", "NEXT_PUBLIC_HARNESS_API_URL"] as const)(
+    "refuses plain http for a remote host in %s, so no password or token travels in clear text",
+    (name) => {
+      const result = parsePublicConfig({ ...VALID, [name]: "http://db.example.com" });
+      expect(result).toEqual({
+        ok: false,
+        problems: [`${name} must use https (plain http is allowed only for localhost).`],
+      });
+    },
+  );
+
+  it.each(["http://localhost:8000", "http://127.0.0.1:54321", "http://[::1]:8000"])(
+    "allows plain http for the local host %s",
+    (url) => {
+      const result = parsePublicConfig({
+        ...VALID,
+        NEXT_PUBLIC_SUPABASE_URL: url,
+        NEXT_PUBLIC_HARNESS_API_URL: url,
+      });
+      expect(result.ok).toBe(true);
+    },
+  );
+
+  it("does not treat a host that only starts with localhost as local", () => {
+    const result = parsePublicConfig({
+      ...VALID,
+      NEXT_PUBLIC_HARNESS_API_URL: "http://localhost.example.com",
+    });
+    expect(result.ok).toBe(false);
+  });
 });

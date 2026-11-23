@@ -34,9 +34,12 @@ function json(body: unknown, status = 200) {
 describe("createBrowserDeps (real clients, mocked network)", () => {
   const token = fakeAccessToken();
   let seen: Seen[];
+  let logoutAnswer: "ok" | "network" | 500 | 401;
 
   beforeEach(() => {
     seen = [];
+    logoutAnswer = "ok";
+    window.localStorage.clear();
     vi.stubGlobal(
       "fetch",
       vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -58,7 +61,11 @@ describe("createBrowserDeps (real clients, mocked network)", () => {
             user: { id: USER_ID, email: "staff@example.test", aud: "authenticated" },
           });
         }
-        if (url.pathname === "/auth/v1/logout") return new Response(null, { status: 204 });
+        if (url.pathname === "/auth/v1/logout") {
+          if (logoutAnswer === "network") throw new TypeError("Failed to fetch");
+          if (logoutAnswer === "ok") return new Response(null, { status: 204 });
+          return json({ message: "logout failed" }, logoutAnswer);
+        }
         if (url.pathname === "/rest/v1/memberships") {
           return json([{ user_id: USER_ID, org_id: ORG_A, hotel_id: HOTEL_A1, role: "operator" }]);
         }
@@ -130,4 +137,23 @@ describe("createBrowserDeps (real clients, mocked network)", () => {
     expect(await d.auth.currentUser()).toBeNull();
     expect(await d.auth.accessToken()).toBeNull();
   });
+
+  // auth.ts relies on supabase-js removing the local session even when the revoke call fails.
+  // That behaviour changed across supabase-js versions, so check it with the real client.
+  it.each(["network", 500, 401] as const)(
+    "removes the local session when the logout request fails (%s)",
+    async (failure) => {
+      const d = deps();
+      await d.auth.signIn("staff@example.test", "pw");
+      expect(Object.keys(window.localStorage).some((k) => k.startsWith("sb-"))).toBe(true);
+
+      logoutAnswer = failure;
+      await d.auth.signOut();
+
+      expect(seen.some((s) => s.url.pathname === "/auth/v1/logout")).toBe(true);
+      expect(Object.keys(window.localStorage).filter((k) => k.startsWith("sb-"))).toEqual([]);
+      expect(await d.auth.currentUser()).toBeNull();
+      expect(await d.auth.accessToken()).toBeNull();
+    },
+  );
 });

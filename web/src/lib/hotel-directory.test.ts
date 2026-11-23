@@ -16,10 +16,18 @@ import {
   USER_ID,
 } from "@/test/fixtures";
 
-type Call = { table: string; columns: string; filters: Array<[string, string, unknown]> };
+type Call = {
+  table: string;
+  columns: string;
+  filters: Array<[string, string, unknown]>;
+  range?: [number, number];
+};
 
-/** A stand-in for the Supabase Data API: records each query and answers per table. */
-function fakeReader(answers: Record<string, QueryResult>) {
+/**
+ * A stand-in for the Supabase Data API: records each request and answers per table. Like
+ * PostgREST, it returns at most `maxRows` rows per request whatever range was asked for.
+ */
+function fakeReader(answers: Record<string, QueryResult>, maxRows = 1000) {
   const calls: Call[] = [];
   const reader: TableReader = {
     from(table) {
@@ -36,12 +44,25 @@ function fakeReader(answers: Record<string, QueryResult>) {
               call.filters.push(["in", column, [...values]]);
               return builder;
             },
+            order(column: string) {
+              call.filters.push(["order", column, "asc"]);
+              return builder;
+            },
+            range(from: number, to: number) {
+              call.range = [from, to];
+              return builder;
+            },
             then<R1 = QueryResult, R2 = never>(
               onFulfilled?: ((value: QueryResult) => R1 | PromiseLike<R1>) | null,
               onRejected?: ((reason: unknown) => R2 | PromiseLike<R2>) | null,
             ) {
               const answer = answers[table] ?? { data: [], error: null };
-              return Promise.resolve(answer).then(onFulfilled, onRejected);
+              let data = answer.data;
+              if (Array.isArray(data)) {
+                const [from, to] = call.range ?? [0, data.length - 1];
+                data = data.slice(from, Math.min(to + 1, from + maxRows));
+              }
+              return Promise.resolve({ ...answer, data }).then(onFulfilled, onRejected);
             },
           };
           return builder;
@@ -111,6 +132,49 @@ describe("createSupabaseHotelDirectory", () => {
     const { reader, calls } = fakeReader({ memberships: { data: [], error: null } });
     expect(await createSupabaseHotelDirectory(reader).listMyHotels(USER_ID)).toEqual([]);
     expect(calls.map((c) => c.table)).toEqual(["memberships"]);
+  });
+
+  it("reads every page when the server caps the rows per response", async () => {
+    // PostgREST returns at most `max_rows` rows with no error, so one request is not enough.
+    const many = Array.from({ length: 5 }, (_, i) => {
+      const id = `a${i}000000-0000-4000-8000-00000000000${i}`;
+      return { ...hotelRows[0], id, slug: `acme-${i}`, name: `Acme ${i}` };
+    });
+    const { reader, calls } = fakeReader(
+      {
+        memberships: { data: [m(ORG_A, null, "viewer")], error: null },
+        hotels: { data: many, error: null },
+      },
+      2,
+    );
+    const list = await createSupabaseHotelDirectory(reader).listMyHotels(USER_ID);
+
+    expect(list).toHaveLength(5);
+    const hotelCalls = calls.filter((c) => c.table === "hotels");
+    expect(hotelCalls.map((c) => c.range?.[0])).toEqual([0, 2, 4, 5]);
+    // Stable paging needs a fixed order.
+    expect(hotelCalls.every((c) => c.filters.some((f) => f[0] === "order" && f[1] === "id"))).toBe(
+      true,
+    );
+  });
+
+  it("stops with an error instead of paging without end", async () => {
+    // A server that ignores the range and always answers with a row must not loop forever.
+    const answer: QueryResult = { data: [m(ORG_A, null, "viewer")], error: null };
+    const builder = {
+      eq: () => builder,
+      in: () => builder,
+      order: () => builder,
+      range: () => builder,
+      then: <R1, R2>(
+        ok?: ((v: QueryResult) => R1 | PromiseLike<R1>) | null,
+        bad?: ((r: unknown) => R2 | PromiseLike<R2>) | null,
+      ) => Promise.resolve(answer).then(ok, bad),
+    };
+    const reader: TableReader = { from: () => ({ select: () => builder }) };
+    await expect(createSupabaseHotelDirectory(reader).listMyHotels(USER_ID)).rejects.toBeInstanceOf(
+      HotelDirectoryError,
+    );
   });
 
   it("drops membership rows of another user, unknown roles and malformed ids", async () => {
