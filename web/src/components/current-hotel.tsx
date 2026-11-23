@@ -20,10 +20,13 @@ type MeState =
  * gives each hotel its own key, so a late answer for an earlier hotel never shows here.
  */
 export function CurrentHotel({
+  userId,
   hotel,
   deps,
   onSessionEnded,
 }: {
+  /** The signed-in user. An answer about anyone else is not shown. */
+  userId: string;
   hotel: HotelAccess;
   deps: Pick<HarnessDeps, "auth" | "api">;
   onSessionEnded: () => void;
@@ -44,7 +47,11 @@ export function CurrentHotel({
       }
       try {
         const me = await deps.api.getMe({ orgId, hotelId }, token, signal);
-        if (!signal.aborted) setState({ status: "ready", me });
+        if (signal.aborted) return;
+        // Another tab can sign in as someone else while this request is in flight; the auth
+        // listener then remounts the workspace, and this answer must not show meanwhile.
+        if (me.userId.toLowerCase() !== userId.toLowerCase()) setState({ status: "failed" });
+        else setState({ status: "ready", me });
       } catch (error) {
         if (signal.aborted) return;
         const kind = error instanceof HarnessApiError ? error.kind : "unexpected";
@@ -55,7 +62,7 @@ export function CurrentHotel({
       }
     })();
     return () => controller.abort();
-  }, [deps.auth, deps.api, orgId, hotelId, attempt, onSessionEnded]);
+  }, [deps.auth, deps.api, userId, orgId, hotelId, attempt, onSessionEnded]);
 
   const retry = () => {
     setState({ status: "loading" });

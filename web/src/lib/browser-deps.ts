@@ -35,6 +35,8 @@ function filterBuilder(query: PostgrestQuery): FilterBuilder {
   return {
     eq: (column, value) => filterBuilder(query.eq(column, value)),
     in: (column, values) => filterBuilder(query.in(column, values)),
+    order: (column) => filterBuilder(query.order(column, { ascending: true })),
+    range: (from, to) => filterBuilder(query.range(from, to)),
     then: (onFulfilled, onRejected) =>
       query
         .then((result: QueryResult): QueryResult => ({ data: result.data, error: result.error }))

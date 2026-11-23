@@ -34,13 +34,18 @@ export function HarnessApp({ deps }: { deps: HarnessDeps }) {
   // Each sign-in or sign-out bumps this. A call that finishes after a newer one started does not
   // write the auth state, so a slow logout request cannot undo a later sign-in.
   const latestAuthCall = useRef(0);
+  // The user this tab shows, for auth events that end the session.
+  const signedInUserId = useRef<string | null>(null);
 
   useEffect(() => {
     let active = true;
     let heardEvent = false;
     const stop = deps.auth.onUserChange((user) => {
       heardEvent = true;
-      if (active) setAuth(authStateFor(user));
+      if (!active) return;
+      // A sign-out in another tab arrives here too; forget that user's hotel as this tab would.
+      if (!user && signedInUserId.current) deps.selection.clear(signedInUserId.current);
+      setAuth(authStateFor(user));
     });
     // An auth event that arrives first is newer than this read, so it wins.
     deps.auth.currentUser().then(
@@ -55,9 +60,12 @@ export function HarnessApp({ deps }: { deps: HarnessDeps }) {
       active = false;
       stop();
     };
-  }, [deps.auth]);
+  }, [deps.auth, deps.selection]);
 
   const userId = auth.status === "signed_in" ? auth.user.id : null;
+  useEffect(() => {
+    signedInUserId.current = userId;
+  }, [userId]);
 
   const signOut = useCallback(
     async (message: string | null) => {
@@ -185,6 +193,7 @@ function HotelWorkspace({
             onChange={(hotel) => setPreferred({ orgId: hotel.orgId, hotelId: hotel.hotelId })}
           />
           <CurrentHotel
+            userId={user.id}
             key={`${selected.orgId}/${selected.hotelId}`}
             hotel={selected}
             deps={deps}

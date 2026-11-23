@@ -30,6 +30,8 @@ export interface QueryResult {
 export interface FilterBuilder extends PromiseLike<QueryResult> {
   eq(column: string, value: string): FilterBuilder;
   in(column: string, values: readonly string[]): FilterBuilder;
+  order(column: string): FilterBuilder;
+  range(from: number, to: number): FilterBuilder;
 }
 
 /** The part of the Supabase client this module uses. */
@@ -77,12 +79,29 @@ function parseHotel(row: Row): HotelRow | null {
   };
 }
 
-async function query(builder: FilterBuilder): Promise<Row[]> {
-  try {
-    return rows(await builder);
-  } catch {
-    throw new HotelDirectoryError();
+// PostgREST returns at most `max_rows` rows per request (1000 by default) without an error, so
+// every read pages until an empty page. The cap bounds a misbehaving server.
+const PAGE_SIZE = 1000;
+const MAX_PAGES = 20;
+
+/** Reads every row, ordered by `id` so the pages are stable. */
+async function readAll(makeQuery: () => FilterBuilder): Promise<Row[]> {
+  const all: Row[] = [];
+  for (let page = 0; page < MAX_PAGES; page++) {
+    let batch: Row[];
+    try {
+      batch = rows(
+        await makeQuery()
+          .order("id")
+          .range(all.length, all.length + PAGE_SIZE - 1),
+      );
+    } catch {
+      throw new HotelDirectoryError();
+    }
+    if (batch.length === 0) return all;
+    all.push(...batch);
   }
+  throw new HotelDirectoryError();
 }
 
 export function createSupabaseHotelDirectory(client: TableReader): HotelDirectory {
@@ -93,7 +112,7 @@ export function createSupabaseHotelDirectory(client: TableReader): HotelDirector
 
       // RLS shows admins other users' rows too, so filter on the caller's own user id.
       const memberships = (
-        await query(
+        await readAll(() =>
           client.from("memberships").select("user_id, org_id, hotel_id, role").eq("user_id", id),
         )
       )
@@ -103,7 +122,7 @@ export function createSupabaseHotelDirectory(client: TableReader): HotelDirector
 
       const orgIds = [...new Set(memberships.map((m) => m.orgId))];
       const hotels = (
-        await query(
+        await readAll(() =>
           client
             .from("hotels")
             .select("id, org_id, slug, name, orgs(id, slug, name)")

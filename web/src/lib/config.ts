@@ -1,5 +1,6 @@
 // Public browser configuration. Only NEXT_PUBLIC_* values are read, and Next.js inlines them at
 // build time, so each name is written out literally in `readPublicConfig`.
+import { checkPublicUrl, type PublicUrlName } from "./public-url";
 import { isBrowserSafeKey } from "./supabase-key";
 
 export interface PublicConfig {
@@ -18,16 +19,6 @@ type PublicEnv = Partial<
   >
 >;
 
-function httpUrl(value: string): string | null {
-  try {
-    const url = new URL(value);
-    if (url.protocol !== "https:" && url.protocol !== "http:") return null;
-    return value.replace(/\/+$/, "");
-  } catch {
-    return null;
-  }
-}
-
 export function parsePublicConfig(env: PublicEnv): ConfigResult {
   const problems: string[] = [];
   const value = (name: keyof PublicEnv): string | null => {
@@ -39,10 +30,16 @@ export function parsePublicConfig(env: PublicEnv): ConfigResult {
     return v;
   };
 
-  const rawSupabaseUrl = value("NEXT_PUBLIC_SUPABASE_URL");
-  const supabaseUrl = rawSupabaseUrl && httpUrl(rawSupabaseUrl);
-  if (rawSupabaseUrl && !supabaseUrl)
-    problems.push("NEXT_PUBLIC_SUPABASE_URL must be an http(s) URL.");
+  const url = (name: PublicUrlName) => {
+    const raw = value(name);
+    if (!raw) return null;
+    const checked = checkPublicUrl(name, raw);
+    if (checked.ok) return checked.url;
+    problems.push(checked.problem);
+    return null;
+  };
+
+  const supabaseUrl = url("NEXT_PUBLIC_SUPABASE_URL");
 
   const supabaseAnonKey = value("NEXT_PUBLIC_SUPABASE_ANON_KEY");
   if (supabaseAnonKey && !isBrowserSafeKey(supabaseAnonKey)) {
@@ -51,10 +48,7 @@ export function parsePublicConfig(env: PublicEnv): ConfigResult {
     );
   }
 
-  const rawApiUrl = value("NEXT_PUBLIC_HARNESS_API_URL");
-  const harnessApiUrl = rawApiUrl && httpUrl(rawApiUrl);
-  if (rawApiUrl && !harnessApiUrl)
-    problems.push("NEXT_PUBLIC_HARNESS_API_URL must be an http(s) URL.");
+  const harnessApiUrl = url("NEXT_PUBLIC_HARNESS_API_URL");
 
   if (problems.length > 0 || !supabaseUrl || !supabaseAnonKey || !harnessApiUrl) {
     return { ok: false, problems };
