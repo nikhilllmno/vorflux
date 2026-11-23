@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 import { CurrentHotel } from "@/components/current-hotel";
 import { HotelSwitcher } from "@/components/hotel-switcher";
@@ -31,6 +31,9 @@ function authStateFor(user: SignedInUser | null) {
 export function HarnessApp({ deps }: { deps: HarnessDeps }) {
   const [auth, setAuth] = useState<AuthState>({ status: "loading" });
   const [notice, setNotice] = useState<string | null>(null);
+  // Each sign-in or sign-out bumps this. A call that finishes after a newer one started does not
+  // write the auth state, so a slow logout request cannot undo a later sign-in.
+  const latestAuthCall = useRef(0);
 
   useEffect(() => {
     let active = true;
@@ -58,12 +61,13 @@ export function HarnessApp({ deps }: { deps: HarnessDeps }) {
 
   const signOut = useCallback(
     async (message: string | null) => {
+      const call = ++latestAuthCall.current;
       if (userId) deps.selection.clear(userId);
       setNotice(message);
       try {
         await deps.auth.signOut();
       } finally {
-        setAuth({ status: "signed_out" });
+        if (latestAuthCall.current === call) setAuth({ status: "signed_out" });
       }
     },
     [deps.auth, deps.selection, userId],
@@ -74,11 +78,12 @@ export function HarnessApp({ deps }: { deps: HarnessDeps }) {
 
   const onSignIn = useCallback(
     async (email: string, password: string) => {
+      const call = ++latestAuthCall.current;
       const result = await deps.auth.signIn(email, password);
       if (result.ok) {
         setNotice(null);
         const user = await deps.auth.currentUser();
-        setAuth(authStateFor(user));
+        if (latestAuthCall.current === call) setAuth(authStateFor(user));
       }
       return result;
     },

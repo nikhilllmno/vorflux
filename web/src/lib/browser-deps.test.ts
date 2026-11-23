@@ -101,7 +101,9 @@ describe("createBrowserDeps (real clients, mocked network)", () => {
 
     expect(await d.auth.currentUser()).toEqual({ id: USER_ID, email: "staff@example.test" });
     const hotels = await d.hotels.listMyHotels(USER_ID);
-    expect(hotels.map((h) => [h.orgId, h.hotelId, h.role])).toEqual([[ORG_A, HOTEL_A1, "operator"]]);
+    expect(hotels.map((h) => [h.orgId, h.hotelId, h.role])).toEqual([
+      [ORG_A, HOTEL_A1, "operator"],
+    ]);
 
     const memberships = seen.find((s) => s.url.pathname === "/rest/v1/memberships");
     expect(memberships?.url.searchParams.get("user_id")).toBe(`eq.${USER_ID}`);

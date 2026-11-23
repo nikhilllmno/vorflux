@@ -1,5 +1,6 @@
 // Public browser configuration. Only NEXT_PUBLIC_* values are read, and Next.js inlines them at
 // build time, so each name is written out literally in `readPublicConfig`.
+import { isBrowserSafeKey } from "./supabase-key";
 
 export interface PublicConfig {
   supabaseUrl: string;
@@ -25,30 +26,6 @@ function httpUrl(value: string): string | null {
   } catch {
     return null;
   }
-}
-
-function jwtRole(key: string): unknown {
-  const parts = key.split(".");
-  if (parts.length !== 3) return undefined;
-  try {
-    const json = atob(parts[1].replace(/-/g, "+").replace(/_/g, "/"));
-    const payload: unknown = JSON.parse(json);
-    return typeof payload === "object" && payload !== null
-      ? (payload as Record<string, unknown>).role
-      : undefined;
-  } catch {
-    return undefined;
-  }
-}
-
-/**
- * Only a publishable key (`sb_publishable_...`) or a legacy JWT with role `anon` may reach the
- * browser. A secret key or a `service_role` JWT bypasses RLS, so the app refuses to start with
- * one rather than ship it in the bundle by mistake.
- */
-function isBrowserSafeKey(key: string): boolean {
-  if (key.startsWith("sb_publishable_")) return true;
-  return jwtRole(key) === "anon";
 }
 
 export function parsePublicConfig(env: PublicEnv): ConfigResult {

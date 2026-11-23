@@ -97,6 +97,27 @@ describe("sign-in and sign-out", () => {
     expect(deps.selection.load(USER_ID)).toBeNull();
   });
 
+  it("keeps a new sign-in when an earlier sign-out finishes late", async () => {
+    // supabase-js clears the session and emits SIGNED_OUT before its logout request returns.
+    const { deps, authControl } = fakeDeps();
+    const logout = deferred<void>();
+    deps.auth.signOut.mockImplementationOnce(async () => {
+      authControl.emit(null);
+      await logout.promise;
+    });
+    render(<HarnessApp deps={deps} />);
+    await screen.findByRole("combobox", { name: "Hotel" });
+
+    await userEvent.setup().click(screen.getByRole("button", { name: "Sign out" }));
+    await screen.findByRole("heading", { name: "Sign in" });
+    await signIn();
+    await screen.findByRole("combobox", { name: "Hotel" });
+
+    await act(async () => logout.resolve());
+    expect(screen.getByRole("combobox", { name: "Hotel" })).toBeDefined();
+    expect(screen.queryByRole("heading", { name: "Sign in" })).toBeNull();
+  });
+
   it("returns to the sign-in form when Supabase ends the session", async () => {
     const { deps, authControl } = fakeDeps();
     render(<HarnessApp deps={deps} />);
