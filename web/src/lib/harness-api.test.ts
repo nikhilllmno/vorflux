@@ -13,9 +13,9 @@ function jsonResponse(status: number, body: unknown) {
   });
 }
 
-function apiWith(response: Response | Error) {
+function apiWith(response: Response | Error | DOMException) {
   const fetchImpl = vi.fn<typeof fetch>(async () => {
-    if (response instanceof Error) throw response;
+    if (!(response instanceof Response)) throw response;
     return response;
   });
   return { api: createHarnessApi({ baseUrl: "https://api.example.test/", fetchImpl }), fetchImpl };

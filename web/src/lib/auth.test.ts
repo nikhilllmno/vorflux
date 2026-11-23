@@ -3,7 +3,9 @@ import { describe, expect, it, vi } from "vitest";
 import { createSupabaseAuthGateway, type SupabaseAuthLike } from "@/lib/auth";
 import { USER_ID } from "@/test/fixtures";
 
-type SessionLike = NonNullable<Awaited<ReturnType<SupabaseAuthLike["getSession"]>>["data"]["session"]>;
+type SessionLike = NonNullable<
+  Awaited<ReturnType<SupabaseAuthLike["getSession"]>>["data"]["session"]
+>;
 
 function session(overrides: Partial<SessionLike["user"]> = {}, token = "access-1"): SessionLike {
   return { access_token: token, user: { id: USER_ID, email: "staff@example.test", ...overrides } };
@@ -20,7 +22,10 @@ function fakeSupabaseAuth(initial: SessionLike | null = null) {
       return { data: { subscription: { unsubscribe } } };
     }),
     signInWithPassword: vi.fn(
-      async (credentials: { email: string; password: string }): Promise<{
+      async (credentials: {
+        email: string;
+        password: string;
+      }): Promise<{
         error: { status?: number; code?: string; message: string } | null;
       }> => {
         void credentials;
@@ -52,7 +57,10 @@ describe("createSupabaseAuthGateway", () => {
   });
 
   it.each([
-    [{ status: 400, code: "invalid_credentials", message: "Invalid login credentials" }, "invalid_credentials"],
+    [
+      { status: 400, code: "invalid_credentials", message: "Invalid login credentials" },
+      "invalid_credentials",
+    ],
     [{ status: 429, code: "over_request_rate_limit", message: "rate" }, "rate_limited"],
     [{ status: 500, message: "boom" }, "unavailable"],
     [{ message: "fetch failed" }, "unavailable"],

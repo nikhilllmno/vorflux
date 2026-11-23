@@ -6,7 +6,9 @@ import { parsePublicConfig } from "@/lib/config";
 function jwtWithRole(role: string) {
   const part = (value: object) =>
     btoa(JSON.stringify(value)).replace(/=+$/, "").replace(/\+/g, "-").replace(/\//g, "_");
-  return [part({ alg: "HS256", typ: "JWT" }), part({ role, iss: "supabase" }), "signature"].join(".");
+  return [part({ alg: "HS256", typ: "JWT" }), part({ role, iss: "supabase" }), "signature"].join(
+    ".",
+  );
 }
 const PUBLISHABLE_KEY = ["sb", "publishable", "test0000"].join("_");
 const SECRET_KEY = ["sb", "secret", "test0000"].join("_");
@@ -30,7 +32,10 @@ describe("parsePublicConfig", () => {
   });
 
   it("accepts a legacy anon JWT", () => {
-    const result = parsePublicConfig({ ...VALID, NEXT_PUBLIC_SUPABASE_ANON_KEY: jwtWithRole("anon") });
+    const result = parsePublicConfig({
+      ...VALID,
+      NEXT_PUBLIC_SUPABASE_ANON_KEY: jwtWithRole("anon"),
+    });
     expect(result.ok).toBe(true);
   });
 
@@ -61,7 +66,10 @@ describe("parsePublicConfig", () => {
     "refuses a non-http API URL %s",
     (url) => {
       const result = parsePublicConfig({ ...VALID, NEXT_PUBLIC_HARNESS_API_URL: url });
-      expect(result).toEqual({ ok: false, problems: ["NEXT_PUBLIC_HARNESS_API_URL must be an http(s) URL."] });
+      expect(result).toEqual({
+        ok: false,
+        problems: ["NEXT_PUBLIC_HARNESS_API_URL must be an http(s) URL."],
+      });
     },
   );
 });

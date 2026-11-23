@@ -57,9 +57,27 @@ function m(orgId: string, hotelId: string | null, role: string, userId = USER_ID
 }
 
 const hotelRows = [
-  { id: HOTEL_A1, org_id: ORG_A, slug: "acme-beach", name: "Acme Beach", orgs: { id: ORG_A, slug: "acme", name: "Acme Hotels" } },
-  { id: HOTEL_A2, org_id: ORG_A, slug: "acme-city", name: "Acme City", orgs: { id: ORG_A, slug: "acme", name: "Acme Hotels" } },
-  { id: HOTEL_B1, org_id: ORG_B, slug: "bloom-ranch", name: "Bloom Ranch", orgs: { id: ORG_B, slug: "bloom", name: "Bloom Stays" } },
+  {
+    id: HOTEL_A1,
+    org_id: ORG_A,
+    slug: "acme-beach",
+    name: "Acme Beach",
+    orgs: { id: ORG_A, slug: "acme", name: "Acme Hotels" },
+  },
+  {
+    id: HOTEL_A2,
+    org_id: ORG_A,
+    slug: "acme-city",
+    name: "Acme City",
+    orgs: { id: ORG_A, slug: "acme", name: "Acme Hotels" },
+  },
+  {
+    id: HOTEL_B1,
+    org_id: ORG_B,
+    slug: "bloom-ranch",
+    name: "Bloom Ranch",
+    orgs: { id: ORG_B, slug: "bloom", name: "Bloom Stays" },
+  },
 ];
 
 describe("createSupabaseHotelDirectory", () => {
@@ -130,22 +148,25 @@ describe("createSupabaseHotelDirectory", () => {
 
   it("refuses a user id that is not a UUID without querying", async () => {
     const { reader, calls } = fakeReader({});
-    await expect(createSupabaseHotelDirectory(reader).listMyHotels("anything")).rejects.toBeInstanceOf(
-      HotelDirectoryError,
-    );
+    await expect(
+      createSupabaseHotelDirectory(reader).listMyHotels("anything"),
+    ).rejects.toBeInstanceOf(HotelDirectoryError);
     expect(calls).toEqual([]);
   });
 
-  it.each(["memberships", "hotels"])("turns a %s query error into HotelDirectoryError", async (table) => {
-    const { reader } = fakeReader({
-      memberships: { data: [m(ORG_A, null, "viewer")], error: null },
-      [table]: { data: null, error: { message: "permission denied for table secret_detail" } },
-    });
-    const error = await createSupabaseHotelDirectory(reader)
-      .listMyHotels(USER_ID)
-      .catch((e: unknown) => e);
-    expect(error).toBeInstanceOf(HotelDirectoryError);
-    // The database message stays out of the UI text.
-    expect(String((error as Error).message)).not.toContain("secret_detail");
-  });
+  it.each(["memberships", "hotels"])(
+    "turns a %s query error into HotelDirectoryError",
+    async (table) => {
+      const { reader } = fakeReader({
+        memberships: { data: [m(ORG_A, null, "viewer")], error: null },
+        [table]: { data: null, error: { message: "permission denied for table secret_detail" } },
+      });
+      const error = await createSupabaseHotelDirectory(reader)
+        .listMyHotels(USER_ID)
+        .catch((e: unknown) => e);
+      expect(error).toBeInstanceOf(HotelDirectoryError);
+      // The database message stays out of the UI text.
+      expect(String((error as Error).message)).not.toContain("secret_detail");
+    },
+  );
 });

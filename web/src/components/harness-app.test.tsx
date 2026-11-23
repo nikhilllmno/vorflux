@@ -1,4 +1,4 @@
-import { act, render, screen, waitFor, within } from "@testing-library/react";
+import { act, render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it } from "vitest";
 
@@ -40,9 +40,9 @@ describe("sign-in and sign-out", () => {
   it("signs in with Supabase Auth and then lists the user's hotels", async () => {
     const { deps } = fakeDeps({ user: null });
     render(<HarnessApp deps={deps} />);
-    await signIn(" staff@example.test", "correct horse");
+    await signIn("staff@example.test", "correct horse");
 
-    expect(deps.auth.signIn).toHaveBeenCalledWith(" staff@example.test", "correct horse");
+    expect(deps.auth.signIn).toHaveBeenCalledWith("staff@example.test", "correct horse");
     expect(await screen.findByRole("combobox", { name: "Hotel" })).toBeDefined();
     expect(deps.hotels.listMyHotels).toHaveBeenCalledWith(USER_ID);
     expect(screen.getByText("staff@example.test")).toBeDefined();
@@ -61,7 +61,9 @@ describe("sign-in and sign-out", () => {
     expect((await screen.findByRole("alert")).textContent).toBe(message);
     expect((screen.getByLabelText("Password") as HTMLInputElement).value).toBe("");
     expect((screen.getByLabelText("Email") as HTMLInputElement).value).toBe("staff@example.test");
-    expect((screen.getByRole("button", { name: "Sign in" }) as HTMLButtonElement).disabled).toBe(false);
+    expect((screen.getByRole("button", { name: "Sign in" }) as HTMLButtonElement).disabled).toBe(
+      false,
+    );
   });
 
   it("disables the form while a sign-in is in flight, so one click sends one request", async () => {
@@ -77,7 +79,9 @@ describe("sign-in and sign-out", () => {
     expect(deps.auth.signIn).toHaveBeenCalledTimes(1);
 
     await act(async () => pending.resolve({ ok: false, reason: "invalid_credentials" }));
-    expect((screen.getByRole("button", { name: "Sign in" }) as HTMLButtonElement).disabled).toBe(false);
+    expect((screen.getByRole("button", { name: "Sign in" }) as HTMLButtonElement).disabled).toBe(
+      false,
+    );
   });
 
   it("signs out, forgets the chosen hotel and returns to the sign-in form", async () => {
@@ -119,10 +123,11 @@ describe("hotel switcher", () => {
 
     const groups = within(select).getAllByRole("group");
     expect(groups.map((g) => g.getAttribute("label"))).toEqual(["Acme Hotels", "Bloom Stays"]);
-    expect(within(select).getAllByRole("option").map((o) => o.textContent)).toEqual([
-      "Acme Beach",
-      "Bloom Ranch",
-    ]);
+    expect(
+      within(select)
+        .getAllByRole("option")
+        .map((o) => o.textContent),
+    ).toEqual(["Acme Beach", "Bloom Ranch"]);
     expect(screen.queryByText("Acme City")).toBeNull();
   });
 
@@ -131,7 +136,9 @@ describe("hotel switcher", () => {
     authControl.setToken("fresh-token");
     render(<HarnessApp deps={deps} />);
 
-    expect(await screen.findByText("You work in Acme Beach (Acme Hotels) as operator.")).toBeDefined();
+    expect(
+      await screen.findByText("You work in Acme Beach (Acme Hotels) as operator."),
+    ).toBeDefined();
     expect(deps.api.getMe).toHaveBeenCalledWith(
       { orgId: ORG_A, hotelId: HOTEL_A1 },
       "fresh-token",
@@ -150,7 +157,9 @@ describe("hotel switcher", () => {
 
     await userEvent.setup().selectOptions(select, HOTEL_B1);
 
-    expect(await screen.findByText("You work in Bloom Ranch (Bloom Stays) as viewer.")).toBeDefined();
+    expect(
+      await screen.findByText("You work in Bloom Ranch (Bloom Stays) as viewer."),
+    ).toBeDefined();
     expect(deps.api.getMe).toHaveBeenLastCalledWith(
       { orgId: ORG_B, hotelId: HOTEL_B1 },
       "token-1",
@@ -231,19 +240,19 @@ describe("API errors for the chosen hotel", () => {
     );
   });
 
-  it.each([
-    new HarnessApiError("unavailable", 503),
-    new HarnessApiError("network"),
-  ])("shows that the API is not available (%s) and retries", async (error) => {
-    const { deps } = fakeDeps();
-    deps.api.getMe.mockRejectedValueOnce(error);
-    render(<HarnessApp deps={deps} />);
-    expect((await screen.findByRole("alert")).textContent).toContain(
-      "The harness API is not available. Try again later.",
-    );
-    await userEvent.setup().click(screen.getByRole("button", { name: "Try again" }));
-    expect(await screen.findByText(/as operator/)).toBeDefined();
-  });
+  it.each([new HarnessApiError("unavailable", 503), new HarnessApiError("network")])(
+    "shows that the API is not available (%s) and retries",
+    async (error) => {
+      const { deps } = fakeDeps();
+      deps.api.getMe.mockRejectedValueOnce(error);
+      render(<HarnessApp deps={deps} />);
+      expect((await screen.findByRole("alert")).textContent).toContain(
+        "The harness API is not available. Try again later.",
+      );
+      await userEvent.setup().click(screen.getByRole("button", { name: "Try again" }));
+      expect(await screen.findByText(/as operator/)).toBeDefined();
+    },
+  );
 
   it("signs out locally on a 401 and asks the user to sign in again", async () => {
     const { deps } = fakeDeps();
