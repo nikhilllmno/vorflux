@@ -66,6 +66,10 @@ describe("createBrowserDeps (real clients, mocked network)", () => {
           if (logoutAnswer === "ok") return new Response(null, { status: 204 });
           return json({ message: "logout failed" }, logoutAnswer);
         }
+        // Like PostgREST: a page past the end is empty.
+        if (url.pathname.startsWith("/rest/v1/") && Number(url.searchParams.get("offset")) > 0) {
+          return json([]);
+        }
         if (url.pathname === "/rest/v1/memberships") {
           return json([{ user_id: USER_ID, org_id: ORG_A, hotel_id: HOTEL_A1, role: "operator" }]);
         }
@@ -118,6 +122,10 @@ describe("createBrowserDeps (real clients, mocked network)", () => {
     const hotelQuery = seen.find((s) => s.url.pathname === "/rest/v1/hotels");
     expect(hotelQuery?.url.searchParams.get("org_id")).toBe(`in.(${ORG_A})`);
     expect(hotelQuery?.headers.get("Authorization")).toBe(`Bearer ${token}`);
+    // Paged reads in a fixed order: offset 0 then 1 (empty), sorted by id.
+    const hotelPages = seen.filter((s) => s.url.pathname === "/rest/v1/hotels");
+    expect(hotelPages.map((s) => s.url.searchParams.get("offset") ?? "0")).toEqual(["0", "1"]);
+    expect(hotelPages.every((s) => s.url.searchParams.get("order") === "id.asc")).toBe(true);
 
     const accessToken = await d.auth.accessToken();
     expect(accessToken).toBe(token);

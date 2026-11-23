@@ -48,8 +48,8 @@ describe("buildSecurityHeaders", () => {
     expect(csp["script-src"]).toEqual(["'self'", "'unsafe-inline'"]);
   });
 
-  it("sends no referrer and no MIME sniffing", () => {
-    expect(prod["Referrer-Policy"]).toBe("no-referrer");
+  it("sends only the origin as referrer to other sites, and no MIME sniffing", () => {
+    expect(prod["Referrer-Policy"]).toBe("strict-origin-when-cross-origin");
     expect(prod["X-Content-Type-Options"]).toBe("nosniff");
   });
 

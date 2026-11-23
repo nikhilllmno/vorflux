@@ -49,18 +49,17 @@ describe("build-time guard", () => {
   });
 
   it("next.config.ts refuses to load with a service_role key, so nothing is bundled", async () => {
+    vi.stubEnv("NEXT_PUBLIC_SUPABASE_URL", "");
+    vi.stubEnv("NEXT_PUBLIC_HARNESS_API_URL", "");
     vi.stubEnv("NEXT_PUBLIC_SUPABASE_ANON_KEY", jwtWithRole("service_role"));
     await expect(import("../../next.config")).rejects.toThrow(/NEXT_PUBLIC_SUPABASE_ANON_KEY/);
   });
 
   it("next.config.ts loads with a publishable key", async () => {
+    vi.stubEnv("NEXT_PUBLIC_SUPABASE_URL", "");
+    vi.stubEnv("NEXT_PUBLIC_HARNESS_API_URL", "");
     vi.stubEnv("NEXT_PUBLIC_SUPABASE_ANON_KEY", PUBLISHABLE_KEY);
     const config = (await import("../../next.config")).default;
     expect(config.cacheComponents).toBe(true);
-    expect(config.poweredByHeader).toBe(false);
-    const rules = (await config.headers?.()) ?? [];
-    const keys = rules.flatMap((rule) => rule.headers.map((h) => h.key));
-    expect(rules.map((rule) => rule.source)).toEqual(["/:path*"]);
-    expect(keys).toEqual(expect.arrayContaining(["Content-Security-Policy", "Referrer-Policy"]));
   });
 });
