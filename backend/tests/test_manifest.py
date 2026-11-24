@@ -532,3 +532,31 @@ def test_adversarial_patterns_do_not_stall_path_queries(path: str, pattern: str)
     assert manifest.harness_may_edit(path)
     assert manifest.change_class_of(path) is ChangeClass.CODE
     assert time.perf_counter() - started < 1.0
+
+
+@pytest.mark.parametrize(
+    ("path", "pattern"),
+    [
+        ("private/ß.txt", "private/?.txt"),  # "?" is one character, even if it folds to two
+        ("private/ẞ.txt", "private/?.txt"),
+        (".g\u0131thub/CODEOWNERS", ".github/CODEOWNERS"),  # dotless i
+        (".G\u0130THUB/x", ".github/**"),  # dotted capital I
+        ("\u0130/x", "\u0131/**"),  # dotted capital I against dotless i
+        ("\u017f.pem", "S.pem"),  # long s
+        ("ΣΟΦΙΑ/x.md", "σοφια/*.md"),
+        ("KEY.PEM", "**/*.pem"),
+    ],
+)
+def test_unicode_case_tricks_still_hit_protected_and_forbidden_paths(
+    path: str, pattern: str
+) -> None:
+    manifest = parse(manifest_with(protected_paths=[pattern], forbidden_paths=[pattern]))
+    assert manifest.is_protected(path)
+    assert not manifest.harness_may_edit(path)
+
+
+def test_unicode_case_tricks_never_widen_a_change_class() -> None:
+    manifest = parse(manifest_with(change_classes={"content": ["kb/?.md", "faq/i.md"]}))
+    assert manifest.change_class_of("kb/ß.md") is ChangeClass.CONTENT  # one character
+    assert manifest.change_class_of("faq/I.md") is ChangeClass.CODE  # case-sensitive here
+    assert manifest.change_class_of("faq/\u0131.md") is ChangeClass.CODE

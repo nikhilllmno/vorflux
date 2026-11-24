@@ -15,6 +15,7 @@ A path that fails them raises `UnsafePathError`; callers must treat that as a re
 
 import re
 from collections.abc import Iterable
+from functools import lru_cache
 
 MAX_PATH_LENGTH = 255
 
@@ -75,7 +76,22 @@ def check_query_path(value: str) -> str:
     return value
 
 
-def _segment_matches(name: str, pattern: str) -> bool:
+@lru_cache(maxsize=4096)
+def _same_char(a: str, b: str) -> bool:
+    """Case-insensitive equality of two single characters.
+
+    Compared per character, never by folding whole strings: `"ß".casefold()` is `"ss"`, which would
+    change how many characters `?` sees. Either test is enough: the Python case mappings, or the
+    single-character equivalence of `re.IGNORECASE` (which also joins, for example, the Turkish
+    dotted and dotless i with i and I). So the match is at least as wide as `re.IGNORECASE`.
+    Callers use this only where a wider match is the safe side.
+    """
+    if a.lower() == b.lower() or a.upper() == b.upper() or a.casefold() == b.casefold():
+        return True
+    return re.fullmatch(re.escape(a), b, re.IGNORECASE) is not None
+
+
+def _segment_matches(name: str, pattern: str, ignore_case: bool) -> bool:
     """Wildcard match of one path segment, in O(len(name) * len(pattern)) time.
 
     Dynamic programming, not a regex: a translated regex backtracks on patterns such as
@@ -90,12 +106,18 @@ def _segment_matches(name: str, pattern: str) -> bool:
                 row[j] = row[j] or row[j - 1]
         else:
             row = [False] + [
-                row[j - 1] and (char == "?" or char == name[j - 1]) for j in range(1, len(row))
+                row[j - 1]
+                and (
+                    char == "?"
+                    or char == name[j - 1]
+                    or (ignore_case and _same_char(char, name[j - 1]))
+                )
+                for j in range(1, len(row))
             ]
     return row[-1]
 
 
-def _path_matches(segments: list[str], pattern: list[str]) -> bool:
+def _path_matches(segments: list[str], pattern: list[str], ignore_case: bool) -> bool:
     """Match path segments against pattern segments, in polynomial time.
 
     A `**` segment matches zero or more path segments, except as the last pattern segment, where
@@ -114,7 +136,7 @@ def _path_matches(segments: list[str], pattern: list[str]) -> bool:
             state = new_state
         else:
             state = [False] + [
-                state[j - 1] and _segment_matches(segments[j - 1], part)
+                state[j - 1] and _segment_matches(segments[j - 1], part, ignore_case)
                 for j in range(1, len(state))
             ]
     return state[-1]
@@ -127,9 +149,7 @@ def matches(path: str, pattern: str, *, ignore_case: bool) -> bool:
     "Harness.YAML" fails closed) and `ignore_case=False` where a wider match would loosen a rule
     (change classes, where no match means the strictest class).
     """
-    if ignore_case:
-        path, pattern = path.casefold(), pattern.casefold()
-    return _path_matches(path.split("/"), pattern.split("/"))
+    return _path_matches(path.split("/"), pattern.split("/"), ignore_case)
 
 
 def matches_any(path: str, patterns: Iterable[str], *, ignore_case: bool) -> bool:
