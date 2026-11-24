@@ -1,0 +1,44 @@
+# Verbatim copy of the example in docs/architecture.md, Section 9.3. It must stay valid.
+version: 1
+layout: standard/v1
+hotel: example-hotel
+agents:                              # pluggable agent types; email and others later
+  - type: voice
+    platform: vapi
+    prompt_dir: prompts/voice
+    config_path: vapi/assistant.yaml # pushed to the production assistant by the repo's CI on merge
+    test_assistant: example-hotel-test   # in the hotel's Vapi test org (D21, O11)
+  - type: text
+    platform: own                    # our text agent in src/
+    prompt_dir: prompts/text
+commands:
+  setup: uv sync --locked
+  lint: uv run ruff check .
+  test: uv run pytest -q
+  render: uv run python -m hotel.render --check
+  baml_test: uv run baml-cli test
+  eval: uv run python -m evals.run --suite full
+  smoke: uv run python -m evals.run --suite smoke
+change_classes:                      # decide which evals run and how the staff diff looks
+  content: [kb/**, facts.yaml, policies/**]
+  prompt: [prompts/**]
+  config: [vapi/**, tools.yaml]
+  code: [src/**, baml_src/**, tests/**]
+protected_paths:                     # always need our team's review (Q28)
+  - harness.yaml
+  - CODEOWNERS
+  - .github/**
+  - evals/**
+  - src/**/migrations/**
+  - src/payments/**
+  - src/auth/**
+forbidden_paths:                     # the harness must never change these
+  - infra/prod/**
+  - "**/*.pem"
+  - ".env*"
+limits:
+  max_changed_files: 30
+  max_diff_lines: 800
+deploy:
+  owner: target-repo-ci              # the harness never deploys
+  staging_check: https://example.invalid/healthz   # read-only status URL
