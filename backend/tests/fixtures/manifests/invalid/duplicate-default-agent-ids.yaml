@@ -1,0 +1,21 @@
+# Invalid: two text agents without an id both default to the id text (expected path: agents[1].id)
+version: 1
+layout: standard/v1
+hotel: broken-hotel
+agents:
+  - type: text
+    platform: own
+    prompt_dir: prompts/text
+  - type: text
+    platform: own
+    prompt_dir: prompts/text
+commands:
+  setup: uv sync --locked
+  lint: uv run ruff check .
+  test: uv run pytest -q
+  render: uv run python -m hotel.render --check
+  eval: uv run python -m evals.run --suite full
+change_classes:
+  content: [kb/**]
+deploy:
+  owner: target-repo-ci

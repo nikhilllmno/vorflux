@@ -1,0 +1,52 @@
+# A complete harness.yaml for a fictional hotel. Test fixture only: no real hotel or guest data.
+version: 1
+layout: standard/v1
+hotel: sample-hotel
+agents:
+  - type: voice
+    id: front-desk-voice
+    platform: vapi
+    prompt_dir: prompts/voice
+    config_path: vapi/assistant.yaml
+    test_assistant: sample-hotel-test
+  - type: text
+    id: front-desk-text
+    platform: own
+    runtime: claude_agent_sdk
+    prompt_dir: prompts/text
+commands:
+  setup: uv sync --locked
+  lint: uv run ruff check .
+  test: uv run pytest -q
+  render: uv run python -m hotel.render --check
+  baml_test: uv run baml-cli test
+  eval: uv run python -m evals.run --suite full
+  smoke: uv run python -m evals.run --suite smoke
+change_classes:
+  content: [kb/**, facts.yaml, policies/**]
+  prompt: [prompts/**]
+  config: [vapi/**, tools.yaml]
+  code: [src/**, baml_src/**, tests/**]
+protected_paths:
+  - harness.yaml
+  - CODEOWNERS
+  - .github/**
+  - evals/**
+  - src/**/migrations/**
+  - src/payments/**
+  - src/auth/**
+forbidden_paths:
+  - infra/prod/**
+  - "**/*.pem"
+  - ".env*"
+limits:
+  max_changed_files: 30
+  max_diff_lines: 800
+evals:
+  suites:
+    front-desk-voice: evals/voice.yaml
+    front-desk-text: evals/text.yaml
+  max_score_drop: 0.0
+deploy:
+  owner: target-repo-ci
+  staging_check: https://staging.sample-hotel.example.invalid/healthz

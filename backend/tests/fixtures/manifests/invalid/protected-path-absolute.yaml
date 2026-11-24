@@ -1,0 +1,20 @@
+# Invalid: a protected path is absolute (expected path: protected_paths[0])
+version: 1
+layout: standard/v1
+hotel: broken-hotel
+agents:
+  - type: text
+    platform: own
+    prompt_dir: prompts/text
+commands:
+  setup: uv sync --locked
+  lint: uv run ruff check .
+  test: uv run pytest -q
+  render: uv run python -m hotel.render --check
+  eval: uv run python -m evals.run --suite full
+change_classes:
+  content: [kb/**]
+protected_paths:
+  - /etc/**
+deploy:
+  owner: target-repo-ci
