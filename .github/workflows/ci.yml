@@ -4,13 +4,21 @@ on:
   pull_request:
   push:
     branches: [main]
+  # Manual run from the Actions tab (any branch).
+  workflow_dispatch:
+  # Daily run at 03:30 UTC (09:00 IST). GitHub runs schedules only from the default branch,
+  # so this trigger starts to work after this file is merged to main.
+  schedule:
+    - cron: "30 3 * * *"
 
 permissions:
   contents: read
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  # Cancel superseded runs of a PR only. Runs on main (push, schedule, manual) share one group
+  # and queue: a new run never stops a running one. GitHub keeps one pending run per group.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   GITLEAKS_VERSION: "8.30.1"
