@@ -1,7 +1,8 @@
 """`harness-validate`: the command-line front end of the manifest validator."""
 
 import json
-import tomllib
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -59,6 +60,17 @@ def test_schema_flag_prints_the_committed_schema(capsys: pytest.CaptureFixture[s
     assert json.loads(out)["$id"].endswith("/harness-v1.schema.json")
 
 
-def test_console_script_is_registered() -> None:
-    pyproject = tomllib.loads((Path(__file__).parents[1] / "pyproject.toml").read_text())
-    assert pyproject["project"]["scripts"]["harness-validate"] == "harness.manifest.cli:main"
+def test_installed_console_script_validates_a_file() -> None:
+    script = Path(sys.executable).parent / "harness-validate"
+    good = FIXTURES / "valid" / "minimal.yaml"
+    bad = FIXTURES / "invalid" / "duplicate-agent-ids.yaml"
+
+    ok = subprocess.run([script, good], capture_output=True, text=True, check=False)  # noqa: S603
+    assert (ok.returncode, ok.stdout.strip()) == (
+        0,
+        f"{good}: OK: hotel minimal-hotel; agents: text (text)",
+    )
+
+    failed = subprocess.run([script, bad], capture_output=True, text=True, check=False)  # noqa: S603
+    assert failed.returncode == 1
+    assert f"{bad}: agents[1].id: duplicate agent id" in failed.stdout

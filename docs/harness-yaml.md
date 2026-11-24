@@ -24,8 +24,9 @@ changes are classified, and which paths need our team or are off limits. Design:
 3. **Unknown keys are errors**, at every level. A typo never turns into a silent default.
 4. **Strict types.** `"30"` is not an integer, `30` is not a string, and `version` must be the
    integer `1`.
-5. **Safe YAML only.** Duplicate keys, aliases (`*name`), custom tags, files over 64 KiB, and
-   non-UTF-8 text are rejected.
+5. **Safe YAML only.** Duplicate keys, aliases (`*name`), custom tags, files over 64 KiB, nesting
+   deeper than 16 levels, and non-UTF-8 text are rejected. Malformed input always gives issues,
+   never an exception.
 
 ## Example
 
@@ -121,6 +122,8 @@ two agents of one type need explicit ids.
   the root. Write `**/*.pem` for any depth.
 - Not supported, so rejected: character classes (`[ab]`), brace expansion (`{a,b}`), and
   negation (`!x`).
+- Matching runs in bounded time (dynamic programming, not a backtracking regex), so no pattern
+  can stall a guardrail check.
 
 ### Change classes
 

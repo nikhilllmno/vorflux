@@ -15,7 +15,6 @@ A path that fails them raises `UnsafePathError`; callers must treat that as a re
 
 import re
 from collections.abc import Iterable
-from functools import lru_cache
 
 MAX_PATH_LENGTH = 255
 
@@ -76,25 +75,49 @@ def check_query_path(value: str) -> str:
     return value
 
 
-@lru_cache(maxsize=2048)
-def _compile(pattern: str, ignore_case: bool) -> re.Pattern[str]:
-    segments = pattern.split("/")
-    parts: list[str] = []
-    for index, segment in enumerate(segments):
-        last = index == len(segments) - 1
-        if segment == "**":
-            parts.append(".+" if last else "(?:[^/]+/)*")
-            continue
-        for char in segment:
-            if char == "*":
-                parts.append("[^/]*")
-            elif char == "?":
-                parts.append("[^/]")
-            else:
-                parts.append(re.escape(char))
-        if not last:
-            parts.append("/")
-    return re.compile("".join(parts), re.IGNORECASE if ignore_case else 0)
+def _segment_matches(name: str, pattern: str) -> bool:
+    """Wildcard match of one path segment, in O(len(name) * len(pattern)) time.
+
+    Dynamic programming, not a regex: a translated regex backtracks on patterns such as
+    `*a*a*a...b`, which would let a manifest stall every guardrail query.
+    """
+    # row[j] is True when pattern[:i] matches name[:j], for the current i.
+    row = [True] + [False] * len(name)
+    for char in pattern:
+        if char == "*":
+            # "*" matches name[:j] when pattern[:i-1] matches any name[:k] with k <= j.
+            for j in range(1, len(row)):
+                row[j] = row[j] or row[j - 1]
+        else:
+            row = [False] + [
+                row[j - 1] and (char == "?" or char == name[j - 1]) for j in range(1, len(row))
+            ]
+    return row[-1]
+
+
+def _path_matches(segments: list[str], pattern: list[str]) -> bool:
+    """Match path segments against pattern segments, in polynomial time.
+
+    A `**` segment matches zero or more path segments, except as the last pattern segment, where
+    it matches one or more (so `.github/**` matches files under `.github/` but not `.github`).
+    """
+    # state[j] is True when the pattern segments seen so far match segments[:j].
+    state = [True] + [False] * len(segments)
+    for index, part in enumerate(pattern):
+        last = index == len(pattern) - 1
+        if part == "**":
+            reached = False
+            new_state = []
+            for j in range(len(state)):
+                new_state.append(reached or (state[j] and not last))
+                reached = reached or state[j]
+            state = new_state
+        else:
+            state = [False] + [
+                state[j - 1] and _segment_matches(segments[j - 1], part)
+                for j in range(1, len(state))
+            ]
+    return state[-1]
 
 
 def matches(path: str, pattern: str, *, ignore_case: bool) -> bool:
@@ -104,7 +127,9 @@ def matches(path: str, pattern: str, *, ignore_case: bool) -> bool:
     "Harness.YAML" fails closed) and `ignore_case=False` where a wider match would loosen a rule
     (change classes, where no match means the strictest class).
     """
-    return _compile(pattern, ignore_case).fullmatch(path) is not None
+    if ignore_case:
+        path, pattern = path.casefold(), pattern.casefold()
+    return _path_matches(path.split("/"), pattern.split("/"))
 
 
 def matches_any(path: str, patterns: Iterable[str], *, ignore_case: bool) -> bool:

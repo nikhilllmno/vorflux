@@ -18,6 +18,7 @@ from urllib.parse import urlsplit
 from pydantic import (
     AfterValidator,
     BaseModel,
+    BeforeValidator,
     ConfigDict,
     Field,
     Strict,
@@ -222,6 +223,13 @@ HttpsUrl = Annotated[
 StrictInt = Annotated[int, Strict()]
 
 
+def _exact_int(value: Any) -> Any:
+    # Literal[1] alone accepts True and 1.0, because they compare equal to 1.
+    if type(value) is not int:
+        raise PydanticCustomError("int_type", "must be the integer 1")
+    return value
+
+
 class _Model(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -343,7 +351,7 @@ class Manifest(_Model):
 
     model_config = ConfigDict(title="harness.yaml manifest v1")
 
-    version: Literal[1]
+    version: Annotated[Literal[1], BeforeValidator(_exact_int)]
     layout: Literal["standard/v1"]
     hotel: Slug
     agents: Annotated[

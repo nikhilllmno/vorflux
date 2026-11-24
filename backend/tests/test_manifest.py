@@ -5,6 +5,7 @@ Spec: docs/architecture.md, Sections 9.3 and 9.9, and docs/harness-yaml.md.
 
 import copy
 import json
+import time
 from pathlib import Path
 from typing import Any
 
@@ -120,21 +121,22 @@ def test_valid_mapping_and_bytes_sources_give_the_same_manifest() -> None:
 # --- Invalid fixtures ------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize(
-    ("name", "path", "code"),
-    [
-        ("unknown-top-level-key", "content_paths", "extra_forbidden"),
-        ("unknown-agent-key", "agents[0].api_key", "extra_forbidden"),
-        ("duplicate-agent-ids", "agents[1].id", "duplicate_agent_id"),
-        ("duplicate-default-agent-ids", "agents[1].id", "duplicate_agent_id"),
-        ("protected-path-traversal", "protected_paths[1]", "unsafe_path"),
-        ("protected-path-absolute", "protected_paths[0]", "unsafe_path"),
-        ("forbidden-path-traversal", "forbidden_paths[0]", "unsafe_path"),
-        ("unknown-change-class", "change_classes.secrets", "unknown_change_class"),
-        ("email-agent-deferred", "agents[1].type", "agent_type_deferred"),
-        ("duplicate-yaml-key", "(yaml)", "duplicate_key"),
-    ],
-)
+# One table for every invalid fixture: (fixture name, expected issue path, expected issue code).
+INVALID_FIXTURES: list[tuple[str, str, str]] = [
+    ("unknown-top-level-key", "content_paths", "extra_forbidden"),
+    ("unknown-agent-key", "agents[0].api_key", "extra_forbidden"),
+    ("duplicate-agent-ids", "agents[1].id", "duplicate_agent_id"),
+    ("duplicate-default-agent-ids", "agents[1].id", "duplicate_agent_id"),
+    ("protected-path-traversal", "protected_paths[1]", "unsafe_path"),
+    ("protected-path-absolute", "protected_paths[0]", "unsafe_path"),
+    ("forbidden-path-traversal", "forbidden_paths[0]", "unsafe_path"),
+    ("unknown-change-class", "change_classes.secrets", "unknown_change_class"),
+    ("email-agent-deferred", "agents[1].type", "agent_type_deferred"),
+    ("duplicate-yaml-key", "(yaml)", "duplicate_key"),
+]
+
+
+@pytest.mark.parametrize(("name", "path", "code"), INVALID_FIXTURES)
 def test_invalid_fixtures_fail_with_a_readable_path(name: str, path: str, code: str) -> None:
     result = validate_manifest((FIXTURES / "invalid" / f"{name}.yaml").read_text())
 
@@ -145,20 +147,9 @@ def test_invalid_fixtures_fail_with_a_readable_path(name: str, path: str, code: 
     assert issue.message  # never empty
 
 
-def test_every_invalid_fixture_is_covered_by_the_table() -> None:
-    covered = {
-        "unknown-top-level-key",
-        "unknown-agent-key",
-        "duplicate-agent-ids",
-        "duplicate-default-agent-ids",
-        "protected-path-traversal",
-        "protected-path-absolute",
-        "forbidden-path-traversal",
-        "unknown-change-class",
-        "email-agent-deferred",
-        "duplicate-yaml-key",
-    }
-    assert {p.stem for p in (FIXTURES / "invalid").glob("*.yaml")} == covered
+def test_every_invalid_fixture_has_an_expected_issue() -> None:
+    on_disk = {p.stem for p in (FIXTURES / "invalid").glob("*.yaml")}
+    assert on_disk == {name for name, _, _ in INVALID_FIXTURES}
 
 
 def test_error_messages_name_the_problem() -> None:
@@ -237,6 +228,8 @@ def test_agent_directories_must_be_plain_repo_paths(value: str) -> None:
     [
         ({"version": 2}, "version"),
         ({"version": "1"}, "version"),
+        ({"version": True}, "version"),
+        ({"version": 1.0}, "version"),
         ({"layout": "custom"}, "layout"),
         ({"hotel": "Example Hotel"}, "hotel"),
         ({"hotel": 123}, "hotel"),
@@ -328,6 +321,9 @@ def test_text_agents_accept_each_product_runtime(runtime: str) -> None:
         ("x: !!python/object:os.system {}\n", "yaml_syntax"),
         (b"version: 1\nhotel: \xff\n", "not_utf8"),
         ("a: 1\n" + "#" * 70_000, "too_large"),
+        ("x: " + "[" * 1000 + "0" + "]" * 1000, "too_deep"),
+        ("x: " + "{a: " * 1000 + "0" + "}" * 1000, "too_deep"),
+        ("hotel: \ud800\n", "not_utf8"),
     ],
 )
 def test_unsafe_or_broken_yaml_is_rejected(text: str | bytes, code: str) -> None:
@@ -483,3 +479,56 @@ def test_case_tricks_never_loosen_a_rule() -> None:
     # An eval suite must be protected with the exact case.
     data = manifest_with(evals={"suites": {"text": "EVALS/text.yaml"}})
     assert issue_paths(data) == ["evals.suites.text"]
+
+
+@pytest.mark.parametrize(
+    ("place", "path"),
+    [
+        ((), "['[key]']"),
+        (("agents", 0), "agents[0]['[key]']"),
+        (("commands",), "commands['[key]']"),
+    ],
+)
+def test_a_user_key_that_looks_like_an_internal_marker_is_reported_as_given(
+    place: tuple[str | int, ...], path: str
+) -> None:
+    data = manifest_with()
+    target: Any = data
+    for part in place:
+        target = target[part]
+    target["[key]"] = 1
+    result = validate_manifest(data)
+    assert [(issue.path, issue.code) for issue in result.issues] == [(path, "extra_forbidden")]
+    assert "unknown key '[key]'" in result.issues[0].message
+
+
+def test_an_agent_key_named_like_an_agent_type_is_reported_at_its_path() -> None:
+    data = manifest_with(agents=[{**MINIMAL["agents"][0], "voice": 1}])
+    assert issue_paths(data) == ["agents[0].voice"]
+
+
+@pytest.mark.parametrize(
+    ("key", "path"),
+    [("Bad Key", "evals.suites['Bad Key']"), ("[key]", "evals.suites['[key]']")],
+)
+def test_bad_eval_suite_keys_keep_their_name_in_the_path(key: str, path: str) -> None:
+    result = validate_manifest(manifest_with(evals={"suites": {key: "evals/x.yaml"}}))
+    assert [(issue.path, issue.code) for issue in result.issues] == [(path, "bad_agent_id")]
+
+
+@pytest.mark.parametrize(
+    ("path", "pattern"),
+    [
+        ("a" * 64, "*a" * 32 + "b"),
+        ("a" * 200, "*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*b"),
+        ("/".join(["a"] * 100), "/".join(["**"] * 50) + "/b"),
+        ("/".join(["a"] * 60), "/".join(["**/*a*a*a"] * 20) + "/b"),
+    ],
+)
+def test_adversarial_patterns_do_not_stall_path_queries(path: str, pattern: str) -> None:
+    manifest = parse(manifest_with(protected_paths=[pattern], forbidden_paths=[pattern]))
+    started = time.perf_counter()
+    assert not manifest.is_protected(path)
+    assert manifest.harness_may_edit(path)
+    assert manifest.change_class_of(path) is ChangeClass.CODE
+    assert time.perf_counter() - started < 1.0

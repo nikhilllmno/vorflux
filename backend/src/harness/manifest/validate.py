@@ -28,6 +28,9 @@ from harness.manifest.schema import (
 )
 
 MAX_MANIFEST_BYTES: Final = 64 * 1024
+# The deepest real manifest is about 4 levels (evals.suites.<id>, agents[n].key). The limit stops
+# small inputs such as "[[[[...]]]]" from exhausting the parser's recursion.
+MAX_YAML_DEPTH: Final = 16
 SCHEMA_ID: Final = (
     "https://raw.githubusercontent.com/nikhilllmno/vorflux/main/backend/schemas/"
     "harness-v1.schema.json"
@@ -81,15 +84,26 @@ class _ManifestLoader(yaml.SafeLoader):
     aliases allow exponential expansion ("billion laughs"). Neither has a use in a manifest.
     """
 
+    _depth = 0
+
     def compose_node(self, parent: yaml.Node | None, index: Any) -> yaml.Node | None:
-        if self.check_event(yaml.AliasEvent):
-            event = self.peek_event()  # type: ignore[no-untyped-call]
+        event = self.peek_event()  # type: ignore[no-untyped-call]
+        line = event.start_mark.line + 1
+        if isinstance(event, yaml.AliasEvent):
             raise _YamlProblem(
-                f"line {event.start_mark.line + 1}: YAML aliases (*name) are not allowed in "
-                "harness.yaml; write the value out",
+                f"line {line}: YAML aliases (*name) are not allowed in harness.yaml; "
+                "write the value out",
                 "yaml_alias",
             )
-        return super().compose_node(parent, index)
+        if self._depth >= MAX_YAML_DEPTH:
+            raise _YamlProblem(
+                f"line {line}: nested deeper than {MAX_YAML_DEPTH} levels", "too_deep"
+            )
+        self._depth += 1
+        try:
+            return super().compose_node(parent, index)
+        finally:
+            self._depth -= 1
 
     def construct_mapping(self, node: yaml.MappingNode, deep: bool = False) -> dict[Any, Any]:
         seen: set[Hashable] = set()
@@ -106,7 +120,10 @@ class _ManifestLoader(yaml.SafeLoader):
 
 
 def _load_yaml(source: str | bytes) -> Any:
-    raw = source.encode() if isinstance(source, str) else source
+    try:
+        raw = source.encode() if isinstance(source, str) else source
+    except UnicodeEncodeError as exc:
+        raise _YamlProblem(f"not valid UTF-8 (character {exc.start})", "not_utf8") from None
     if len(raw) > MAX_MANIFEST_BYTES:
         raise _YamlProblem(f"the file is larger than {MAX_MANIFEST_BYTES} bytes", "too_large")
     try:
@@ -136,18 +153,19 @@ def _format_path(parts: Sequence[str | int]) -> str:
 
 
 def _clean_loc(loc: Sequence[str | int]) -> list[str | int]:
-    """Drop pydantic's internal location parts: the agent-type tag and dict `[key]` markers."""
-    cleaned: list[str | int] = []
-    for index, part in enumerate(loc):
-        after_agent_index = (
-            index >= 2 and loc[index - 2] == "agents" and isinstance(loc[index - 1], int)
-        )
-        if after_agent_index and part in _AGENT_TAGS:
-            continue
-        if part == "[key]":
-            continue
-        cleaned.append(part)
-    return cleaned
+    """Drop pydantic's internal location parts, and only those.
+
+    Pydantic inserts the union tag after an agent index (`agents, 0, "voice", ...`) and appends
+    `"[key]"` after a dict key whose key failed validation (`evals, suites, "Bad", "[key]"`). A user
+    key may have the same text, so each marker is removed only at its exact position.
+    """
+    parts = list(loc)
+    if len(parts) >= 3 and parts[0] == "agents" and isinstance(parts[1], int):
+        if parts[2] in _AGENT_TAGS:
+            del parts[2]
+    if len(parts) == 4 and parts[:2] == ["evals", "suites"] and parts[3] == "[key]":
+        del parts[3]
+    return parts
 
 
 def _model_key(loc: Sequence[str | int], agent_types: Sequence[str | None]) -> tuple[str, ...]:
