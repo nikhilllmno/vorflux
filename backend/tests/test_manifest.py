@@ -471,3 +471,15 @@ def test_json_schema_is_closed_and_lists_only_enabled_agent_types() -> None:
     for definition in schema["$defs"].values():
         if definition.get("type") == "object":
             assert definition.get("additionalProperties") is False, definition["title"]
+
+
+def test_case_tricks_never_loosen_a_rule() -> None:
+    manifest = load_manifest(FIXTURES / "valid" / "sample-hotel.yaml")
+    # Protected and forbidden paths match case-insensitively (the safe side) ...
+    assert manifest.is_protected("EVALS/text.yaml")
+    assert not manifest.harness_may_edit("Infra/Prod/main.tf")
+    # ... but change classes match case-sensitively, so "KB/" is not content: it falls to code.
+    assert manifest.change_class_of("KB/evil.py") is ChangeClass.CODE
+    # An eval suite must be protected with the exact case.
+    data = manifest_with(evals={"suites": {"text": "EVALS/text.yaml"}})
+    assert issue_paths(data) == ["evals.suites.text"]

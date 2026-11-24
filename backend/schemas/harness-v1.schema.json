@@ -1,0 +1,403 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/nikhilllmno/vorflux/main/backend/schemas/harness-v1.schema.json",
+  "$defs": {
+    "ChangeClasses": {
+      "additionalProperties": false,
+      "description": "Path patterns per change class. A path in no class is treated as `code`.",
+      "properties": {
+        "content": {
+          "default": [],
+          "items": {
+            "description": "A glob relative to the repo root and anchored there. '*' and '?' stay in one directory; '**' (a whole segment) spans directories. No '..', classes or negation.",
+            "type": "string"
+          },
+          "maxItems": 200,
+          "title": "Content",
+          "type": "array"
+        },
+        "prompt": {
+          "default": [],
+          "items": {
+            "description": "A glob relative to the repo root and anchored there. '*' and '?' stay in one directory; '**' (a whole segment) spans directories. No '..', classes or negation.",
+            "type": "string"
+          },
+          "maxItems": 200,
+          "title": "Prompt",
+          "type": "array"
+        },
+        "config": {
+          "default": [],
+          "items": {
+            "description": "A glob relative to the repo root and anchored there. '*' and '?' stay in one directory; '**' (a whole segment) spans directories. No '..', classes or negation.",
+            "type": "string"
+          },
+          "maxItems": 200,
+          "title": "Config",
+          "type": "array"
+        },
+        "code": {
+          "default": [],
+          "items": {
+            "description": "A glob relative to the repo root and anchored there. '*' and '?' stay in one directory; '**' (a whole segment) spans directories. No '..', classes or negation.",
+            "type": "string"
+          },
+          "maxItems": 200,
+          "title": "Code",
+          "type": "array"
+        }
+      },
+      "title": "ChangeClasses",
+      "type": "object"
+    },
+    "Commands": {
+      "additionalProperties": false,
+      "description": "Commands the harness runs in the sandbox, from the repo root.",
+      "properties": {
+        "setup": {
+          "description": "One shell command line, run in the sandbox from the repo root.",
+          "title": "Setup",
+          "type": "string"
+        },
+        "lint": {
+          "description": "One shell command line, run in the sandbox from the repo root.",
+          "title": "Lint",
+          "type": "string"
+        },
+        "test": {
+          "description": "One shell command line, run in the sandbox from the repo root.",
+          "title": "Test",
+          "type": "string"
+        },
+        "render": {
+          "description": "One shell command line, run in the sandbox from the repo root.",
+          "title": "Render",
+          "type": "string"
+        },
+        "baml_test": {
+          "anyOf": [
+            {
+              "description": "One shell command line, run in the sandbox from the repo root.",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Baml Test"
+        },
+        "eval": {
+          "description": "One shell command line, run in the sandbox from the repo root.",
+          "title": "Eval",
+          "type": "string"
+        },
+        "smoke": {
+          "anyOf": [
+            {
+              "description": "One shell command line, run in the sandbox from the repo root.",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Smoke"
+        }
+      },
+      "required": [
+        "setup",
+        "lint",
+        "test",
+        "render",
+        "eval"
+      ],
+      "title": "Commands",
+      "type": "object"
+    },
+    "Deploy": {
+      "additionalProperties": false,
+      "description": "The harness never deploys. The hotel repo's own CI does.",
+      "properties": {
+        "owner": {
+          "const": "target-repo-ci",
+          "title": "Owner",
+          "type": "string"
+        },
+        "staging_check": {
+          "anyOf": [
+            {
+              "format": "uri",
+              "pattern": "^https://",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Read-only status URL the harness may poll after a merge.",
+          "title": "Staging Check"
+        }
+      },
+      "required": [
+        "owner"
+      ],
+      "title": "Deploy",
+      "type": "object"
+    },
+    "Evals": {
+      "additionalProperties": false,
+      "description": "Where each agent's eval suite lives, and how far scores may fall against `main`.",
+      "properties": {
+        "suites": {
+          "description": "Agent id to suite file. An agent not listed uses evals/<type>.yaml.",
+          "patternProperties": {
+            "^[a-z][a-z0-9-]{0,39}$": {
+              "description": "A plain path relative to the repo root (no glob, no '..').",
+              "type": "string"
+            }
+          },
+          "title": "Suites",
+          "type": "object"
+        },
+        "max_score_drop": {
+          "default": 0.0,
+          "description": "Largest allowed drop of a 0-1 eval score against main. 0 means no drop.",
+          "maximum": 0.2,
+          "minimum": 0.0,
+          "title": "Max Score Drop",
+          "type": "number"
+        }
+      },
+      "title": "Evals",
+      "type": "object"
+    },
+    "Limits": {
+      "additionalProperties": false,
+      "description": "Diff limits per change request. A larger change splits into several CRs.",
+      "properties": {
+        "max_changed_files": {
+          "default": 30,
+          "maximum": 200,
+          "minimum": 1,
+          "title": "Max Changed Files",
+          "type": "integer"
+        },
+        "max_diff_lines": {
+          "default": 800,
+          "maximum": 5000,
+          "minimum": 1,
+          "title": "Max Diff Lines",
+          "type": "integer"
+        }
+      },
+      "title": "Limits",
+      "type": "object"
+    },
+    "ProductRuntime": {
+      "description": "The framework a hotel's own (non-Vapi) agent runs on.\n\nThis is the product agent's runtime, not the harness runtime (`harness.runtimes.RuntimeKind`).\nThe two lists can differ: the harness itself may support fewer frameworks than hotel agents use.",
+      "enum": [
+        "claude_agent_sdk",
+        "openai_agents_sdk",
+        "deep_agents",
+        "opencode"
+      ],
+      "title": "ProductRuntime",
+      "type": "string"
+    },
+    "TextAgent": {
+      "additionalProperties": false,
+      "description": "A text agent (SMS, WhatsApp, web chat) that is our own code in the hotel repo.",
+      "properties": {
+        "type": {
+          "const": "text",
+          "title": "Type",
+          "type": "string"
+        },
+        "id": {
+          "description": "Unique among the agents. Defaults to the agent type.",
+          "pattern": "^[a-z][a-z0-9-]{0,39}$",
+          "title": "Id",
+          "type": "string"
+        },
+        "platform": {
+          "const": "own",
+          "title": "Platform",
+          "type": "string"
+        },
+        "prompt_dir": {
+          "description": "A plain path relative to the repo root (no glob, no '..').",
+          "title": "Prompt Dir",
+          "type": "string"
+        },
+        "runtime": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ProductRuntime"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "The framework the agent runs on. Unset means not declared."
+        }
+      },
+      "required": [
+        "type",
+        "platform",
+        "prompt_dir"
+      ],
+      "title": "TextAgent",
+      "type": "object"
+    },
+    "VoiceAgent": {
+      "additionalProperties": false,
+      "description": "A voice agent on Vapi. Its prompts and Vapi config live in the hotel repo.",
+      "properties": {
+        "type": {
+          "const": "voice",
+          "title": "Type",
+          "type": "string"
+        },
+        "id": {
+          "description": "Unique among the agents. Defaults to the agent type.",
+          "pattern": "^[a-z][a-z0-9-]{0,39}$",
+          "title": "Id",
+          "type": "string"
+        },
+        "platform": {
+          "const": "vapi",
+          "title": "Platform",
+          "type": "string"
+        },
+        "prompt_dir": {
+          "description": "A plain path relative to the repo root (no glob, no '..').",
+          "title": "Prompt Dir",
+          "type": "string"
+        },
+        "config_path": {
+          "description": "Vapi assistant settings; the repo's CI pushes them to production on merge.",
+          "title": "Config Path",
+          "type": "string"
+        },
+        "test_assistant": {
+          "description": "Assistant in the hotel's Vapi test org that voice evals run against.",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$",
+          "title": "Test Assistant",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "platform",
+        "prompt_dir",
+        "config_path",
+        "test_assistant"
+      ],
+      "title": "VoiceAgent",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "description": "`harness.yaml`, schema version 1.",
+  "properties": {
+    "version": {
+      "const": 1,
+      "title": "Version",
+      "type": "integer"
+    },
+    "layout": {
+      "const": "standard/v1",
+      "title": "Layout",
+      "type": "string"
+    },
+    "hotel": {
+      "maxLength": 63,
+      "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$",
+      "title": "Hotel",
+      "type": "string"
+    },
+    "agents": {
+      "items": {
+        "discriminator": {
+          "mapping": {
+            "text": "#/$defs/TextAgent",
+            "voice": "#/$defs/VoiceAgent"
+          },
+          "propertyName": "type"
+        },
+        "oneOf": [
+          {
+            "$ref": "#/$defs/VoiceAgent"
+          },
+          {
+            "$ref": "#/$defs/TextAgent"
+          }
+        ]
+      },
+      "maxItems": 20,
+      "minItems": 1,
+      "title": "Agents",
+      "type": "array"
+    },
+    "commands": {
+      "$ref": "#/$defs/Commands"
+    },
+    "change_classes": {
+      "$ref": "#/$defs/ChangeClasses"
+    },
+    "protected_paths": {
+      "default": [],
+      "description": "Added to the default protected paths, which always apply.",
+      "items": {
+        "description": "A glob relative to the repo root and anchored there. '*' and '?' stay in one directory; '**' (a whole segment) spans directories. No '..', classes or negation.",
+        "type": "string"
+      },
+      "maxItems": 200,
+      "title": "Protected Paths",
+      "type": "array"
+    },
+    "forbidden_paths": {
+      "default": [],
+      "description": "Added to the paths the harness never edits, which always apply.",
+      "items": {
+        "description": "A glob relative to the repo root and anchored there. '*' and '?' stay in one directory; '**' (a whole segment) spans directories. No '..', classes or negation.",
+        "type": "string"
+      },
+      "maxItems": 200,
+      "title": "Forbidden Paths",
+      "type": "array"
+    },
+    "limits": {
+      "$ref": "#/$defs/Limits",
+      "default": {
+        "max_changed_files": 30,
+        "max_diff_lines": 800
+      }
+    },
+    "evals": {
+      "$ref": "#/$defs/Evals",
+      "default": {
+        "suites": {},
+        "max_score_drop": 0.0
+      }
+    },
+    "deploy": {
+      "$ref": "#/$defs/Deploy"
+    }
+  },
+  "required": [
+    "version",
+    "layout",
+    "hotel",
+    "agents",
+    "commands",
+    "change_classes",
+    "deploy"
+  ],
+  "title": "harness.yaml manifest v1",
+  "type": "object"
+}
